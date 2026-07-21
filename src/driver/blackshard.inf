@@ -1,0 +1,57 @@
+[Version]
+Signature   = "$Windows NT$"
+Class       = "AntiVirus"
+ClassGuid   = {b1d1a169-c54f-4379-81db-bee7d88d7454}
+Provider    = "Blackshard"
+DriverVer   = 01/01/2026,1.0.0.0
+CatalogFile = blackshard.cat
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = "Blackshard Installation Disk"
+
+[SourceDisksFiles]
+blackshard.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12
+blackshard.DriverFiles = 12
+blackshard.DriverFiles.Delete = 12
+
+[DefaultInstall.NTamd64]
+OptionDesc = "Blackshard"
+CopyFiles  = blackshard.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = blackshard,,blackshard.Service
+
+[DefaultUninstall.NTamd64]
+LegacyUninstall = 1
+DelFiles   = blackshard.DriverFiles.Delete
+
+[DefaultUninstall.NTamd64.Services]
+DelService = blackshard,0x200
+
+[blackshard.Service]
+DisplayName    = "blackshard"
+Description    = "Blackshard"
+ServiceBinary  = %12%\blackshard.sys
+Dependencies   = "FltMgr"
+ServiceType    = 2
+StartType      = 3
+ErrorControl   = 1
+LoadOrderGroup = "FSFilter Anti-Virus"
+AddReg         = blackshard.AddRegistry
+
+[blackshard.AddRegistry]
+HKR,"Parameters","DebugFlags",0x00010001,0x0
+HKR,"Parameters","SupportedFeatures",0x00010001,0x3
+HKR,"Parameters\Instances","DefaultInstance",0x00000000,"blackshard Instance"
+HKR,"Parameters\Instances\blackshard Instance","Altitude",0x00000000,"328000"
+HKR,"Parameters\Instances\blackshard Instance","Flags",0x00010001,0x0
+
+[blackshard.DriverFiles]
+blackshard.sys
+
+[blackshard.DriverFiles.Delete]
+blackshard.sys
