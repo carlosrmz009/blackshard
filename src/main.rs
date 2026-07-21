@@ -27,11 +27,8 @@ extern "system" {
         lpOverlapped: *mut c_void,
     ) -> i32;
 
-    fn FilterReplyMessage(
-        hPort: HANDLE,
-        lpReplyBuffer: *mut c_void,
-        dwReplyBufferSize: u32,
-    ) -> i32;
+    fn FilterReplyMessage(hPort: HANDLE, lpReplyBuffer: *mut c_void, dwReplyBufferSize: u32)
+        -> i32;
 }
 
 #[repr(C)]
@@ -95,27 +92,33 @@ impl eframe::App for BlackshardApp {
         ctx.set_visuals(egui::Visuals::dark());
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.heading(egui::RichText::new("BLACKSHARD // AGENT ONLINE").color(egui::Color32::GREEN));
+            ui.heading(
+                egui::RichText::new("BLACKSHARD // AGENT ONLINE").color(egui::Color32::GREEN),
+            );
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                let logs = self.logs.lock().unwrap();
-                for log in logs.iter() {
-                    let color = if log.verdict == BLACKSHARD_VERDICT::Block {
-                        egui::Color32::RED
-                    } else {
-                        egui::Color32::WHITE
-                    };
-                    
-                    let text = format!("[{}] PID: {:<6} | Entropy: {:.2} | Verdict: {:?} | File: {}", 
-                                       log.timestamp, log.pid, log.entropy, log.verdict, log.file_path);
-                    
-                    ui.colored_label(color, text);
-                }
-            });
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    let logs = self.logs.lock().unwrap();
+                    for log in logs.iter() {
+                        let color = if log.verdict == BLACKSHARD_VERDICT::Block {
+                            egui::Color32::RED
+                        } else {
+                            egui::Color32::WHITE
+                        };
+
+                        let text = format!(
+                            "[{}] PID: {:<6} | Entropy: {:.2} | Verdict: {:?} | File: {}",
+                            log.timestamp, log.pid, log.entropy, log.verdict, log.file_path
+                        );
+
+                        ui.colored_label(color, text);
+                    }
+                });
         });
-        
+
         ctx.request_repaint();
     }
 }
@@ -172,7 +175,7 @@ fn run_telemetry_loop(logs: Arc<Mutex<Vec<LogEntry>>>) {
     }
 
     let mut message = unsafe { mem::zeroed::<BLACKSHARD_MESSAGE>() };
-    
+
     loop {
         let get_msg_hr = unsafe {
             FilterGetMessage(
@@ -188,8 +191,13 @@ fn run_telemetry_loop(logs: Arc<Mutex<Vec<LogEntry>>>) {
         }
 
         let pid = message.notification.process_id;
-        
-        let path_len = message.notification.file_path.iter().position(|&c| c == 0).unwrap_or(MAX_FILE_PATH_LENGTH);
+
+        let path_len = message
+            .notification
+            .file_path
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(MAX_FILE_PATH_LENGTH);
         let path = String::from_utf16_lossy(&message.notification.file_path[..path_len]);
 
         let openable_path = if path.starts_with("\\Device\\") {
@@ -220,7 +228,7 @@ fn run_telemetry_loop(logs: Arc<Mutex<Vec<LogEntry>>>) {
                 Status: 0,
                 MessageId: message.header.MessageId,
             },
-            verdict: final_verdict, 
+            verdict: final_verdict,
         };
 
         let _reply_hr = unsafe {
@@ -243,11 +251,17 @@ fn main() -> Result<(), eframe::Error> {
         run_telemetry_loop(logs_clone);
     });
 
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    wgpu_options.supported_backends = eframe::wgpu::Backends::DX12;
+    wgpu_options.power_preference = eframe::wgpu::PowerPreference::LowPower;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         ..Default::default()
     };
-    
+
     eframe::run_native(
         "Blackshard",
         options,
