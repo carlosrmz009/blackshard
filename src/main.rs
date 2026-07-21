@@ -1,9 +1,13 @@
+use chrono::Local;
+use eframe::egui;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::Read;
 use std::mem;
 use std::ptr;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HRESULT, S_OK};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
 
 #[link(name = "FltLib")]
 extern "system" {
@@ -14,20 +18,20 @@ extern "system" {
         wSizeOfContext: u16,
         lpSecurityAttributes: *const c_void,
         hPort: *mut HANDLE,
-    ) -> HRESULT;
+    ) -> i32;
 
     fn FilterGetMessage(
         hPort: HANDLE,
         lpMessageBuffer: *mut c_void,
         dwMessageBufferSize: u32,
         lpOverlapped: *mut c_void,
-    ) -> HRESULT;
+    ) -> i32;
 
     fn FilterReplyMessage(
         hPort: HANDLE,
         lpReplyBuffer: *mut c_void,
         dwReplyBufferSize: u32,
-    ) -> HRESULT;
+    ) -> i32;
 }
 
 #[repr(C)]
@@ -74,11 +78,52 @@ pub struct BLACKSHARD_REPLY_MSG {
     pub verdict: BLACKSHARD_VERDICT,
 }
 
+struct LogEntry {
+    timestamp: String,
+    pid: u32,
+    file_path: String,
+    entropy: f64,
+    verdict: BLACKSHARD_VERDICT,
+}
+
+struct BlackshardApp {
+    logs: Arc<Mutex<Vec<LogEntry>>>,
+}
+
+impl eframe::App for BlackshardApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
+
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.heading(egui::RichText::new("BLACKSHARD // AGENT ONLINE").color(egui::Color32::GREEN));
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                let logs = self.logs.lock().unwrap();
+                for log in logs.iter() {
+                    let color = if log.verdict == BLACKSHARD_VERDICT::Block {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::WHITE
+                    };
+                    
+                    let text = format!("[{}] PID: {:<6} | Entropy: {:.2} | Verdict: {:?} | File: {}", 
+                                       log.timestamp, log.pid, log.entropy, log.verdict, log.file_path);
+                    
+                    ui.colored_label(color, text);
+                }
+            });
+        });
+        
+        ctx.request_repaint();
+    }
+}
+
 fn calculate_entropy(file_path: &str) -> f64 {
     let mut file = match File::open(file_path) {
         Ok(f) => f,
-        Err(e) => {
-            eprintln!("[!] Warning: Could not open file for entropy check ({}). Reason: {}", file_path, e);
+        Err(_) => {
             return 0.0;
         }
     };
@@ -107,14 +152,10 @@ fn calculate_entropy(file_path: &str) -> f64 {
     entropy
 }
 
-fn main() {
-    println!("[*] Blackshard Daemon Starting...");
-
+fn run_telemetry_loop(logs: Arc<Mutex<Vec<LogEntry>>>) {
     let port_name: Vec<u16> = "\\BlackshardPort\0".encode_utf16().collect();
-    let mut port_handle: HANDLE = ptr::null_mut();
+    let mut port_handle: HANDLE = 0;
 
-    println!("[*] Attempting to connect to kernel port: \\BlackshardPort");
-    
     let hr = unsafe {
         FilterConnectCommunicationPort(
             port_name.as_ptr(),
@@ -127,12 +168,8 @@ fn main() {
     };
 
     if hr != S_OK {
-        eprintln!("[!] Failed to connect to port. Is the driver loaded? HRESULT: {:#010X}", hr);
         return;
     }
-
-    println!("[+] Successfully connected to Blackshard Minifilter Driver.");
-    println!("[*] Securing execution pipeline. Entering telemetry listening loop...\n");
 
     let mut message = unsafe { mem::zeroed::<BLACKSHARD_MESSAGE>() };
     
@@ -147,7 +184,6 @@ fn main() {
         };
 
         if get_msg_hr != S_OK {
-            eprintln!("[!] FilterGetMessage failed with HRESULT: {:#010X}", get_msg_hr);
             break;
         }
 
@@ -163,20 +199,21 @@ fn main() {
         };
 
         let entropy = calculate_entropy(&openable_path);
-        let mut final_verdict = BLACKSHARD_VERDICT::Allow;
-
-        if entropy > 7.2 {
-            println!("============================================================");
-            println!("[!!!] HIGH ENTROPY THREAT DETECTED [!!!]");
-            println!("  [>] PID     : {}", pid);
-            println!("  [>] File    : {}", path);
-            println!("  [>] Entropy : {:.2}", entropy);
-            println!("  [X] Verdict : BLOCK");
-            println!("============================================================");
-            final_verdict = BLACKSHARD_VERDICT::Block;
+        let final_verdict = if entropy > 7.2 {
+            BLACKSHARD_VERDICT::Block
         } else {
-            println!("[OK] PID: {:<6} | Entropy: {:.2} | Verdict: ALLOW | File: {}", pid, entropy, path);
-        }
+            BLACKSHARD_VERDICT::Allow
+        };
+
+        let timestamp = Local::now().format("%H:%M:%S").to_string();
+
+        logs.lock().unwrap().push(LogEntry {
+            timestamp,
+            pid,
+            file_path: path,
+            entropy,
+            verdict: final_verdict,
+        });
 
         let mut reply = BLACKSHARD_REPLY_MSG {
             header: FILTER_REPLY_HEADER {
@@ -186,19 +223,34 @@ fn main() {
             verdict: final_verdict, 
         };
 
-        let reply_hr = unsafe {
+        let _reply_hr = unsafe {
             FilterReplyMessage(
                 port_handle,
                 &mut reply as *mut _ as *mut c_void,
                 mem::size_of::<BLACKSHARD_REPLY_MSG>() as u32,
             )
         };
-
-        if reply_hr != S_OK {
-            eprintln!("[!] FilterReplyMessage failed with HRESULT: {:#010X}", reply_hr);
-        }
     }
 
     unsafe { CloseHandle(port_handle) };
-    println!("[*] Blackshard Daemon Shutting Down.");
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let logs_clone = Arc::clone(&logs);
+
+    thread::spawn(move || {
+        run_telemetry_loop(logs_clone);
+    });
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        ..Default::default()
+    };
+    
+    eframe::run_native(
+        "Blackshard",
+        options,
+        Box::new(|_cc| Box::new(BlackshardApp { logs }) as Box<dyn eframe::App>),
+    )
 }
