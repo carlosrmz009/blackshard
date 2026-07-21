@@ -1,5 +1,9 @@
 New-Item -ItemType Directory -Force -Path "dist"
 
+if (Test-Path "install.ps1") {
+    Copy-Item -Path "install.ps1" -Destination "dist\install.ps1" -Force
+}
+
 if (Test-Path "src\driver\blackshard.inf") {
     Copy-Item -Path "src\driver\blackshard.inf" -Destination "dist\blackshard.inf" -Force
 }
