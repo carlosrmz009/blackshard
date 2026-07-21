@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 windows-sys = { version = "0.52.0", features = ["Win32_Foundation"] }
+eframe = "0.27.2"
+chrono = "0.4.38"
