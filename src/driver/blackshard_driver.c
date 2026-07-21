@@ -21,6 +21,7 @@ typedef struct _BLACKSHARD_DATA {
     PFLT_FILTER FilterHandle;
     PFLT_PORT ServerPort;
     PFLT_PORT ClientPort;
+    HANDLE ClientProcessId;
 } BLACKSHARD_DATA, *PBLACKSHARD_DATA;
 
 BLACKSHARD_DATA gBlackshardData;
@@ -199,6 +200,10 @@ BlackshardPreCreate (
     BLACKSHARD_REPLY reply;
     ULONG replyLength = sizeof(BLACKSHARD_REPLY);
     ULONG copyLength;
+    ULONG requestorProcessId;
+    UCHAR createDisposition;
+    ACCESS_MASK desiredAccess;
+    LARGE_INTEGER timeout;
 
     UNREFERENCED_PARAMETER( FltObjects );
     UNREFERENCED_PARAMETER( CompletionContext );
@@ -206,6 +211,34 @@ BlackshardPreCreate (
     PAGED_CODE();
 
     if (Data->RequestorMode != UserMode) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    requestorProcessId = FltGetRequestorProcessId(Data);
+
+    /*
+     * The user-mode agent opens candidate files to inspect them. Sending those
+     * opens back to the same agent would deadlock the single message consumer.
+     */
+    if (gBlackshardData.ClientProcessId != NULL &&
+        requestorProcessId == HandleToULong(gBlackshardData.ClientProcessId)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (FlagOn(Data->Iopb->Parameters.Create.Options, FILE_DIRECTORY_FILE)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    createDisposition = (UCHAR)(Data->Iopb->Parameters.Create.Options >> 24);
+    if (createDisposition == FILE_CREATE ||
+        createDisposition == FILE_SUPERSEDE ||
+        createDisposition == FILE_OVERWRITE ||
+        createDisposition == FILE_OVERWRITE_IF) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    if ((desiredAccess & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) == 0) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -227,7 +260,7 @@ BlackshardPreCreate (
         RtlZeroMemory(&notification, sizeof(BLACKSHARD_NOTIFICATION));
         RtlZeroMemory(&reply, sizeof(BLACKSHARD_REPLY));
 
-        notification.ProcessId = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
+        notification.ProcessId = requestorProcessId;
 
         copyLength = nameInfo->Name.Length;
         if (copyLength >= (MAX_FILE_PATH_LENGTH * sizeof(WCHAR))) {
@@ -236,15 +269,20 @@ BlackshardPreCreate (
         RtlCopyMemory(notification.FilePath, nameInfo->Name.Buffer, copyLength);
         notification.FilePath[copyLength / sizeof(WCHAR)] = L'\0';
 
+        /* Relative timeout: never hold a file open for more than three seconds. */
+        timeout.QuadPart = -3LL * 10LL * 1000LL * 1000LL;
+
         status = FltSendMessage( gBlackshardData.FilterHandle,
                                  &gBlackshardData.ClientPort,
                                  &notification,
                                  sizeof(BLACKSHARD_NOTIFICATION),
                                  &reply,
                                  &replyLength,
-                                 NULL );
+                                 &timeout );
 
-        if (NT_SUCCESS(status) && reply.Verdict == VERDICT_BLOCK) {
+        if (status == STATUS_SUCCESS &&
+            replyLength == sizeof(BLACKSHARD_REPLY) &&
+            reply.Verdict == VERDICT_BLOCK) {
             
             KdPrint(("Blackshard: BLOCKED IRP_MJ_CREATE for PID %d, File: %ws\n", notification.ProcessId, notification.FilePath));
 
@@ -277,7 +315,8 @@ BlackshardPortConnect (
     PAGED_CODE();
 
     KdPrint(("Blackshard: User-space daemon connected.\n"));
-    
+
+    gBlackshardData.ClientProcessId = PsGetCurrentProcessId();
     gBlackshardData.ClientPort = ClientPort;
 
     return STATUS_SUCCESS;
@@ -296,6 +335,7 @@ BlackshardPortDisconnect (
 
     FltCloseClientPort( gBlackshardData.FilterHandle, &gBlackshardData.ClientPort );
     gBlackshardData.ClientPort = NULL;
+    gBlackshardData.ClientProcessId = NULL;
 }
 
 NTSTATUS

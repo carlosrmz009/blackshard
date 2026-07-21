@@ -44,11 +44,11 @@ LoadOrderGroup = "FSFilter Anti-Virus"
 AddReg         = blackshard.AddRegistry
 
 [blackshard.AddRegistry]
-HKR,"Parameters","DebugFlags",0x00010001,0x0
-HKR,"Parameters","SupportedFeatures",0x00010001,0x3
-HKR,"Parameters\Instances","DefaultInstance",0x00000000,"blackshard Instance"
-HKR,"Parameters\Instances\blackshard Instance","Altitude",0x00000000,"328000"
-HKR,"Parameters\Instances\blackshard Instance","Flags",0x00010001,0x0
+HKR,,"DebugFlags",0x00010001,0x0
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,"Instances","DefaultInstance",0x00000000,"blackshard Instance"
+HKR,"Instances\blackshard Instance","Altitude",0x00000000,"328000"
+HKR,"Instances\blackshard Instance","Flags",0x00010001,0x0
 
 [blackshard.DriverFiles]
 blackshard.sys

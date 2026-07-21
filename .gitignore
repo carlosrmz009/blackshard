@@ -1,2 +1,4 @@
 /target/
 /dist/
+/src/x64/
+/src/driver/x64/
