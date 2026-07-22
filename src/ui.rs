@@ -5,10 +5,11 @@
 //! update trust chain, or independent certification are healthy.
 
 use crate::config::Settings;
+use crate::elevation::{self, QuarantineAdminAction};
 use crate::history::{EventKind, SecurityEvent};
 use crate::ipc::{
-    DetectionVerdictView, IpcClient, QuarantineRecordView, ScanFindingView, ScanPhaseView,
-    ScanRequestKind, ServiceScanJob,
+    DetectionVerdictView, IpcClient, QuarantineRecordView, RpcErrorCode, ScanFindingView,
+    ScanPhaseView, ScanRequestKind, ServiceScanJob,
 };
 use crate::quarantine::IsolationState;
 use chrono::{DateTime, Local, Utc};
@@ -121,6 +122,7 @@ pub struct UiRuntimeState {
     pub protection_test: ProtectionTestStatus,
     pub realtime_scanned_files: u64,
     pub realtime_blocked_files: u64,
+    pub realtime_bypassed_requests: u64,
     pub last_realtime_path: Option<PathBuf>,
     pub desired_real_time_protection: bool,
     pub update_check_requested: bool,
@@ -141,6 +143,7 @@ impl Default for UiRuntimeState {
             protection_test: ProtectionTestStatus::Idle,
             realtime_scanned_files: 0,
             realtime_blocked_files: 0,
+            realtime_bypassed_requests: 0,
             last_realtime_path: None,
             desired_real_time_protection: true,
             update_check_requested: false,
@@ -485,6 +488,21 @@ impl BlackshardApp {
                     created: Instant::now(),
                 });
             }
+            Err(error) if error.code == RpcErrorCode::AccessDenied => {
+                self.settings_dirty = false;
+                self.notice = Some(match elevation::request_save_settings(&self.settings) {
+                    Ok(()) => Notice {
+                        level: NoticeLevel::Information,
+                        message: "Approve the Windows administrator prompt to apply these machine protection settings.".to_owned(),
+                        created: Instant::now(),
+                    },
+                    Err(error) => Notice {
+                        level: NoticeLevel::Error,
+                        message: format!("Administrator approval could not be requested: {error}"),
+                        created: Instant::now(),
+                    },
+                });
+            }
             Err(error) => {
                 self.notice = Some(Notice {
                     level: NoticeLevel::Error,
@@ -511,13 +529,23 @@ impl BlackshardApp {
         let sender = self.operation_sender.clone();
         thread::spawn(move || {
             let result = match operation {
-                QuarantineOperation::Restore => client
-                    .restore_quarantine(id)
-                    .map_err(|error| error.to_string()),
-                QuarantineOperation::Delete => client
-                    .delete_quarantine(id)
-                    .map_err(|error| error.to_string()),
-            };
+                QuarantineOperation::Restore => client.restore_quarantine(id),
+                QuarantineOperation::Delete => client.delete_quarantine(id),
+            }
+            .or_else(|error| {
+                if error.code != RpcErrorCode::AccessDenied {
+                    return Err(error.to_string());
+                }
+                let action = match operation {
+                    QuarantineOperation::Restore => QuarantineAdminAction::Restore,
+                    QuarantineOperation::Delete => QuarantineAdminAction::Delete,
+                };
+                elevation::request_quarantine_action(action, id).map(|()| {
+                    "Approve the Windows administrator prompt; the list will refresh automatically."
+                        .to_owned()
+                })
+            })
+            .map_err(|error| error.to_string());
             let _ = sender.send(QuarantineOutcome {
                 id,
                 operation,
@@ -764,7 +792,7 @@ impl BlackshardApp {
         }
         ui.add_space(12.0);
 
-        ui.columns(3, |columns| {
+        ui.columns(4, |columns| {
             stat_card(
                 &mut columns[0],
                 "REAL-TIME SCANNED",
@@ -783,6 +811,16 @@ impl BlackshardApp {
             );
             stat_card(
                 &mut columns[2],
+                "DEGRADED EVENTS",
+                &runtime.realtime_bypassed_requests.to_string(),
+                if runtime.realtime_bypassed_requests > 0 {
+                    AMBER
+                } else {
+                    GREEN
+                },
+            );
+            stat_card(
+                &mut columns[3],
                 "IN QUARANTINE",
                 &self.quarantine_records.len().to_string(),
                 if self.quarantine_records.is_empty() {
@@ -1455,6 +1493,20 @@ impl BlackshardApp {
                             created: Instant::now(),
                         });
                     }
+                    Err(error) if error.code == RpcErrorCode::AccessDenied => {
+                        self.notice = Some(match elevation::request_clear_activity() {
+                            Ok(()) => Notice {
+                                level: NoticeLevel::Information,
+                                message: "Approve the Windows administrator prompt to clear machine activity history.".to_owned(),
+                                created: Instant::now(),
+                            },
+                            Err(error) => Notice {
+                                level: NoticeLevel::Error,
+                                message: format!("Administrator approval could not be requested: {error}"),
+                                created: Instant::now(),
+                            },
+                        });
+                    }
                     Err(error) => {
                         self.notice = Some(Notice {
                             level: NoticeLevel::Error,
@@ -2011,9 +2063,11 @@ mod tests {
 
     #[test]
     fn active_label_requires_engine_and_filter() {
-        let mut state = UiRuntimeState::default();
-        state.protection = ProtectionStatus::Active;
-        state.driver = DriverStatus::Disconnected("test".to_owned());
+        let mut state = UiRuntimeState {
+            protection: ProtectionStatus::Active,
+            driver: DriverStatus::Disconnected("test".to_owned()),
+            ..UiRuntimeState::default()
+        };
         assert_eq!(compact_health(&state).0, "PROTECTION LIMITED");
 
         state.driver = DriverStatus::Connected;
@@ -2022,8 +2076,10 @@ mod tests {
 
     #[test]
     fn known_driver_failure_overrides_starting_state() {
-        let mut state = UiRuntimeState::default();
-        state.driver = DriverStatus::NotInstalled;
+        let state = UiRuntimeState {
+            driver: DriverStatus::NotInstalled,
+            ..UiRuntimeState::default()
+        };
         assert_eq!(compact_health(&state).0, "PROTECTION LIMITED");
         assert_eq!(overall_health(&state).0, "ON-DEMAND ONLY");
     }

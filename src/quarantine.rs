@@ -1,5 +1,7 @@
 use crate::atomic_file;
 use crate::detection::opened_file_id;
+#[cfg(windows)]
+use crate::detection::opened_file_identity;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use chrono::{DateTime, Utc};
@@ -174,6 +176,16 @@ impl QuarantineStore {
                     "the file size changed after it was scanned; quarantine was aborted",
                 ));
             }
+            #[cfg(windows)]
+            {
+                let identity = opened_file_identity(&input)?;
+                if identity.link_count > 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "automatic quarantine cannot prove isolation because the file has additional hard links",
+                    ));
+                }
+            }
             if let Some(expected_file_id) = expected_file_id {
                 let actual_file_id = opened_file_id(&input)?;
                 if actual_file_id != expected_file_id {
@@ -305,7 +317,7 @@ impl QuarantineStore {
                 }
             }
         }
-        records.sort_by(|left, right| right.quarantined_at.cmp(&left.quarantined_at));
+        records.sort_by_key(|record| std::cmp::Reverse(record.quarantined_at));
         Ok(records)
     }
 

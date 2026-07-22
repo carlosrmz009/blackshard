@@ -1,18 +1,20 @@
 #include <fltKernel.h>
 #include <dontuse.h>
 
-#define BLACKSHARD_PROTOCOL_MAGIC 0x33485342UL /* "BSH3" */
-#define BLACKSHARD_PROTOCOL_VERSION 3
+#define BLACKSHARD_PROTOCOL_MAGIC 0x35485342UL /* "BSH5" */
+#define BLACKSHARD_PROTOCOL_VERSION 5
 #define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
 #define BLACKSHARD_STREAM_CONTEXT_TAG 'cShB'
 #define MAX_FILE_PATH_LENGTH 1024
 
 #define BLACKSHARD_OPERATION_OPEN 1UL
 #define BLACKSHARD_OPERATION_EXECUTE_SECTION 2UL
+#define BLACKSHARD_OPERATION_PROTECTED_WRITE 3UL
+#define BLACKSHARD_OPERATION_PROTECTED_METADATA 4UL
 #define BLACKSHARD_CONTROL_GET_HEALTH 1UL
 
 /*
- * Protocol V3 is intentionally fixed-width. User mode must validate Size,
+ * Protocol V5 is intentionally fixed-width. User mode must validate Size,
  * Magic, and Version before using any field. FileId is the live file-system
  * identity returned by FileInternalInformation for the exact FILE_OBJECT.
  */
@@ -27,6 +29,7 @@ typedef struct _BLACKSHARD_NOTIFICATION {
     WCHAR FilePath[MAX_FILE_PATH_LENGTH];
     ULONGLONG FileId;
     ULONGLONG ContentGeneration;
+    ULONGLONG ProcessStartKey;
     ULONG MustEnforce;
     ULONG Reserved;
 } BLACKSHARD_NOTIFICATION, *PBLACKSHARD_NOTIFICATION;
@@ -73,6 +76,9 @@ typedef struct _BLACKSHARD_STREAM_CONTEXT {
     volatile LONG IdentityValid;
     volatile LONG Reserved;
     volatile LONG64 ContentGeneration;
+    volatile LONG LastWriteProcessId;
+    volatile LONG WriteReserved;
+    volatile LONG64 LastWriteNotificationTick;
 } BLACKSHARD_STREAM_CONTEXT, *PBLACKSHARD_STREAM_CONTEXT;
 
 typedef struct _BLACKSHARD_DATA {
@@ -96,8 +102,9 @@ typedef struct _BLACKSHARD_DATA {
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FilePath) == 24);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FileId) == 2072);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ContentGeneration) == 2080);
-C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, MustEnforce) == 2088);
-C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 2096);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ProcessStartKey) == 2088);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, MustEnforce) == 2096);
+C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 2104);
 C_ASSERT(sizeof(BLACKSHARD_REPLY) == 16);
 C_ASSERT(sizeof(BLACKSHARD_CONTROL_REQUEST) == 12);
 C_ASSERT(sizeof(BLACKSHARD_HEALTH_REPLY) == 96);
@@ -128,6 +135,13 @@ BlackshardPostCreate (
 
 FLT_PREOP_CALLBACK_STATUS
 BlackshardPreWrite (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    );
+
+FLT_PREOP_CALLBACK_STATUS
+BlackshardPreSetInformation (
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
@@ -171,6 +185,17 @@ BlackshardShouldScanName (
     );
 
 BOOLEAN
+BlackshardIsProtectedDocumentName (
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    );
+
+BOOLEAN
+BlackshardNameContainsInsensitive (
+    _In_ PCUNICODE_STRING Name,
+    _In_ PCUNICODE_STRING Fragment
+    );
+
+BOOLEAN
 BlackshardEvaluateOpenedObject (
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -194,6 +219,8 @@ BlackshardGetOrCreateStreamContext (
 #pragma alloc_text(PAGE, BlackshardPortDisconnect)
 #pragma alloc_text(PAGE, BlackshardPortMessage)
 #pragma alloc_text(PAGE, BlackshardShouldScanName)
+#pragma alloc_text(PAGE, BlackshardIsProtectedDocumentName)
+#pragma alloc_text(PAGE, BlackshardNameContainsInsensitive)
 #pragma alloc_text(PAGE, BlackshardEvaluateOpenedObject)
 
 CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
@@ -221,6 +248,12 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
         IRP_MJ_WRITE,
         0,
         BlackshardPreWrite,
+        NULL
+    },
+    {
+        IRP_MJ_SET_INFORMATION,
+        0,
+        BlackshardPreSetInformation,
         NULL
     },
     {
@@ -468,17 +501,81 @@ BlackshardPreWrite (
 {
     NTSTATUS status;
     PBLACKSHARD_STREAM_CONTEXT streamContext;
+    ULONG requestorProcessId;
+    ULONGLONG now;
+    ULONGLONG previousTick;
+    LONG previousProcessId;
+    BOOLEAN sendTelemetry;
+    BOOLEAN block;
 
     if (CompletionContext != NULL) {
         *CompletionContext = NULL;
     }
 
-    if (KeGetCurrentIrql() > APC_LEVEL ||
+    if (Data->RequestorMode != UserMode ||
+        KeGetCurrentIrql() > APC_LEVEL ||
         Data->Iopb->Parameters.Write.Length == 0 ||
         FltObjects->Instance == NULL ||
         FltObjects->FileObject == NULL ||
         FlagOn(FltObjects->FileObject->Flags, FO_STREAM_FILE | FO_VOLUME_OPEN)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    sendTelemetry = FALSE;
+    requestorProcessId = FltGetRequestorProcessId(Data);
+    status = BlackshardGetOrCreateStreamContext(
+        FltObjects,
+        FALSE,
+        0,
+        &streamContext
+        );
+    if (NT_SUCCESS(status)) {
+        now = KeQueryInterruptTime();
+        previousProcessId = InterlockedCompareExchange(
+            &streamContext->LastWriteProcessId,
+            0,
+            0
+            );
+        previousTick = (ULONGLONG)InterlockedCompareExchange64(
+            &streamContext->LastWriteNotificationTick,
+            0,
+            0
+            );
+        if (requestorProcessId != 0 &&
+            (previousProcessId != (LONG)requestorProcessId ||
+             now - previousTick >= 10ULL * 1000ULL * 1000ULL)) {
+            InterlockedExchange(
+                &streamContext->LastWriteProcessId,
+                (LONG)requestorProcessId
+                );
+            InterlockedExchange64(
+                &streamContext->LastWriteNotificationTick,
+                (LONG64)now
+                );
+            sendTelemetry = TRUE;
+        }
+        FltReleaseContext(streamContext);
+    }
+
+    if (sendTelemetry &&
+        gBlackshardData.ClientPort != NULL &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL &&
+        !KeAreAllApcsDisabled() &&
+        IoGetTopLevelIrp() == NULL) {
+        block = BlackshardEvaluateOpenedObject(
+            Data,
+            FltObjects,
+            BLACKSHARD_OPERATION_PROTECTED_WRITE,
+            FALSE,
+            0,
+            TRUE
+            );
+        if (block) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            InterlockedIncrement64(&gBlackshardData.Blocks);
+            return FLT_PREOP_COMPLETE;
+        }
     }
 
     status = BlackshardGetOrCreateStreamContext(
@@ -494,6 +591,65 @@ BlackshardPreWrite (
     }
 
     /* Mark before dispatch: a failed write causes only a conservative rescan. */
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+FLT_PREOP_CALLBACK_STATUS
+BlackshardPreSetInformation (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    )
+{
+    FILE_INFORMATION_CLASS informationClass;
+    BOOLEAN relevant;
+    BOOLEAN block;
+
+    if (CompletionContext != NULL) {
+        *CompletionContext = NULL;
+    }
+
+    if (Data->RequestorMode != UserMode ||
+        FltObjects->Instance == NULL ||
+        FltObjects->FileObject == NULL ||
+        FlagOn(FltObjects->FileObject->Flags, FO_STREAM_FILE | FO_VOLUME_OPEN)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    informationClass =
+        Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    relevant = (BOOLEAN)(
+        informationClass == FileDispositionInformation ||
+        informationClass == FileDispositionInformationEx ||
+        informationClass == FileRenameInformation ||
+        informationClass == FileRenameInformationEx
+        );
+    if (!relevant) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
+        KeAreAllApcsDisabled() ||
+        IoGetTopLevelIrp() != NULL) {
+        InterlockedIncrement64(&gBlackshardData.IrqlBypasses);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    block = BlackshardEvaluateOpenedObject(
+        Data,
+        FltObjects,
+        BLACKSHARD_OPERATION_PROTECTED_METADATA,
+        FALSE,
+        0,
+        TRUE
+        );
+    if (block) {
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+        InterlockedIncrement64(&gBlackshardData.Blocks);
+        return FLT_PREOP_COMPLETE;
+    }
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -580,6 +736,8 @@ BlackshardEvaluateOpenedObject (
     BLACKSHARD_REPLY reply;
     ULONG replyLength;
     ULONG requestorProcessId;
+    PEPROCESS requestorProcess;
+    ULONGLONG processStartKey;
     ULONG pathLength;
     ULONGLONG contentGeneration;
     LARGE_INTEGER timeout;
@@ -595,6 +753,16 @@ BlackshardEvaluateOpenedObject (
     if (requestorProcessId == 0 ||
         (gBlackshardData.ClientProcessId != NULL &&
          requestorProcessId == HandleToULong(gBlackshardData.ClientProcessId))) {
+        return FALSE;
+    }
+    requestorProcess = FltGetRequestorProcess(Data);
+    if (requestorProcess == NULL) {
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        return FALSE;
+    }
+    processStartKey = PsGetProcessStartKey(requestorProcess);
+    if (processStartKey == 0) {
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
         return FALSE;
     }
 
@@ -616,10 +784,22 @@ BlackshardEvaluateOpenedObject (
         return FALSE;
     }
 
-    if (RestrictToHighRiskName &&
-        !BlackshardShouldScanName(nameInformation, (ACCESS_MASK)DesiredAccess)) {
-        FltReleaseFileNameInformation(nameInformation);
-        return FALSE;
+    if (RestrictToHighRiskName) {
+        if ((Operation == BLACKSHARD_OPERATION_PROTECTED_WRITE ||
+             Operation == BLACKSHARD_OPERATION_PROTECTED_METADATA) &&
+            !BlackshardIsProtectedDocumentName(nameInformation)) {
+            FltReleaseFileNameInformation(nameInformation);
+            return FALSE;
+        }
+        if (Operation != BLACKSHARD_OPERATION_PROTECTED_WRITE &&
+            Operation != BLACKSHARD_OPERATION_PROTECTED_METADATA &&
+            !BlackshardShouldScanName(
+                nameInformation,
+                (ACCESS_MASK)DesiredAccess
+                )) {
+            FltReleaseFileNameInformation(nameInformation);
+            return FALSE;
+        }
     }
 
     /* Resolve object identity only after the inexpensive name prefilter. */
@@ -703,12 +883,17 @@ BlackshardEvaluateOpenedObject (
     notification.FilePath[pathLength] = L'\0';
     notification.FileId = (ULONGLONG)internalInformation.IndexNumber.QuadPart;
     notification.ContentGeneration = contentGeneration;
+    notification.ProcessStartKey = processStartKey;
     notification.MustEnforce = MustEnforce;
 
     FltReleaseFileNameInformation(nameInformation);
 
     replyLength = sizeof(reply);
-    timeout.QuadPart = -15LL * 1000LL * 1000LL;
+    timeout.QuadPart =
+        (Operation == BLACKSHARD_OPERATION_PROTECTED_WRITE ||
+         Operation == BLACKSHARD_OPERATION_PROTECTED_METADATA)
+        ? -1LL * 1000LL * 1000LL
+        : -15LL * 1000LL * 1000LL;
     InterlockedIncrement64(&gBlackshardData.ScanRequests);
 
     status = FltSendMessage(
@@ -895,6 +1080,109 @@ BlackshardShouldScanName (
         }
     }
 
+    return FALSE;
+}
+
+BOOLEAN
+BlackshardIsProtectedDocumentName (
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    )
+{
+    static const UNICODE_STRING extensions[] = {
+        RTL_CONSTANT_STRING(L"doc"), RTL_CONSTANT_STRING(L"docx"),
+        RTL_CONSTANT_STRING(L"docm"), RTL_CONSTANT_STRING(L"xls"),
+        RTL_CONSTANT_STRING(L"xlsx"), RTL_CONSTANT_STRING(L"xlsm"),
+        RTL_CONSTANT_STRING(L"ppt"), RTL_CONSTANT_STRING(L"pptx"),
+        RTL_CONSTANT_STRING(L"pptm"), RTL_CONSTANT_STRING(L"pdf"),
+        RTL_CONSTANT_STRING(L"txt"), RTL_CONSTANT_STRING(L"rtf"),
+        RTL_CONSTANT_STRING(L"csv"), RTL_CONSTANT_STRING(L"jpg"),
+        RTL_CONSTANT_STRING(L"jpeg"), RTL_CONSTANT_STRING(L"png"),
+        RTL_CONSTANT_STRING(L"gif"), RTL_CONSTANT_STRING(L"bmp"),
+        RTL_CONSTANT_STRING(L"svg"), RTL_CONSTANT_STRING(L"mp3"),
+        RTL_CONSTANT_STRING(L"wav"), RTL_CONSTANT_STRING(L"mp4"),
+        RTL_CONSTANT_STRING(L"mov"), RTL_CONSTANT_STRING(L"avi"),
+        RTL_CONSTANT_STRING(L"zip"), RTL_CONSTANT_STRING(L"7z"),
+        RTL_CONSTANT_STRING(L"rar"), RTL_CONSTANT_STRING(L"sql"),
+        RTL_CONSTANT_STRING(L"db"), RTL_CONSTANT_STRING(L"sqlite"),
+        RTL_CONSTANT_STRING(L"psd"), RTL_CONSTANT_STRING(L"ai")
+    };
+    static const UNICODE_STRING users = RTL_CONSTANT_STRING(L"\\users\\");
+    static const UNICODE_STRING protectedFolders[] = {
+        RTL_CONSTANT_STRING(L"\\desktop\\"),
+        RTL_CONSTANT_STRING(L"\\documents\\"),
+        RTL_CONSTANT_STRING(L"\\pictures\\"),
+        RTL_CONSTANT_STRING(L"\\music\\"),
+        RTL_CONSTANT_STRING(L"\\videos\\"),
+        RTL_CONSTANT_STRING(L"\\favorites\\"),
+        RTL_CONSTANT_STRING(L"\\onedrive\\"),
+        RTL_CONSTANT_STRING(L"\\onedrive - ")
+    };
+    ULONG index;
+    BOOLEAN protectedFolder;
+
+    PAGED_CODE();
+
+    if (NameInfo->Extension.Length == 0 ||
+        !BlackshardNameContainsInsensitive(&NameInfo->Name, &users)) {
+        return FALSE;
+    }
+    protectedFolder = FALSE;
+    for (index = 0; index < RTL_NUMBER_OF(protectedFolders); index++) {
+        if (BlackshardNameContainsInsensitive(
+                &NameInfo->Name,
+                &protectedFolders[index]
+                )) {
+            protectedFolder = TRUE;
+            break;
+        }
+    }
+    if (!protectedFolder) {
+        return FALSE;
+    }
+    for (index = 0; index < RTL_NUMBER_OF(extensions); index++) {
+        if (RtlEqualUnicodeString(&NameInfo->Extension, &extensions[index], TRUE)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+BOOLEAN
+BlackshardNameContainsInsensitive (
+    _In_ PCUNICODE_STRING Name,
+    _In_ PCUNICODE_STRING Fragment
+    )
+{
+    USHORT nameCharacters;
+    USHORT fragmentCharacters;
+    USHORT start;
+    USHORT offset;
+    BOOLEAN match;
+
+    PAGED_CODE();
+
+    if (Name == NULL || Fragment == NULL ||
+        Name->Buffer == NULL || Fragment->Buffer == NULL ||
+        Fragment->Length == 0 || Name->Length < Fragment->Length) {
+        return FALSE;
+    }
+    nameCharacters = Name->Length / sizeof(WCHAR);
+    fragmentCharacters = Fragment->Length / sizeof(WCHAR);
+    for (start = 0;
+         start <= nameCharacters - fragmentCharacters;
+         start++) {
+        match = TRUE;
+        for (offset = 0; offset < fragmentCharacters; offset++) {
+            if (RtlUpcaseUnicodeChar(Name->Buffer[start + offset]) !=
+                RtlUpcaseUnicodeChar(Fragment->Buffer[offset])) {
+                match = FALSE;
+                break;
+            }
+        }
+        if (match) {
+            return TRUE;
+        }
+    }
     return FALSE;
 }
 

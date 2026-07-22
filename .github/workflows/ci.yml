@@ -1,0 +1,71 @@
+name: security-ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+    - cron: "43 3 * * 6"
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release
+      - name: Build minifilter and development distribution
+        shell: pwsh
+        run: .\deploy.ps1
+      - name: Upload development test package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: blackshard-development-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Parse PowerShell sources
+        shell: pwsh
+        run: |
+          $failed = $false
+          @(Get-ChildItem -Recurse -File | Where-Object Extension -eq '.ps1') | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) {
+              $failed = $true
+              $errors | ForEach-Object { Write-Error "$($_.Extent.File): $($_.Message)" }
+            }
+          }
+          if ($failed) { exit 1 }
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  fuzz-smoke:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 3 * * 6'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
+        with:
+          toolchain: nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz byte scanner
+        run: cargo +nightly fuzz run scan_bytes -- -runs=10000 -max_len=1048576
+      - name: Fuzz VBA decompressor
+        run: cargo +nightly fuzz run vba_decompress -- -runs=10000 -max_len=1048576

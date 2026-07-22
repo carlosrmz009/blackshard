@@ -1,0 +1,26 @@
+[package]
+name = "blackshard-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blackshard = { path = ".." }
+
+[[bin]]
+name = "scan_bytes"
+path = "fuzz_targets/scan_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vba_decompress"
+path = "fuzz_targets/vba_decompress.rs"
+test = false
+doc = false
+bench = false

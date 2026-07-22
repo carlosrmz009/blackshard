@@ -390,6 +390,7 @@ impl ScanEngine {
             ContentType::Script(_) => {
                 analyze_script(bytes, self.config.max_script_sample_bytes, &mut evidence)
             }
+            ContentType::Pdf => analyze_pdf(bytes, &mut evidence),
             _ => {
                 if entropy >= HIGH_ENTROPY_THRESHOLD && bytes.len() >= MIN_SECTION_ENTROPY_BYTES {
                     push_evidence(
@@ -1088,6 +1089,64 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
     }
 }
 
+fn analyze_pdf(bytes: &[u8], evidence: &mut Vec<Evidence>) {
+    let javascript = contains_pdf_name(bytes, b"JavaScript") || contains_pdf_name(bytes, b"JS");
+    let automatic_action =
+        contains_pdf_name(bytes, b"OpenAction") || contains_pdf_name(bytes, b"AA");
+    if javascript && automatic_action {
+        push_evidence(
+            evidence,
+            "pdf.automatic_javascript",
+            EvidenceSeverity::High,
+            60,
+            "PDF combines JavaScript with an automatic document action".to_owned(),
+        );
+    } else if javascript {
+        push_evidence(
+            evidence,
+            "pdf.javascript",
+            EvidenceSeverity::Low,
+            15,
+            "PDF declares JavaScript content".to_owned(),
+        );
+    }
+    if contains_pdf_name(bytes, b"Launch") {
+        push_evidence(
+            evidence,
+            "pdf.launch_action",
+            EvidenceSeverity::High,
+            55,
+            "PDF contains an external-program launch action".to_owned(),
+        );
+    }
+    if contains_pdf_name(bytes, b"EmbeddedFile") && contains_pdf_name(bytes, b"Filespec") {
+        push_evidence(
+            evidence,
+            "pdf.embedded_file",
+            EvidenceSeverity::Low,
+            10,
+            "PDF contains an embedded file object".to_owned(),
+        );
+    }
+}
+
+fn contains_pdf_name(bytes: &[u8], name: &[u8]) -> bool {
+    let token_length = name.len().saturating_add(1);
+    bytes
+        .windows(token_length)
+        .enumerate()
+        .any(|(offset, token)| {
+            token.first() == Some(&b'/')
+                && token[1..]
+                    .iter()
+                    .zip(name)
+                    .all(|(left, right)| left.eq_ignore_ascii_case(right))
+                && bytes
+                    .get(offset + token_length)
+                    .is_none_or(|next| next.is_ascii_whitespace() || b"()<>[]{}/%".contains(next))
+        })
+}
+
 fn contains_long_base64_token(text: &str, minimum_length: usize) -> bool {
     text.split(|character: char| {
         !character.is_ascii_alphanumeric()
@@ -1404,6 +1463,35 @@ mod tests {
             ..ScanConfig::default()
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_pdf_javascript_is_suspicious() {
+        let pdf = b"%PDF-1.7\n1 0 obj << /OpenAction 2 0 R /JavaScript (alert) >> endobj";
+        let report = ScanEngine::default().scan_bytes(pdf);
+        assert_eq!(report.content_type, ContentType::Pdf);
+        assert_eq!(report.verdict, Verdict::Suspicious);
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "pdf.automatic_javascript"));
+    }
+
+    #[test]
+    fn ordinary_pdf_header_is_not_escalated() {
+        let report = ScanEngine::default().scan_bytes(b"%PDF-1.7\nordinary text");
+        assert_eq!(report.verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn pdf_name_prefixes_do_not_create_active_content_signals() {
+        let report =
+            ScanEngine::default().scan_bytes(b"%PDF-1.7\n<< /OpenActionable true /JSON (data) >>");
+        assert_eq!(report.verdict, Verdict::Clean);
+        assert!(report
+            .evidence
+            .iter()
+            .all(|item| !item.code.starts_with("pdf.")));
     }
 
     fn eicar_bytes() -> Vec<u8> {

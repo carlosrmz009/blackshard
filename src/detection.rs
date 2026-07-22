@@ -1,10 +1,13 @@
-use crate::amsi::{AmsiScanReport, AmsiScanner, AmsiVerdict};
-use crate::engine::{ScanEngine, ScanReport, Verdict as StaticVerdict};
+use crate::amsi::{AmsiScanReport, AmsiScanner};
+use crate::archive::{inspect_gzip, inspect_ole, inspect_zip, ContainerInspection};
+use crate::definitions::{DefinitionMatchRateCircuitBreaker, DefinitionMatchRateState};
+use crate::engine::{ContentType, ScanEngine, ScanReport, Verdict as StaticVerdict};
 use crate::rules::{RuleDisposition, RuleEngine, RuleMatch};
+use crate::similarity::{SimilarityEngine, SimilarityMatch};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +30,12 @@ pub struct DetectionReport {
     pub truncated: bool,
     pub static_report: Option<ScanReport>,
     pub rule_matches: Vec<RuleMatch>,
+    /// Authenticated family-similarity results. These are advisory and require
+    /// corroboration; they never authorize blocking or quarantine alone.
+    pub similarity_matches: Vec<SimilarityMatch>,
+    /// Bounded findings from ZIP/OOXML contents. Entries are scanned in memory
+    /// and are never extracted to the filesystem.
+    pub container_inspection: Option<ContainerInspection>,
     /// Result returned by the locally registered Windows AMSI provider. This is
     /// kept separate from Blackshard's signatures and heuristics so callers can
     /// apply a non-destructive execution policy without authorizing quarantine.
@@ -41,9 +50,10 @@ pub struct DetectionReport {
     /// signature. YARA/heuristic matches can still report malicious or
     /// suspicious findings, but cannot trigger destructive automatic action.
     pub automatic_quarantine_eligible: bool,
-    /// True for a trusted exact signature, an explicit malicious rule, or a
-    /// Windows AMSI provider/policy detection. Unlike quarantine, an execution
-    /// deny is reversible and does not mutate the candidate.
+    /// True for a trusted exact signature or a Windows AMSI provider/policy
+    /// detection. Publisher-defined YARA classifications remain alert-only
+    /// until independently corroborated. Unlike quarantine, an execution deny
+    /// is reversible and does not mutate the candidate.
     pub execution_block_eligible: bool,
 }
 
@@ -68,6 +78,8 @@ impl DetectionReport {
             truncated: false,
             static_report: None,
             rule_matches: Vec::new(),
+            similarity_matches: Vec::new(),
+            container_inspection: None,
             amsi_report: None,
             amsi_error: None,
             elapsed,
@@ -77,13 +89,44 @@ impl DetectionReport {
             execution_block_eligible: false,
         }
     }
+
+    pub(crate) fn ransomware_behavior(
+        _distinct_files: usize,
+        block: bool,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            verdict: DetectionVerdict::Suspicious,
+            risk_score: 95,
+            confidence: 90,
+            threat_name: Some("Behavior.Ransomware.MassModification".to_owned()),
+            sha256: None,
+            file_size: 0,
+            bytes_scanned: 0,
+            truncated: false,
+            static_report: None,
+            rule_matches: Vec::new(),
+            similarity_matches: Vec::new(),
+            container_inspection: None,
+            amsi_report: None,
+            amsi_error: None,
+            elapsed,
+            from_cache: false,
+            error: None,
+            automatic_quarantine_eligible: false,
+            execution_block_eligible: block,
+        }
+    }
 }
 
 pub struct DetectionEngine {
     static_engine: ScanEngine,
     rules: RuleEngine,
+    similarity: SimilarityEngine,
     amsi: Option<Arc<AmsiScanner>>,
     amsi_initialization_error: Option<String>,
+    external_rule_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
+    external_similarity_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
 }
 
 impl DetectionEngine {
@@ -95,9 +138,19 @@ impl DetectionEngine {
         Self {
             static_engine,
             rules,
+            similarity: SimilarityEngine::default(),
             amsi,
             amsi_initialization_error,
+            external_rule_circuit_breaker: Mutex::new(DefinitionMatchRateCircuitBreaker::default()),
+            external_similarity_circuit_breaker: Mutex::new(
+                DefinitionMatchRateCircuitBreaker::default(),
+            ),
         }
+    }
+
+    pub fn with_similarity(mut self, similarity: SimilarityEngine) -> Self {
+        self.similarity = similarity;
+        self
     }
 
     pub fn builtin() -> Result<Self, String> {
@@ -200,7 +253,7 @@ impl DetectionEngine {
             .max(sample.len() as u64 + u64::from(observed_extra));
         let static_report = self.static_engine.scan_sample(&sample, declared_size);
         let rule_matches = match self.rules.scan(&sample) {
-            Ok(matches) => matches,
+            Ok(matches) => self.apply_external_rule_circuit_breaker(matches),
             Err(error) => {
                 return DetectionReport {
                     verdict: DetectionVerdict::Error,
@@ -213,22 +266,61 @@ impl DetectionEngine {
                     truncated: static_report.truncated,
                     static_report: Some(static_report),
                     rule_matches: Vec::new(),
+                    similarity_matches: Vec::new(),
+                    container_inspection: None,
+                    amsi_report: None,
+                    amsi_error: None,
                     elapsed: started.elapsed(),
                     from_cache: false,
                     error: Some(error),
                     automatic_quarantine_eligible: false,
+                    execution_block_eligible: false,
                 }
             }
         };
+        let similarity_matches =
+            self.apply_similarity_circuit_breaker(self.similarity.scan(&sample, declared_size));
+        let (amsi_report, amsi_error) = self.scan_with_amsi(&static_report, &rule_matches, &sample);
 
-        combine(static_report, rule_matches, started.elapsed())
+        let report = combine(
+            static_report,
+            rule_matches,
+            similarity_matches,
+            amsi_report,
+            amsi_error,
+            started.elapsed(),
+        );
+        self.with_container_inspection(&sample, report, started)
     }
 
     pub fn scan_bytes(&self, bytes: &[u8]) -> DetectionReport {
         let started = Instant::now();
+        let report = self.scan_leaf_bytes(bytes);
+        self.with_container_inspection(bytes, report, started)
+    }
+
+    /// Scans one already-expanded object without recursively opening it as a
+    /// container. The archive walker owns the single recursion/resource budget.
+    pub(crate) fn scan_leaf_bytes(&self, bytes: &[u8]) -> DetectionReport {
+        let started = Instant::now();
         let static_report = self.static_engine.scan_bytes(bytes);
         match self.rules.scan(bytes) {
-            Ok(rule_matches) => combine(static_report, rule_matches, started.elapsed()),
+            Ok(rule_matches) => {
+                let rule_matches = self.apply_external_rule_circuit_breaker(rule_matches);
+                let similarity_matches = self.apply_similarity_circuit_breaker(
+                    self.similarity.scan(bytes, bytes.len() as u64),
+                );
+                let (amsi_report, amsi_error) =
+                    self.scan_with_amsi(&static_report, &rule_matches, bytes);
+                combine(
+                    static_report,
+                    rule_matches,
+                    similarity_matches,
+                    amsi_report,
+                    amsi_error,
+                    started.elapsed(),
+                )
+            }
             Err(error) => DetectionReport {
                 verdict: DetectionVerdict::Error,
                 risk_score: static_report.risk_score,
@@ -240,11 +332,116 @@ impl DetectionEngine {
                 truncated: static_report.truncated,
                 static_report: Some(static_report),
                 rule_matches: Vec::new(),
+                similarity_matches: Vec::new(),
+                container_inspection: None,
+                amsi_report: None,
+                amsi_error: None,
                 elapsed: started.elapsed(),
                 from_cache: false,
                 error: Some(error),
                 automatic_quarantine_eligible: false,
+                execution_block_eligible: false,
             },
+        }
+    }
+
+    fn with_container_inspection(
+        &self,
+        bytes: &[u8],
+        mut report: DetectionReport,
+        started: Instant,
+    ) -> DetectionReport {
+        let content_type = report
+            .static_report
+            .as_ref()
+            .map(|static_report| static_report.content_type);
+        if report.truncated
+            || !matches!(
+                content_type,
+                Some(ContentType::Zip | ContentType::Gzip | ContentType::OleCompound)
+            )
+        {
+            report.elapsed = started.elapsed();
+            return report;
+        }
+
+        let inspection = match content_type {
+            Some(ContentType::Zip) => inspect_zip(bytes, |entry| self.scan_leaf_bytes(entry)),
+            Some(ContentType::OleCompound) => {
+                inspect_ole(bytes, |entry| self.scan_leaf_bytes(entry))
+            }
+            Some(ContentType::Gzip) => inspect_gzip(bytes, |entry| self.scan_leaf_bytes(entry)),
+            _ => unreachable!("container type was checked above"),
+        };
+        let strongest = inspection
+            .findings
+            .iter()
+            .max_by_key(|finding| (finding.verdict_rank(), finding.risk_score));
+        if let Some(finding) = strongest {
+            match finding.verdict {
+                DetectionVerdict::Malicious => {
+                    report.verdict = DetectionVerdict::Malicious;
+                    report.risk_score = report.risk_score.max(finding.risk_score);
+                    report.confidence = report.confidence.max(95);
+                }
+                DetectionVerdict::Suspicious if report.verdict == DetectionVerdict::Clean => {
+                    report.verdict = DetectionVerdict::Suspicious;
+                    report.risk_score = report.risk_score.max(finding.risk_score);
+                    report.confidence = report.confidence.max(80);
+                }
+                DetectionVerdict::Error
+                | DetectionVerdict::Clean
+                | DetectionVerdict::Suspicious => {}
+            }
+            if report.threat_name.is_none() || finding.verdict == DetectionVerdict::Malicious {
+                let nested_name = finding
+                    .threat_name
+                    .as_deref()
+                    .unwrap_or("Suspicious.EmbeddedObject");
+                report.threat_name = Some(format!("Container.Contains.{nested_name}"));
+            }
+            report.automatic_quarantine_eligible |= finding.automatic_quarantine_eligible
+                && report.sha256.is_some()
+                && !report.truncated;
+            report.execution_block_eligible |=
+                finding.execution_block_eligible || report.automatic_quarantine_eligible;
+        }
+
+        let structural_risk = inspection.structural_risk_score();
+        if structural_risk >= 55 && report.verdict == DetectionVerdict::Clean {
+            report.verdict = DetectionVerdict::Suspicious;
+            report.risk_score = structural_risk;
+            report.confidence = 75;
+            report.threat_name = Some(if inspection.limit_triggered {
+                "Archive.ResourceLimitTriggered".to_owned()
+            } else {
+                "Office.MacroWithExternalContent".to_owned()
+            });
+        }
+        report.container_inspection = Some(inspection);
+        report.elapsed = started.elapsed();
+        report
+    }
+
+    fn scan_with_amsi(
+        &self,
+        static_report: &ScanReport,
+        rule_matches: &[RuleMatch],
+        sample: &[u8],
+    ) -> (Option<AmsiScanReport>, Option<String>) {
+        let eligible = matches!(
+            static_report.content_type,
+            ContentType::Script(_) | ContentType::OleCompound
+        ) || !rule_matches.is_empty();
+        if !eligible {
+            return (None, None);
+        }
+        let Some(scanner) = &self.amsi else {
+            return (None, self.amsi_initialization_error.clone());
+        };
+        match scanner.scan_buffer(sample, "Blackshard.FileContent") {
+            Ok(report) => (Some(report), None),
+            Err(error) => (None, Some(error.to_string())),
         }
     }
 
@@ -252,6 +449,61 @@ impl DetectionEngine {
         // Intentionally a no-op. Metadata-only clean-result caching can be
         // bypassed by restoring timestamps. A future cache must be keyed by a
         // stable file ID plus a mutation journal/version, not a pathname.
+    }
+
+    pub fn external_rules_tripped(&self) -> bool {
+        let rules_tripped = self
+            .external_rule_circuit_breaker
+            .lock()
+            .map(|breaker| breaker.is_tripped())
+            .unwrap_or(true);
+        let similarity_tripped = self
+            .external_similarity_circuit_breaker
+            .lock()
+            .map(|breaker| breaker.is_tripped())
+            .unwrap_or(true);
+        rules_tripped || similarity_tripped
+    }
+
+    fn apply_external_rule_circuit_breaker(&self, mut matches: Vec<RuleMatch>) -> Vec<RuleMatch> {
+        let external_match = matches
+            .iter()
+            .any(|matched| matched.namespace != "blackshard_builtin");
+        let tripped = self
+            .external_rule_circuit_breaker
+            .lock()
+            .map(|mut breaker| {
+                matches!(
+                    breaker.observe_external_match(external_match),
+                    DefinitionMatchRateState::Tripped { .. }
+                )
+            })
+            .unwrap_or(true);
+        if tripped {
+            matches.retain(|matched| matched.namespace == "blackshard_builtin");
+        }
+        matches
+    }
+
+    fn apply_similarity_circuit_breaker(
+        &self,
+        mut matches: Vec<SimilarityMatch>,
+    ) -> Vec<SimilarityMatch> {
+        let external_match = !matches.is_empty();
+        let tripped = self
+            .external_similarity_circuit_breaker
+            .lock()
+            .map(|mut breaker| {
+                matches!(
+                    breaker.observe_external_match(external_match),
+                    DefinitionMatchRateState::Tripped { .. }
+                )
+            })
+            .unwrap_or(true);
+        if tripped {
+            matches.clear();
+        }
+        matches
     }
 }
 
@@ -292,6 +544,19 @@ pub(crate) fn open_candidate_file(path: &Path) -> io::Result<File> {
 /// The index is unique within its volume for the lifetime of the file object.
 #[cfg(windows)]
 pub(crate) fn opened_file_id(file: &File) -> io::Result<u64> {
+    Ok(opened_file_identity(file)?.file_id)
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenedFileIdentity {
+    pub file_id: u64,
+    pub volume_serial_number: u32,
+    pub link_count: u32,
+}
+
+#[cfg(windows)]
+pub(crate) fn opened_file_identity(file: &File) -> io::Result<OpenedFileIdentity> {
     use std::os::windows::io::AsRawHandle;
 
     #[repr(C)]
@@ -331,7 +596,11 @@ pub(crate) fn opened_file_id(file: &File) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     let information = unsafe { information.assume_init() };
-    Ok(((information.file_index_high as u64) << 32) | information.file_index_low as u64)
+    Ok(OpenedFileIdentity {
+        file_id: ((information.file_index_high as u64) << 32) | information.file_index_low as u64,
+        volume_serial_number: information.volume_serial_number,
+        link_count: information.number_of_links,
+    })
 }
 
 #[cfg(not(windows))]
@@ -345,6 +614,9 @@ pub(crate) fn opened_file_id(_file: &File) -> io::Result<u64> {
 fn combine(
     static_report: ScanReport,
     rule_matches: Vec<RuleMatch>,
+    similarity_matches: Vec<SimilarityMatch>,
+    amsi_report: Option<AmsiScanReport>,
+    amsi_error: Option<String>,
     elapsed: Duration,
 ) -> DetectionReport {
     let automatic_quarantine_eligible = static_report.verdict == StaticVerdict::Malicious
@@ -364,6 +636,23 @@ fn combine(
         .map(|item| item.risk_score)
         .max()
         .unwrap_or(0);
+    let similarity_score = similarity_matches
+        .iter()
+        .map(|matched| {
+            82u8.saturating_add(
+                ((matched.similarity_basis_points.saturating_sub(8_500)) / 125) as u8,
+            )
+            .min(94)
+        })
+        .max()
+        .unwrap_or(0);
+
+    let amsi_provider_detection = amsi_report
+        .as_ref()
+        .is_some_and(AmsiScanReport::is_provider_detection);
+    let amsi_policy_block = amsi_report
+        .as_ref()
+        .is_some_and(AmsiScanReport::should_block_execution);
 
     let (verdict, risk_score, confidence, threat_name) = if static_report.verdict
         == StaticVerdict::Malicious
@@ -374,6 +663,13 @@ fn combine(
             static_report.confidence.max(99),
             Some("Known.Malware.ExactSignature".to_owned()),
         )
+    } else if amsi_provider_detection {
+        (
+            DetectionVerdict::Malicious,
+            99,
+            99,
+            Some("AMSI.Provider.MalwareDetected".to_owned()),
+        )
     } else if let Some(rule) = malicious_rule {
         (
             DetectionVerdict::Malicious,
@@ -381,9 +677,19 @@ fn combine(
             99,
             Some(rule.threat_name.clone()),
         )
+    } else if amsi_policy_block {
+        (
+            DetectionVerdict::Suspicious,
+            90,
+            99,
+            Some("AMSI.Policy.BlockedByAdministrator".to_owned()),
+        )
     } else if static_report.verdict == StaticVerdict::Error {
         (DetectionVerdict::Error, 0, 0, None)
-    } else if static_report.verdict == StaticVerdict::Suspicious || suspicious_rule_score > 0 {
+    } else if static_report.verdict == StaticVerdict::Suspicious
+        || suspicious_rule_score > 0
+        || similarity_score > 0
+    {
         let independent_bonus =
             if static_report.verdict == StaticVerdict::Suspicious && suspicious_rule_score > 0 {
                 10
@@ -395,6 +701,7 @@ fn combine(
             static_report
                 .risk_score
                 .max(suspicious_rule_score)
+                .max(similarity_score)
                 .saturating_add(independent_bonus)
                 .min(99),
             static_report.confidence.max(75),
@@ -403,6 +710,11 @@ fn combine(
                 .filter(|item| item.disposition == RuleDisposition::Suspicious)
                 .max_by_key(|item| item.risk_score)
                 .map(|item| item.threat_name.clone())
+                .or_else(|| {
+                    similarity_matches
+                        .first()
+                        .map(|matched| matched.threat_name.clone())
+                })
                 .or_else(|| Some("Suspicious.StaticAnalysis".to_owned())),
         )
     } else {
@@ -426,10 +738,26 @@ fn combine(
         error: static_report.error.clone(),
         static_report: Some(static_report),
         rule_matches,
+        similarity_matches,
+        container_inspection: None,
+        amsi_report,
+        amsi_error,
         elapsed,
         from_cache: false,
         automatic_quarantine_eligible,
+        execution_block_eligible: automatic_quarantine_eligible || amsi_policy_block,
     }
+}
+
+fn shared_system_amsi() -> Result<Arc<AmsiScanner>, String> {
+    static SHARED: OnceLock<Result<Arc<AmsiScanner>, String>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            AmsiScanner::new("Blackshard")
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        })
+        .clone()
 }
 
 #[cfg(test)]
@@ -486,5 +814,22 @@ mod tests {
         fs::rename(&path, temporary.path().join("renamed.txt")).unwrap();
         let report = DetectionEngine::builtin().unwrap().scan_open_file(&file);
         assert_eq!(report.verdict, DetectionVerdict::Clean);
+    }
+
+    #[test]
+    fn amsi_provider_detection_blocks_but_never_authorizes_quarantine() {
+        let static_report = ScanEngine::default().scan_bytes(b"ordinary script-like bytes");
+        let report = combine(
+            static_report,
+            Vec::new(),
+            Vec::new(),
+            Some(AmsiScanReport::synthetic(0x8000, 26, false)),
+            None,
+            Duration::ZERO,
+        );
+        assert_eq!(report.verdict, DetectionVerdict::Malicious);
+        assert!(report.should_block());
+        assert!(!report.should_quarantine());
+        assert!(!report.automatic_quarantine_eligible);
     }
 }

@@ -13,7 +13,7 @@ use crate::definitions::{
 };
 use crate::updater::{
     verify_manifest, verify_update, ActiveUpdate, SignedUpdateEnvelope, UpdateError,
-    UpdateManifest, UpdateScheduler, MAX_ENVELOPE_BYTES, UPDATE_SCHEMA_VERSION,
+    UpdateManifest, UpdateScheduler, MAX_ENVELOPE_BYTES,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
@@ -1266,6 +1266,7 @@ mod windows_http {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::UPDATE_SCHEMA_VERSION;
     use chrono::TimeZone;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};

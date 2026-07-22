@@ -1,9 +1,12 @@
+use crate::behavior::{ProcessTrust, RansomwareMonitor};
 use crate::config::Settings;
 use crate::detection::{
     open_candidate_file, opened_file_id, DetectionEngine, DetectionReport, DetectionVerdict,
 };
 use crate::history::{EventHistory, EventKind, SecurityEvent};
 use crate::quarantine::{IsolationState, QuarantineRecord, QuarantineStore};
+use crate::trust;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
 use std::mem;
@@ -13,10 +16,17 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, S_OK,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
-const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3348_5342;
-const BLACKSHARD_PROTOCOL_VERSION: u16 = 3;
+const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
+const BLACKSHARD_PROTOCOL_VERSION: u16 = 5;
+const OPERATION_PROTECTED_WRITE: u32 = 3;
+const OPERATION_PROTECTED_METADATA: u32 = 4;
 const MAX_FILE_PATH_LENGTH: usize = 1024;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -39,6 +49,58 @@ extern "system" {
     ) -> i32;
 
     fn FilterReplyMessage(port: HANDLE, reply_buffer: *mut c_void, reply_buffer_size: u32) -> i32;
+
+    fn FilterSendMessage(
+        port: HANDLE,
+        input: *const c_void,
+        input_size: u32,
+        output: *mut c_void,
+        output_size: u32,
+        bytes_returned: *mut u32,
+    ) -> i32;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DriverControlRequest {
+    magic: u32,
+    version: u16,
+    size: u16,
+    command: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DriverHealthReply {
+    magic: u32,
+    version: u16,
+    size: u16,
+    scan_requests: u64,
+    blocks: u64,
+    timeouts: u64,
+    service_unavailable_bypasses: u64,
+    object_resolution_bypasses: u64,
+    oversize_path_bypasses: u64,
+    irql_bypasses: u64,
+    invalid_replies: u64,
+    dirty_writes: u64,
+    enforcement_bypasses: u64,
+    content_race_blocks: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DriverHealthCounters {
+    pub scan_requests: u64,
+    pub blocks: u64,
+    pub timeouts: u64,
+    pub service_unavailable_bypasses: u64,
+    pub object_resolution_bypasses: u64,
+    pub oversize_path_bypasses: u64,
+    pub irql_bypasses: u64,
+    pub invalid_replies: u64,
+    pub dirty_writes: u64,
+    pub enforcement_bypasses: u64,
+    pub content_race_blocks: u64,
 }
 
 #[repr(C)]
@@ -68,6 +130,7 @@ struct BlackshardNotification {
     file_path: [u16; MAX_FILE_PATH_LENGTH],
     file_id: u64,
     content_generation: u64,
+    process_start_key: u64,
     must_enforce: u32,
     reserved: u32,
 }
@@ -119,7 +182,7 @@ pub struct RealtimeDecision {
 #[derive(Debug, Clone)]
 pub enum RealtimeEvent {
     Connection(ProtectionConnection),
-    Decision(RealtimeDecision),
+    Decision(Box<RealtimeDecision>),
     QueueSaturated { process_id: u32, path: PathBuf },
 }
 
@@ -202,6 +265,75 @@ impl RealtimeProtection {
             let _ = worker.join();
         }
     }
+
+    pub fn driver_health(&self) -> Result<DriverHealthCounters, String> {
+        let port = self.port.load(Ordering::Acquire);
+        if port == 0 {
+            return Err("the kernel communication port is not connected".to_owned());
+        }
+        let process = unsafe { GetCurrentProcess() };
+        let mut duplicated = 0;
+        if unsafe {
+            DuplicateHandle(
+                process,
+                port,
+                process,
+                &mut duplicated,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "could not duplicate the kernel communication handle: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let request = DriverControlRequest {
+            magic: BLACKSHARD_PROTOCOL_MAGIC,
+            version: BLACKSHARD_PROTOCOL_VERSION,
+            size: mem::size_of::<DriverControlRequest>() as u16,
+            command: 1,
+        };
+        let mut reply = unsafe { mem::zeroed::<DriverHealthReply>() };
+        let mut returned = 0u32;
+        let result = unsafe {
+            FilterSendMessage(
+                duplicated,
+                (&request as *const DriverControlRequest).cast(),
+                mem::size_of::<DriverControlRequest>() as u32,
+                (&mut reply as *mut DriverHealthReply).cast(),
+                mem::size_of::<DriverHealthReply>() as u32,
+                &mut returned,
+            )
+        };
+        unsafe { CloseHandle(duplicated) };
+        if result != S_OK {
+            return Err(hresult_text(result));
+        }
+        if returned as usize != mem::size_of::<DriverHealthReply>()
+            || reply.magic != BLACKSHARD_PROTOCOL_MAGIC
+            || reply.version != BLACKSHARD_PROTOCOL_VERSION
+            || reply.size as usize != mem::size_of::<DriverHealthReply>()
+        {
+            return Err("the minifilter returned an invalid health record".to_owned());
+        }
+        Ok(DriverHealthCounters {
+            scan_requests: reply.scan_requests,
+            blocks: reply.blocks,
+            timeouts: reply.timeouts,
+            service_unavailable_bypasses: reply.service_unavailable_bypasses,
+            object_resolution_bypasses: reply.object_resolution_bypasses,
+            oversize_path_bypasses: reply.oversize_path_bypasses,
+            irql_bypasses: reply.irql_bypasses,
+            invalid_replies: reply.invalid_replies,
+            dirty_writes: reply.dirty_writes,
+            enforcement_bypasses: reply.enforcement_bypasses,
+            content_race_blocks: reply.content_race_blocks,
+        })
+    }
 }
 
 impl Drop for RealtimeProtection {
@@ -228,6 +360,8 @@ fn connection_loop(
     published_port: Arc<AtomicIsize>,
 ) {
     let port_name: Vec<u16> = "\\BlackshardPort\0".encode_utf16().collect();
+    let ransomware_monitor = Arc::new(Mutex::new(RansomwareMonitor::default()));
+    let process_trust_cache = Arc::new(Mutex::new(HashMap::new()));
     while !stop.load(Ordering::Acquire) {
         let _ = events.try_send(RealtimeEvent::Connection(ProtectionConnection::Connecting));
         let mut port_handle: HANDLE = 0;
@@ -272,6 +406,8 @@ fn connection_loop(
             let events = events.clone();
             let counters = Arc::clone(&counters);
             let worker_stop = Arc::clone(&stop);
+            let ransomware_monitor = Arc::clone(&ransomware_monitor);
+            let process_trust_cache = Arc::clone(&process_trust_cache);
             scan_workers.push(thread::spawn(move || {
                 realtime_worker(
                     receiver,
@@ -282,6 +418,8 @@ fn connection_loop(
                     events,
                     counters,
                     worker_stop,
+                    ransomware_monitor,
+                    process_trust_cache,
                 )
             }));
         }
@@ -394,6 +532,8 @@ fn realtime_worker(
     events: mpsc::SyncSender<RealtimeEvent>,
     counters: Arc<Mutex<RealtimeCounters>>,
     stop: Arc<AtomicBool>,
+    ransomware_monitor: Arc<Mutex<RansomwareMonitor>>,
+    process_trust_cache: Arc<Mutex<HashMap<(u32, u64), ProcessTrust>>>,
 ) {
     loop {
         let item = {
@@ -417,6 +557,23 @@ fn realtime_worker(
         }
         let notification = item.message.notification;
         let kernel_path = notification_path(&notification);
+        if matches!(
+            notification.operation,
+            OPERATION_PROTECTED_WRITE | OPERATION_PROTECTED_METADATA
+        ) {
+            handle_protected_modification(
+                &item,
+                &notification,
+                &kernel_path,
+                &settings,
+                &history,
+                &events,
+                &counters,
+                &ransomware_monitor,
+                &process_trust_cache,
+            );
+            continue;
+        }
         let openable_path = device_path_to_openable_path(&kernel_path);
         let candidate = open_candidate_file(&openable_path);
         let path = candidate
@@ -466,7 +623,7 @@ fn realtime_worker(
                 Duration::ZERO,
             ),
         };
-        let driver_verdict = if report.should_quarantine()
+        let driver_verdict = if report.should_block()
             || (notification.must_enforce != 0 && report.verdict == DetectionVerdict::Error)
         {
             DriverVerdict::Block
@@ -583,16 +740,176 @@ fn realtime_worker(
         }
 
         if report.verdict != DetectionVerdict::Clean {
-            let _ = events.try_send(RealtimeEvent::Decision(RealtimeDecision {
+            let _ = events.try_send(RealtimeEvent::Decision(Box::new(RealtimeDecision {
                 process_id: notification.process_id,
                 path,
                 report,
                 block_reply_accepted: driver_verdict == DriverVerdict::Block && reply_accepted,
                 quarantine: quarantine_record,
                 action_error,
-            }));
+            })));
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_protected_modification(
+    item: &WorkItem,
+    notification: &BlackshardNotification,
+    path: &Path,
+    settings: &Arc<RwLock<Settings>>,
+    history: &Arc<EventHistory>,
+    events: &mpsc::SyncSender<RealtimeEvent>,
+    counters: &Arc<Mutex<RealtimeCounters>>,
+    monitor: &Arc<Mutex<RansomwareMonitor>>,
+    trust_cache: &Arc<Mutex<HashMap<(u32, u64), ProcessTrust>>>,
+) {
+    let (enabled, block_mode) = settings
+        .read()
+        .map(|settings| {
+            (
+                settings.real_time_protection
+                    && settings.ransomware_protection
+                    && !settings.is_excluded(path),
+                settings.ransomware_block_mode,
+            )
+        })
+        .unwrap_or((false, false));
+    if !enabled {
+        let _ = reply(
+            item.port,
+            item.message.header.message_id,
+            DriverVerdict::Allow,
+            0,
+        );
+        return;
+    }
+    let process_trust = cached_process_trust(
+        trust_cache,
+        notification.process_id,
+        notification.process_start_key,
+    );
+    let decision = monitor
+        .lock()
+        .map(|mut monitor| {
+            monitor.observe(
+                notification.process_id,
+                notification.process_start_key,
+                path,
+                process_trust,
+                block_mode,
+            )
+        })
+        .unwrap_or_default();
+    let verdict = if decision.block {
+        DriverVerdict::Block
+    } else {
+        DriverVerdict::Allow
+    };
+    let accepted = reply(
+        item.port,
+        item.message.header.message_id,
+        verdict,
+        if decision.alert || decision.block {
+            95
+        } else {
+            0
+        },
+    );
+    if decision.block && accepted {
+        if let Ok(mut counters) = counters.lock() {
+            counters.blocked_replies += 1;
+        }
+    }
+    if !decision.alert {
+        return;
+    }
+
+    let report = DetectionReport::ransomware_behavior(
+        decision.distinct_files,
+        decision.block,
+        Duration::ZERO,
+    );
+    let mut event = SecurityEvent::new(
+        EventKind::Detection,
+        if decision.block {
+            "Ransomware-like mass modification blocked"
+        } else {
+            "Ransomware-like mass modification observed (audit mode)"
+        },
+    );
+    event.path = Some(path.to_path_buf());
+    event.threat_name = report.threat_name.clone();
+    event.risk_score = Some(report.risk_score);
+    event.details = Some(format!(
+        "pid={}; process_start_key={:016x}; operation={}; distinct_protected_files={}; block_mode={block_mode}; block_reply_accepted={accepted}",
+        notification.process_id,
+        notification.process_start_key,
+        if notification.operation == OPERATION_PROTECTED_WRITE {
+            "write"
+        } else {
+            "rename-or-delete"
+        },
+        decision.distinct_files
+    ));
+    let _ = history.append(&event);
+    let _ = events.try_send(RealtimeEvent::Decision(Box::new(RealtimeDecision {
+        process_id: notification.process_id,
+        path: path.to_path_buf(),
+        report,
+        block_reply_accepted: decision.block && accepted,
+        quarantine: None,
+        action_error: None,
+    })));
+}
+
+fn cached_process_trust(
+    cache: &Mutex<HashMap<(u32, u64), ProcessTrust>>,
+    process_id: u32,
+    process_start_key: u64,
+) -> ProcessTrust {
+    let key = (process_id, process_start_key);
+    if let Ok(cache) = cache.lock() {
+        if let Some(trust) = cache.get(&key) {
+            return *trust;
+        }
+        // Do not let a process-churn workload turn this bounded cache into an
+        // unbounded stream of comparatively expensive Authenticode checks.
+        // Unknown uses the conservative middle threshold.
+        if cache.len() >= 256 {
+            return ProcessTrust::Unknown;
+        }
+    }
+    let resolved = process_image_path(process_id)
+        .map(|path| match trust::verify_file(&path) {
+            trust::AuthenticodeStatus::Trusted { .. } => ProcessTrust::Trusted,
+            trust::AuthenticodeStatus::Unsigned | trust::AuthenticodeStatus::Untrusted(_) => {
+                ProcessTrust::Untrusted
+            }
+            trust::AuthenticodeStatus::Error(_) => ProcessTrust::Unknown,
+        })
+        .unwrap_or(ProcessTrust::Unknown);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, resolved);
+    }
+    resolved
+}
+
+fn process_image_path(process_id: u32) -> Option<PathBuf> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    let succeeded =
+        unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) } != 0;
+    unsafe { CloseHandle(process) };
+    if !succeeded || length == 0 || length as usize > buffer.len() {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer)))
 }
 
 fn reply(port: HANDLE, message_id: u64, verdict: DriverVerdict, risk_score: u32) -> bool {
@@ -628,11 +945,13 @@ fn valid_notification(notification: &BlackshardNotification) -> bool {
     notification.magic == BLACKSHARD_PROTOCOL_MAGIC
         && notification.version == BLACKSHARD_PROTOCOL_VERSION
         && notification.size as usize == mem::size_of::<BlackshardNotification>()
-        && matches!(notification.operation, 1 | 2)
+        && matches!(notification.operation, 1..=4)
         && notification.file_id != 0
         && notification.content_generation != 0
+        && notification.process_start_key != 0
         && ((notification.operation == 1 && notification.must_enforce == 0)
-            || (notification.operation == 2 && notification.must_enforce == 1))
+            || (notification.operation == 2 && notification.must_enforce == 1)
+            || (matches!(notification.operation, 3..=4) && notification.must_enforce == 0))
         && notification.reserved == 0
         && notification.path_length > 0
         && notification.path_length < MAX_FILE_PATH_LENGTH as u32
@@ -735,9 +1054,11 @@ mod tests {
 
     #[test]
     fn protocol_layout_matches_x64_filter_manager_abi() {
+        assert_eq!(mem::size_of::<DriverControlRequest>(), 12);
+        assert_eq!(mem::size_of::<DriverHealthReply>(), 96);
         assert_eq!(mem::size_of::<FilterMessageHeader>(), 16);
-        assert_eq!(mem::size_of::<BlackshardNotification>(), 2096);
-        assert_eq!(mem::size_of::<BlackshardMessage>(), 2112);
+        assert_eq!(mem::size_of::<BlackshardNotification>(), 2104);
+        assert_eq!(mem::size_of::<BlackshardMessage>(), 2120);
         assert_eq!(mem::size_of::<FilterReplyHeader>(), 16);
         assert_eq!(mem::size_of::<BlackshardReplyMessage>(), 32);
     }

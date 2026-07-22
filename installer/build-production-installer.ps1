@@ -6,6 +6,8 @@ param(
     [string]$AgentPath,
     [string]$DriverPackageDirectory,
     [string]$AssignedMinifilterAltitude,
+    [string]$UpdateManifestUrl,
+    [string]$DefinitionPublicKeyHex,
     [string]$SigningCertificateThumbprint,
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$CertificateStoreLocation = "CurrentUser",
@@ -56,6 +58,64 @@ function Invoke-NativeTool {
     & $FilePath @ArgumentList
     if ($LASTEXITCODE -ne 0) {
         throw "$Description failed with exit code $LASTEXITCODE."
+    }
+}
+
+function ConvertTo-WindowsCommandLineArgument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+    }
+
+    $builder = [Text.StringBuilder]::new()
+    $backslash = [char]92
+    $quote = [char]34
+    [void]$builder.Append($quote)
+    $pendingBackslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq $backslash) {
+            $pendingBackslashes++
+            continue
+        }
+        if ($character -eq $quote) {
+            [void]$builder.Append($backslash, (2 * $pendingBackslashes) + 1)
+            [void]$builder.Append($quote)
+        } else {
+            [void]$builder.Append($backslash, $pendingBackslashes)
+            [void]$builder.Append($character)
+        }
+        $pendingBackslashes = 0
+    }
+    [void]$builder.Append($backslash, 2 * $pendingBackslashes)
+    [void]$builder.Append($quote)
+    return $builder.ToString()
+}
+
+function Invoke-GuiValidationTool {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    Write-Host "==> $Description"
+    $argumentLine = ($ArgumentList | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Value $_ }) -join ' '
+    $process = Start-Process -FilePath $FilePath -ArgumentList $argumentLine -PassThru -WindowStyle Hidden
+    if (-not $process.WaitForExit(15000)) {
+        $process.Kill()
+        $process.WaitForExit()
+        throw "$Description exceeded its 15-second side-effect-free validation deadline."
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "$Description failed with exit code $($process.ExitCode)."
     }
 }
 
@@ -454,6 +514,21 @@ if ([string]::IsNullOrWhiteSpace($AssignedMinifilterAltitude) -or
 if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
     throw "SigningCertificateThumbprint is required. Unsigned release output is not supported."
 }
+if ([string]::IsNullOrWhiteSpace($DefinitionPublicKeyHex) -or $DefinitionPublicKeyHex -notmatch '^[0-9A-Fa-f]{64}$') {
+    throw "DefinitionPublicKeyHex is required and must be the 32-byte production Ed25519 public key encoded as 64 hexadecimal characters."
+}
+if ($DefinitionPublicKeyHex -match '^0{64}$') {
+    throw "DefinitionPublicKeyHex must be a real production Ed25519 public key, not the all-zero placeholder."
+}
+
+$updateManifestUri = $null
+if (-not [Uri]::TryCreate($UpdateManifestUrl, [UriKind]::Absolute, [ref]$updateManifestUri) -or
+    $updateManifestUri.Scheme -ne "https" -or
+    [string]::IsNullOrWhiteSpace($updateManifestUri.Host) -or
+    -not [string]::IsNullOrEmpty($updateManifestUri.UserInfo) -or
+    -not [string]::IsNullOrEmpty($updateManifestUri.Fragment)) {
+    throw "UpdateManifestUrl is required and must be an absolute HTTPS URL without credentials or a fragment."
+}
 
 $timestampUri = $null
 if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or $timestampUri.Scheme -notin @("http", "https")) {
@@ -477,6 +552,12 @@ Assert-FileExists -Path $driverSys -Description "Production driver binary"
 Assert-FileExists -Path $driverCat -Description "Production driver catalog"
 Assert-X64PeFile -Path $AgentPath -Description "Blackshard agent"
 Assert-X64PeFile -Path $driverSys -Description "Blackshard driver"
+Invoke-GuiValidationTool -FilePath $AgentPath -ArgumentList @(
+    "--validate-release-configuration",
+    $driverInf,
+    $UpdateManifestUrl,
+    $DefinitionPublicKeyHex
+) -Description "Validate the agent's embedded altitude and definition-feed trust configuration"
 
 if ([string]::IsNullOrWhiteSpace($SignToolPath)) {
     $SignToolPath = Resolve-WindowsKitTool -FileName "signtool.exe"

@@ -14,6 +14,7 @@
 use crate::detection::{DetectionEngine, DetectionReport};
 use crate::engine::{ScanConfig, ScanEngine, SignatureDatabase};
 use crate::rules::{RuleBundle, RuleDisposition, RuleEngine, RulePolicy};
+use crate::similarity::{SimilarityEngine, SimilarityProfile, MIN_SKETCH_BYTES, SKETCH_SIZE};
 use crate::updater::{
     verify_update, ActiveUpdate, SignedUpdateEnvelope, UpdateError, UpdateStore, MAX_ENVELOPE_BYTES,
 };
@@ -25,7 +26,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-pub const DEFINITION_SCHEMA_VERSION: u32 = 1;
+pub const DEFINITION_SCHEMA_VERSION: u32 = 2;
 
 /// A hard pre-parse bound. JSON has meaningful allocation amplification, so
 /// this intentionally remains much smaller than the updater's generic limit.
@@ -35,6 +36,8 @@ pub const MAX_YARA_BUNDLES: usize = 64;
 pub const MAX_YARA_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_TOTAL_YARA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RULE_POLICIES: usize = 8_192;
+pub const MAX_SIMILARITY_PROFILES: usize = 512;
+pub const MAX_PROVENANCE_RECORDS: usize = 64;
 
 const MAX_BUNDLE_ID_BYTES: usize = 128;
 const MAX_THREAT_NAME_BYTES: usize = 160;
@@ -84,6 +87,10 @@ pub struct DefinitionBundle {
     pub bundle_id: String,
     pub exact_sha256: Vec<ExactHashDefinition>,
     pub yara_bundles: Vec<DefinitionRuleBundle>,
+    #[serde(default)]
+    pub similarity_profiles: Vec<DefinitionSimilarityProfile>,
+    #[serde(default)]
+    pub sources: Vec<DefinitionProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +120,29 @@ pub struct DefinitionRulePolicy {
     pub risk_score: u8,
     pub threat_name: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DefinitionSimilarityProfile {
+    pub identifier: String,
+    pub threat_name: String,
+    pub family: Option<String>,
+    pub minimum_file_size: u64,
+    pub maximum_file_size: u64,
+    pub minimum_similarity_basis_points: u16,
+    /// Exactly 64 sorted, unique, lower-case 16-digit hexadecimal u64 values.
+    pub sketch: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DefinitionProvenance {
+    pub provider: String,
+    pub source_url: String,
+    pub retrieved_at: DateTime<Utc>,
+    pub content_sha256: String,
+    pub license: String,
 }
 
 impl DefinitionBundle {
@@ -161,11 +191,133 @@ impl DefinitionBundle {
             MAX_EXACT_SIGNATURES,
         )?;
         check_count("yara_bundles", self.yara_bundles.len(), MAX_YARA_BUNDLES)?;
-        if self.exact_sha256.is_empty() && self.yara_bundles.is_empty() {
+        check_count(
+            "similarity_profiles",
+            self.similarity_profiles.len(),
+            MAX_SIMILARITY_PROFILES,
+        )?;
+        check_count("sources", self.sources.len(), MAX_PROVENANCE_RECORDS)?;
+        if self.exact_sha256.is_empty()
+            && self.yara_bundles.is_empty()
+            && self.similarity_profiles.is_empty()
+        {
             return Err(DefinitionError::InvalidField {
                 field: "bundle".to_owned(),
-                reason: "at least one exact signature or YARA bundle is required".to_owned(),
+                reason: "at least one exact, YARA, or similarity detection record is required"
+                    .to_owned(),
             });
+        }
+
+        let mut provenance = HashSet::with_capacity(self.sources.len());
+        for (source_index, source) in self.sources.iter().enumerate() {
+            let field = format!("sources[{source_index}]");
+            validate_token(&format!("{field}.provider"), &source.provider, 96, b"._-")?;
+            let parsed_url =
+                url::Url::parse(&source.source_url).map_err(|_| DefinitionError::InvalidField {
+                    field: format!("{field}.source_url"),
+                    reason: "source URL must be an absolute HTTPS URL".to_owned(),
+                })?;
+            if parsed_url.scheme() != "https"
+                || parsed_url.host_str().is_none()
+                || !parsed_url.username().is_empty()
+                || parsed_url.password().is_some()
+                || parsed_url.fragment().is_some()
+            {
+                return Err(DefinitionError::InvalidField {
+                    field: format!("{field}.source_url"),
+                    reason: "source URL must use HTTPS and contain no credentials or fragment"
+                        .to_owned(),
+                });
+            }
+            validate_sha256(&source.content_sha256).map_err(|reason| {
+                DefinitionError::InvalidField {
+                    field: format!("{field}.content_sha256"),
+                    reason,
+                }
+            })?;
+            validate_text(&format!("{field}.license"), &source.license, 256)?;
+            let identity = format!(
+                "{}\0{}\0{}",
+                source.provider, source.source_url, source.content_sha256
+            );
+            if !provenance.insert(identity) {
+                return Err(DefinitionError::Duplicate {
+                    field: "sources.provider/source_url/content_sha256".to_owned(),
+                    value: source.source_url.clone(),
+                });
+            }
+        }
+
+        let mut profile_identifiers = HashSet::with_capacity(self.similarity_profiles.len());
+        for (profile_index, profile) in self.similarity_profiles.iter().enumerate() {
+            let field = format!("similarity_profiles[{profile_index}]");
+            validate_identifier(
+                &format!("{field}.identifier"),
+                &profile.identifier,
+                MAX_RULE_IDENTIFIER_BYTES,
+                false,
+            )?;
+            if !profile_identifiers.insert(profile.identifier.clone()) {
+                return Err(DefinitionError::Duplicate {
+                    field: "similarity_profiles.identifier".to_owned(),
+                    value: profile.identifier.clone(),
+                });
+            }
+            validate_text(
+                &format!("{field}.threat_name"),
+                &profile.threat_name,
+                MAX_THREAT_NAME_BYTES,
+            )?;
+            if let Some(family) = &profile.family {
+                validate_text(&format!("{field}.family"), family, MAX_FAMILY_BYTES)?;
+            }
+            if profile.minimum_file_size < MIN_SKETCH_BYTES as u64
+                || profile.maximum_file_size < profile.minimum_file_size
+                || profile.maximum_file_size > 64 * 1024 * 1024
+            {
+                return Err(DefinitionError::InvalidField {
+                    field: format!("{field}.file_size"),
+                    reason: "size bounds must be ordered and remain within 4 KiB through 64 MiB"
+                        .to_owned(),
+                });
+            }
+            if !(8_500..=10_000).contains(&profile.minimum_similarity_basis_points) {
+                return Err(DefinitionError::InvalidField {
+                    field: format!("{field}.minimum_similarity_basis_points"),
+                    reason: "similarity threshold must be 8500 through 10000 basis points"
+                        .to_owned(),
+                });
+            }
+            if profile.sketch.len() != SKETCH_SIZE {
+                return Err(DefinitionError::InvalidField {
+                    field: format!("{field}.sketch"),
+                    reason: format!("sketch must contain exactly {SKETCH_SIZE} values"),
+                });
+            }
+            let mut previous = None;
+            for value in &profile.sketch {
+                if value.len() != 16
+                    || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || value.bytes().any(|byte| byte.is_ascii_uppercase())
+                {
+                    return Err(DefinitionError::InvalidField {
+                        field: format!("{field}.sketch"),
+                        reason: "sketch values must be lower-case 16-digit hexadecimal".to_owned(),
+                    });
+                }
+                let parsed =
+                    u64::from_str_radix(value, 16).map_err(|_| DefinitionError::InvalidField {
+                        field: format!("{field}.sketch"),
+                        reason: "sketch contains an invalid integer".to_owned(),
+                    })?;
+                if previous.is_some_and(|prior| prior >= parsed) {
+                    return Err(DefinitionError::InvalidField {
+                        field: format!("{field}.sketch"),
+                        reason: "sketch values must be strictly increasing".to_owned(),
+                    });
+                }
+                previous = Some(parsed);
+            }
         }
 
         let mut digests = HashSet::with_capacity(self.exact_sha256.len());
@@ -513,15 +665,19 @@ impl DefinitionMatchRateCircuitBreaker {
     }
 
     pub fn observe(&mut self, report: &DetectionReport) -> DefinitionMatchRateState {
-        if self.observations.len() == self.limits.window_samples {
-            if self.observations.pop_front() == Some(true) {
-                self.matches -= 1;
-            }
-        }
         let external_match = report
             .rule_matches
             .iter()
             .any(|matched| matched.namespace != BUILTIN_NAMESPACE);
+        self.observe_external_match(external_match)
+    }
+
+    pub fn observe_external_match(&mut self, external_match: bool) -> DefinitionMatchRateState {
+        if self.observations.len() == self.limits.window_samples
+            && self.observations.pop_front() == Some(true)
+        {
+            self.matches -= 1;
+        }
         self.observations.push_back(external_match);
         self.matches += usize::from(external_match);
 
@@ -785,6 +941,31 @@ fn build_authenticated_engine(
     // an unchecked bundle and bypass the public parser.
     bundle.validate()?;
 
+    let similarity_profiles = bundle
+        .similarity_profiles
+        .into_iter()
+        .map(|profile| {
+            let sketch = profile
+                .sketch
+                .iter()
+                .map(|value| u64::from_str_radix(value, 16).expect("validated similarity sketch"))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("validated similarity sketch length");
+            SimilarityProfile {
+                identifier: profile.identifier,
+                threat_name: profile.threat_name,
+                family: profile.family,
+                minimum_file_size: profile.minimum_file_size,
+                maximum_file_size: profile.maximum_file_size,
+                minimum_similarity_basis_points: profile.minimum_similarity_basis_points,
+                sketch,
+            }
+        })
+        .collect::<Vec<_>>();
+    let similarity =
+        SimilarityEngine::new(similarity_profiles).map_err(DefinitionError::Compilation)?;
+
     let mut signatures = SignatureDatabase::default();
     for signature in bundle.exact_sha256 {
         let replaced = signatures
@@ -824,7 +1005,7 @@ fn build_authenticated_engine(
     let static_engine = ScanEngine::new(scan_config, signatures)
         .map_err(|error| DefinitionError::Compilation(error.to_string()))?;
     let rules = RuleEngine::compile(&rule_bundles).map_err(DefinitionError::Compilation)?;
-    Ok(DetectionEngine::new(static_engine, rules))
+    Ok(DetectionEngine::new(static_engine, rules).with_similarity(similarity))
 }
 
 fn validate_policy_score(
@@ -991,6 +1172,7 @@ fn read_bounded_regular(path: &Path, maximum: usize) -> Result<Vec<u8>, Definiti
 mod tests {
     use super::*;
     use crate::detection::DetectionVerdict;
+    use crate::similarity::compute_sketch;
     use crate::updater::{SignedUpdateEnvelope, UpdateManifest, UPDATE_SCHEMA_VERSION};
     use chrono::TimeZone;
     use ed25519_dalek::{Signer, SigningKey};
@@ -1022,7 +1204,42 @@ mod tests {
             bundle_id: id.to_owned(),
             exact_sha256: vec![exact_signature(target, "Test.External.Exact")],
             yara_bundles: Vec::new(),
+            similarity_profiles: Vec::new(),
+            sources: Vec::new(),
         }
+    }
+
+    fn similarity_bundle(id: &str, target: &[u8]) -> DefinitionBundle {
+        let sketch = compute_sketch(target).unwrap();
+        DefinitionBundle {
+            schema_version: DEFINITION_SCHEMA_VERSION,
+            bundle_id: id.to_owned(),
+            exact_sha256: Vec::new(),
+            yara_bundles: Vec::new(),
+            similarity_profiles: vec![DefinitionSimilarityProfile {
+                identifier: "test_family_profile".to_owned(),
+                threat_name: "Test.Similarity.Family".to_owned(),
+                family: Some("TestFamily".to_owned()),
+                minimum_file_size: target.len() as u64,
+                maximum_file_size: target.len() as u64,
+                minimum_similarity_basis_points: 9_000,
+                sketch: sketch.iter().map(|value| format!("{value:016x}")).collect(),
+            }],
+            sources: Vec::new(),
+        }
+    }
+
+    fn similarity_sample(seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let mut target = Vec::with_capacity(32 * 1024);
+        for _ in 0..target.capacity() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            target.push(state as u8);
+        }
+        target[0..2].copy_from_slice(b"MZ");
+        target
     }
 
     fn yara_bundle(id: &str, disposition: Option<RuleDisposition>) -> DefinitionBundle {
@@ -1056,6 +1273,8 @@ mod tests {
                     .into_iter()
                     .collect(),
             }],
+            similarity_profiles: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
@@ -1335,6 +1554,33 @@ mod tests {
             outcome.engine.scan_bytes(previous_target).verdict,
             DetectionVerdict::Malicious
         );
+    }
+
+    #[test]
+    fn authenticated_similarity_is_advisory_and_never_destructive() {
+        let target = similarity_sample(0x1234_5678_9abc_def0);
+        let directory = tempfile::tempdir().unwrap();
+        let store = DefinitionStore::new(directory.path()).unwrap();
+        stage(&store, 30, &similarity_bundle("similarity-30", &target));
+        let outcome = store
+            .load_with_defaults(now(), &signing_key().verifying_key().to_bytes())
+            .unwrap();
+        let report = outcome.engine.scan_bytes(&target);
+        assert_eq!(report.similarity_matches.len(), 1);
+        assert_eq!(report.verdict, DetectionVerdict::Suspicious);
+        assert!(!report.should_block());
+        assert!(!report.should_quarantine());
+    }
+
+    #[test]
+    fn similarity_profile_rejects_low_thresholds_and_unsorted_sketches() {
+        let target = similarity_sample(0xfedc_ba98_7654_3210);
+        let mut bundle = similarity_bundle("invalid-similarity", &target);
+        bundle.similarity_profiles[0].minimum_similarity_basis_points = 8_499;
+        assert!(bundle.validate().is_err());
+        bundle.similarity_profiles[0].minimum_similarity_basis_points = 9_000;
+        bundle.similarity_profiles[0].sketch.swap(0, 1);
+        assert!(bundle.validate().is_err());
     }
 
     #[test]

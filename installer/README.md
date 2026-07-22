@@ -23,12 +23,12 @@ The installer deliberately fails if either mode returns anything except zero. A 
 
 An executable [type-18 Windows Installer custom action](https://learn.microsoft.com/en-us/windows/win32/msi/custom-action-type-18) cannot report `NeedReboot` through MSI state: Windows Installer treats every nonzero EXE exit code, including 3010, as failure. Consequently the helper must complete without a reboot for this wiring to succeed. Before releasing an upgrade that can require a reboot, replace this bridge with an MSI-aware native DLL custom action or a Burn package that propagates restart state and add reboot-path integration tests. Silently ignoring `NeedReboot` is not acceptable.
 
-`ServiceControl Wait="yes"` keeps upgrade and uninstall ordering deterministic, but it also means the service must stop all real-time and update workers within a tested deadline. The current worker lifecycle is not yet proven promptly cancellable under active scan/update load; an unbounded worker can therefore stall servicing. Add cooperative cancellation, a bounded service-stop test, and forced-failure upgrade coverage before release rather than weakening the installer wait.
+`ServiceControl Wait="yes"` keeps upgrade and uninstall ordering deterministic. The service now cooperatively cancels its real-time, update, and IPC workers, but the complete shutdown path still needs a measured deadline test under active scan/update load plus forced-failure upgrade coverage before release.
 
 The setup must not be released until all of these remaining release gates are complete:
 
-- The driver helper modes described above are implemented and tested across install, repair, same-version repair, major upgrade, rollback, and uninstall.
-- The service exposes an authenticated, access-controlled IPC API for on-demand scans, settings changes, quarantine restore/delete, update requests, and user-session notifications.
+- The implemented driver helper modes are integration-tested across install, repair, same-version repair, major upgrade, rollback, reboot-required handling, and uninstall.
+- The implemented service IPC and UAC handoff are independently reviewed and integration-tested with standard users, administrators, multiple sessions, malformed clients, and service restarts.
 - The minifilter INF passes current `InfVerif /h` rules and uses a Microsoft-assigned altitude.
 - The complete driver package is submitted through the Windows Hardware Developer Center and the returned catalog is Microsoft-signed for production kernel loading.
 - Install, upgrade, repair, rollback, and uninstall are tested on every supported Windows release with Secure Boot and Memory Integrity enabled.
@@ -37,7 +37,7 @@ Until those gates are complete, a successfully built package proves that its rel
 
 ### Intentional GUI/service boundary
 
-The current UI still performs quick/full/custom scans, writes `settings.json`, and restores or deletes quarantine items in-process. The production ACLs intentionally deny those writes to ordinary users. After an MSI install, status and history remain readable, but UI settings changes and direct quarantine mutations will fail until those operations are routed through authenticated service IPC. Do not weaken the ACLs or run the GUI elevated to hide this mismatch.
+The GUI stays unelevated. Quick/full/custom scan requests, settings, quarantine operations, activity, and update checks are routed through the local service IPC API. The service authorizes each caller from its impersonated token; machine-wide mutations require an elevated administrator. When needed, the GUI stages a narrowly named, bounded, SHA-256-bound request and asks Windows UAC to run the same signed executable in a restricted helper mode. Production ACLs continue to deny direct ordinary-user writes to service-owned state.
 
 Likewise, a LocalSystem service runs in session 0 and cannot be the user-notification endpoint. The MSI therefore registers `"%ProgramFiles%\Blackshard\blackshard.exe" --notification-agent` under the machine `Run` key. Windows starts one hidden, single-instance broker in every interactive user session at logon; MSI ownership removes that registration on upgrade or uninstall. The broker reads the service-owned detection history and only displays quarantine success/failure notifications. It never performs privileged mutations.
 
@@ -66,7 +66,7 @@ The MSI and Burn bundle have stable upgrade codes and support major upgrades, re
 
 ## Required release inputs
 
-1. A release-built x64 `blackshard.exe`.
+1. A release-built x64 `blackshard.exe` compiled with `BLACKSHARD_MINIFILTER_ALTITUDE`, `BLACKSHARD_UPDATE_MANIFEST_URL`, and `BLACKSHARD_DEFINITION_PUBLIC_KEY_HEX` set to the declared production inputs. The packager verifies the binding without installing the driver.
 2. A directory containing exactly named `blackshard.inf`, `blackshard.sys`, and `blackshard.cat` production driver files.
 3. A currently valid, publicly trusted Authenticode code-signing certificate with an accessible private key and the Code Signing EKU in either `Cert:\CurrentUser\My` or `Cert:\LocalMachine\My`.
 4. A current Windows SDK and WDK, including x64 `signtool.exe` and `infverif.exe`.
@@ -77,6 +77,8 @@ The MSI and Burn bundle have stable upgrade codes and support major upgrades, re
 
 The application certificate and the Microsoft-returned driver catalog are different signing inputs. An ordinary Authenticode certificate cannot make an unsigned or test-signed kernel driver production-loadable.
 
+Qualifying open-source projects can apply to SignPath Foundation for sponsored Authenticode signing of user-mode artifacts. That may satisfy item 3 if the resulting certificate and signing workflow pass this packager's trust, EKU, timestamp, and private-key-access requirements (the current local-certificate interface would need an explicitly reviewed SignPath integration). It does not replace the organization EV certificate Microsoft requires to register for driver submission. There is no supported release mode that bypasses the Microsoft-signed catalog.
+
 ## Build
 
 Run from the repository root:
@@ -85,6 +87,9 @@ Run from the repository root:
 .\installer\build-production-installer.ps1 `
     -ProductVersion 0.1.0 `
     -DriverPackageDirectory C:\release-inputs\blackshard-driver `
+    -AssignedMinifilterAltitude 123456.789 `
+    -UpdateManifestUrl https://updates.example/blackshard/stable/manifest.json `
+    -DefinitionPublicKeyHex d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a `
     -SigningCertificateThumbprint 0123456789ABCDEF0123456789ABCDEF01234567 `
     -CertificateStoreLocation CurrentUser `
     -AcceptWixEula
@@ -92,10 +97,12 @@ Run from the repository root:
 
 Optional parameters select a different agent, output directory, timestamp service, SignTool, or InfVerif path. There is intentionally no unsigned-release switch.
 
+The altitude, URL, key, thumbprint, and paths shown above are examples. Replace all of them with the reviewed production values; never publish a build using a documentation test key.
+
 The script:
 
 1. Rejects malformed MSI versions and missing inputs.
-2. Confirms the application and driver are x64 PE images.
+2. Confirms the application and driver are x64 PE images and that the application is release-bound to the declared driver altitude, update URL, and definition public key.
 3. Validates the code-signing certificate, private key, validity period, Code Signing EKU, trust chain, and online revocation status, and rejects self-signed certificates.
 4. Runs current hardened INF validation.
 5. requires a trusted Microsoft hardware-pipeline signature on the catalog.

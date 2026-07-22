@@ -134,6 +134,23 @@ fn read_inf_altitude(path: &Path) -> Result<String, String> {
     Ok(altitude)
 }
 
+/// Side-effect-free release-pipeline check. Unlike normal debug validation,
+/// this always requires a compile-time production altitude and binds it to the
+/// exact INF being packaged.
+pub fn validate_release_inf(path: &Path) -> Result<(), String> {
+    let path = validate_inf_path(path)?;
+    let declared = read_inf_altitude(&path)?;
+    let expected = option_env!("BLACKSHARD_MINIFILTER_ALTITUDE").ok_or_else(|| {
+        "this binary has no embedded Microsoft-assigned minifilter altitude".to_owned()
+    })?;
+    if declared != expected {
+        return Err(format!(
+            "driver altitude {declared} does not match the binary's release-bound altitude {expected}"
+        ));
+    }
+    Ok(())
+}
+
 fn split_inf_fields(line: &str) -> Result<Vec<String>, String> {
     let mut fields = Vec::new();
     let mut field = String::new();
@@ -438,5 +455,20 @@ mod tests {
         )
         .unwrap();
         assert!(read_inf_altitude(&inf).is_err());
+    }
+
+    #[test]
+    fn release_validation_never_accepts_an_unbound_binary() {
+        if option_env!("BLACKSHARD_MINIFILTER_ALTITUDE").is_some() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let inf = temporary.path().join("blackshard.inf");
+        fs::write(
+            &inf,
+            b"[blackshard.AddRegistry]\r\nHKR,\"Parameters\\Instances\\blackshard Instance\",\"Altitude\",0,\"320000.4242\"\r\n",
+        )
+        .unwrap();
+        assert!(validate_release_inf(&inf).is_err());
     }
 }

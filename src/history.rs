@@ -138,7 +138,7 @@ impl EventHistory {
             ));
         }
 
-        let keep = limit.max(1).min(DEFAULT_HISTORY_LIMIT);
+        let keep = limit.clamp(1, DEFAULT_HISTORY_LIMIT);
         let mut events = VecDeque::with_capacity(keep);
         for line in bytes.split(|byte| *byte == b'\n') {
             if line.is_empty() || line.len() > MAX_EVENT_BYTES {

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// User-mode protection service. This must remain distinct from the
 /// `blackshard` FILE_SYSTEM_DRIVER service installed by the minifilter INF.
 pub const SERVICE_NAME: &str = "BlackshardProtectionService";
-pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 2;
+pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 3;
 pub const SERVICE_HEALTH_FILE_NAME: &str = "service-health.json";
 pub const UPDATE_REQUEST_FILE_NAME: &str = "update-request";
 
@@ -74,6 +74,17 @@ pub struct ServiceCounters {
     pub quarantined: u64,
     pub scan_errors: u64,
     pub bypassed_due_to_load: u64,
+    pub driver_scan_requests: u64,
+    pub driver_blocks: u64,
+    pub driver_timeouts: u64,
+    pub service_unavailable_bypasses: u64,
+    pub object_resolution_bypasses: u64,
+    pub oversize_path_bypasses: u64,
+    pub irql_bypasses: u64,
+    pub invalid_driver_replies: u64,
+    pub dirty_writes: u64,
+    pub enforcement_bypasses: u64,
+    pub content_race_blocks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +96,7 @@ pub struct ServiceHealthSnapshot {
     pub connection: ServiceConnection,
     pub connection_detail: Option<String>,
     pub real_time_enabled: bool,
+    pub external_rules_suppressed: bool,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_detection_at: Option<DateTime<Utc>>,
@@ -103,6 +115,7 @@ impl ServiceHealthSnapshot {
             connection: ServiceConnection::Connecting,
             connection_detail: None,
             real_time_enabled,
+            external_rules_suppressed: false,
             started_at,
             updated_at: started_at,
             last_detection_at: None,
@@ -461,7 +474,7 @@ mod windows_service_host {
 
         snapshot.lifecycle = ServiceLifecycle::Running;
         snapshot.updated_at = Utc::now();
-        snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+        snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
         write_health_best_effort(&health_path, &snapshot, &history);
         if let Err(error) = report_state(BodyState::Running) {
             rpc_server.stop();
@@ -473,7 +486,7 @@ mod windows_service_host {
             snapshot.connection = ServiceConnection::Stopped;
             snapshot.updated_at = Utc::now();
             snapshot.last_error = Some(error.clone());
-            snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+            snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
             write_health_best_effort(&health_path, &snapshot, &history);
             return Err(error);
         }
@@ -512,6 +525,37 @@ mod windows_service_host {
                 }
             }
 
+            if definitions_expired(&stable_definitions, Utc::now()) {
+                match load_detection_engine(&mut snapshot, &history) {
+                    Ok(fresh) => {
+                        replace_detection_engine(&engine, fresh);
+                        stable_definitions = snapshot.definitions.clone();
+                    }
+                    Err(error) => {
+                        match DetectionEngine::builtin() {
+                            Ok(built_in) => {
+                                replace_detection_engine(&engine, built_in);
+                                stable_definitions = ServiceDefinitionHealth::BuiltIn {
+                                    version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
+                                };
+                                snapshot.definitions = stable_definitions.clone();
+                            }
+                            Err(built_in_error) => {
+                                snapshot.definitions = ServiceDefinitionHealth::Failed {
+                                    detail: built_in_error.clone(),
+                                };
+                                runtime_error = Some(built_in_error);
+                            }
+                        }
+                        snapshot.last_error = Some(format!(
+                            "expired definitions were retired; authenticated reload failed: {error}"
+                        ));
+                        append_error(&history, snapshot.last_error.as_deref().unwrap_or(&error));
+                    }
+                }
+                changed = true;
+            }
+
             while rpc_update_receiver.try_recv().is_ok() {
                 let allowed = last_manual_update
                     .is_none_or(|attempt| attempt.elapsed() >= MANUAL_UPDATE_COOLDOWN);
@@ -544,9 +588,15 @@ mod windows_service_host {
                 last_settings_check = Instant::now();
             }
 
+            snapshot.external_rules_suppressed = engine
+                .read()
+                .map(|active| active.external_rules_tripped())
+                .unwrap_or(true);
+
             if changed || last_health_write.elapsed() >= HEALTH_WRITE_INTERVAL {
                 snapshot.updated_at = Utc::now();
-                snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+                snapshot.counters =
+                    counter_snapshot(&counters, &protection, &mut snapshot.last_error);
                 write_health_best_effort(&health_path, &snapshot, &history);
                 last_health_write = Instant::now();
             }
@@ -557,7 +607,7 @@ mod windows_service_host {
 
         snapshot.lifecycle = ServiceLifecycle::StopPending;
         snapshot.updated_at = Utc::now();
-        snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+        snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
         write_health_best_effort(&health_path, &snapshot, &history);
         let stop_status_error = report_state(BodyState::StopPending).err();
 
@@ -571,7 +621,7 @@ mod windows_service_host {
         snapshot.connection = ServiceConnection::Stopped;
         snapshot.connection_detail = None;
         snapshot.updated_at = Utc::now();
-        snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+        snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
         write_health_best_effort(&health_path, &snapshot, &history);
         if let Some(error) = runtime_error {
             Err(error)
@@ -702,6 +752,15 @@ mod windows_service_host {
         }
     }
 
+    fn definitions_expired(definitions: &ServiceDefinitionHealth, now: DateTime<Utc>) -> bool {
+        matches!(
+            definitions,
+            ServiceDefinitionHealth::Current { expires_at, .. }
+                | ServiceDefinitionHealth::LastKnownGood { expires_at, .. }
+                if *expires_at <= now
+        )
+    }
+
     fn load_detection_engine(
         snapshot: &mut ServiceHealthSnapshot,
         history: &EventHistory,
@@ -809,9 +868,10 @@ mod windows_service_host {
 
     fn counter_snapshot(
         counters: &Arc<Mutex<RealtimeCounters>>,
+        protection: &RealtimeProtection,
         last_error: &mut Option<String>,
     ) -> ServiceCounters {
-        match counters.lock() {
+        let mut snapshot = match counters.lock() {
             Ok(value) => ServiceCounters {
                 scanned: value.scanned,
                 suspicious: value.suspicious,
@@ -820,12 +880,27 @@ mod windows_service_host {
                 quarantined: value.quarantined,
                 scan_errors: value.scan_errors,
                 bypassed_due_to_load: value.bypassed_due_to_load,
+                ..ServiceCounters::default()
             },
             Err(_) => {
                 *last_error = Some("real-time counter lock was poisoned".to_owned());
                 ServiceCounters::default()
             }
+        };
+        if let Ok(driver) = protection.driver_health() {
+            snapshot.driver_scan_requests = driver.scan_requests;
+            snapshot.driver_blocks = driver.blocks;
+            snapshot.driver_timeouts = driver.timeouts;
+            snapshot.service_unavailable_bypasses = driver.service_unavailable_bypasses;
+            snapshot.object_resolution_bypasses = driver.object_resolution_bypasses;
+            snapshot.oversize_path_bypasses = driver.oversize_path_bypasses;
+            snapshot.irql_bypasses = driver.irql_bypasses;
+            snapshot.invalid_driver_replies = driver.invalid_replies;
+            snapshot.dirty_writes = driver.dirty_writes;
+            snapshot.enforcement_bypasses = driver.enforcement_bypasses;
+            snapshot.content_race_blocks = driver.content_race_blocks;
         }
+        snapshot
     }
 
     fn settings_stamp(path: &Path) -> Option<SettingsStamp> {

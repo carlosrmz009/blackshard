@@ -50,10 +50,7 @@ impl AmsiVerdict {
     }
 
     pub fn should_block_execution(self) -> bool {
-        matches!(
-            self,
-            Self::MalwareDetected | Self::BlockedByAdministrator
-        )
+        matches!(self, Self::MalwareDetected | Self::BlockedByAdministrator)
     }
 }
 
@@ -102,10 +99,7 @@ pub enum AmsiError {
 impl AmsiError {
     #[cfg(windows)]
     fn windows(operation: &'static str, hresult: i32) -> Self {
-        Self::Windows {
-            operation,
-            hresult,
-        }
+        Self::Windows { operation, hresult }
     }
 }
 
@@ -114,10 +108,7 @@ impl fmt::Display for AmsiError {
         match self {
             Self::Unavailable(message) => write!(formatter, "AMSI is unavailable: {message}"),
             Self::InvalidInput(message) => write!(formatter, "invalid AMSI input: {message}"),
-            Self::Windows {
-                operation,
-                hresult,
-            } => write!(
+            Self::Windows { operation, hresult } => write!(
                 formatter,
                 "{operation} failed with HRESULT 0x{:08x}",
                 *hresult as u32
@@ -191,7 +182,6 @@ fn bounded_sample(bytes: &[u8]) -> (&[u8], bool) {
 mod platform {
     use super::AmsiError;
     use std::ffi::{c_char, c_void};
-    use std::ptr;
     use std::sync::Arc;
 
     const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
@@ -200,14 +190,8 @@ mod platform {
     type AmsiUninitializeFn = unsafe extern "system" fn(usize);
     type AmsiOpenSessionFn = unsafe extern "system" fn(usize, *mut usize) -> i32;
     type AmsiCloseSessionFn = unsafe extern "system" fn(usize, usize);
-    type AmsiScanBufferFn = unsafe extern "system" fn(
-        usize,
-        *const c_void,
-        u32,
-        *const u16,
-        usize,
-        *mut u32,
-    ) -> i32;
+    type AmsiScanBufferFn =
+        unsafe extern "system" fn(usize, *const c_void, u32, *const u16, usize, *mut u32) -> i32;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -228,13 +212,7 @@ mod platform {
     impl Api {
         fn load() -> Result<Self, AmsiError> {
             let dll: Vec<u16> = "amsi.dll".encode_utf16().chain(Some(0)).collect();
-            let module = unsafe {
-                LoadLibraryExW(
-                    dll.as_ptr(),
-                    0,
-                    LOAD_LIBRARY_SEARCH_SYSTEM32,
-                )
-            };
+            let module = unsafe { LoadLibraryExW(dll.as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32) };
             if module == 0 {
                 return Err(AmsiError::Unavailable(format!(
                     "could not load the system amsi.dll: {}",
@@ -331,12 +309,11 @@ mod platform {
     impl Scanner {
         pub(super) fn new(application_name: &str) -> Result<Self, AmsiError> {
             let api = Arc::new(Api::load()?);
-            let application_name: Vec<u16> = application_name
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
+            let application_name: Vec<u16> =
+                application_name.encode_utf16().chain(Some(0)).collect();
             let mut context_handle = 0usize;
-            let result = unsafe { (api.initialize)(application_name.as_ptr(), &mut context_handle) };
+            let result =
+                unsafe { (api.initialize)(application_name.as_ptr(), &mut context_handle) };
             if result < 0 {
                 return Err(AmsiError::windows("AmsiInitialize", result));
             }
@@ -360,8 +337,7 @@ mod platform {
         ) -> Result<u32, AmsiError> {
             let context = Arc::clone(&self.context);
             let session = Session::open(&context)?;
-            let content_name: Vec<u16> =
-                content_name.encode_utf16().chain(Some(0)).collect();
+            let content_name: Vec<u16> = content_name.encode_utf16().chain(Some(0)).collect();
             let mut result = 0u32;
             let hresult = unsafe {
                 (context.api.scan_buffer)(

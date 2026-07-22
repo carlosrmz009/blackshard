@@ -11,6 +11,11 @@ pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 pub struct Settings {
     pub schema_version: u32,
     pub real_time_protection: bool,
+    /// Collect and correlate bounded modification telemetry for protected user data.
+    pub ransomware_protection: bool,
+    /// Audit is the safe default until a machine's legitimate workload has
+    /// been observed. Block mode denies modifications after the behavior threshold.
+    pub ransomware_block_mode: bool,
     pub automatic_quarantine: bool,
     pub notify_on_detection: bool,
     pub scan_archives: bool,
@@ -30,6 +35,8 @@ impl Default for Settings {
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
             real_time_protection: true,
+            ransomware_protection: true,
+            ransomware_block_mode: false,
             automatic_quarantine: true,
             notify_on_detection: true,
             scan_archives: true,
@@ -164,8 +171,10 @@ mod tests {
     fn settings_round_trip_atomically() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("config").join("settings.json");
-        let mut expected = Settings::default();
-        expected.real_time_protection = false;
+        let expected = Settings {
+            real_time_protection: false,
+            ..Settings::default()
+        };
         expected.save(&path).unwrap();
         let actual = Settings::load(&path).unwrap();
         assert!(!actual.real_time_protection);

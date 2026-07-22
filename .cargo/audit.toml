@@ -1,0 +1,12 @@
+# These advisories affect quick-xml 0.39.4 through wayland-scanner, a
+# Linux/Wayland build-time dependency of eframe. Blackshard targets Windows,
+# the crate is absent from the Windows build graph, and wayland-scanner 0.31.10
+# has no compatible patched quick-xml release as of 2026-07-22. Remove these
+# exceptions as soon as the upstream Wayland dependency accepts quick-xml
+# 0.41 or later.
+[advisories]
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
+
+[target]
+arch = ["x86_64"]
+os = ["windows"]

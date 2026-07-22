@@ -1,10 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Blackshard is intentionally a single binary with service, GUI, installer-helper,
+// and test-only subsystem entry points. Some public subsystem APIs are dormant in
+// any one build mode, so retain them while keeping every other warning fatal.
+#![allow(dead_code)]
 
+mod amsi;
+mod archive;
 mod atomic_file;
+mod behavior;
 mod config;
 mod definitions;
 mod detection;
 mod driver_installer;
+mod elevation;
 mod engine;
 mod history;
 mod ipc;
@@ -15,10 +23,12 @@ mod realtime;
 mod rules;
 mod scan_manager;
 mod service;
+mod similarity;
 mod trust;
 mod ui;
 mod update_client;
 mod updater;
+mod vba;
 
 use crate::ipc::IpcClient;
 use crate::service::{
@@ -35,7 +45,7 @@ use eframe::egui;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -46,6 +56,9 @@ const SELF_TEST_ARGUMENT: &str = "--blackshard-self-test-open";
 const INSTALL_DRIVER_ARGUMENT: &str = "--install-driver";
 const UNINSTALL_DRIVER_ARGUMENT: &str = "--uninstall-driver";
 const NOTIFICATION_AGENT_ARGUMENT: &str = "--notification-agent";
+const VALIDATE_RELEASE_CONFIGURATION_ARGUMENT: &str = "--validate-release-configuration";
+const VERIFY_DEFINITION_UPDATE_ARGUMENT: &str = "--verify-definition-update";
+const EVALUATE_CORPUS_ARGUMENT: &str = "--evaluate-corpus";
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTH_STALE_AFTER_SECONDS: i64 = 10;
 const SELF_TEST_PAYLOAD: &[u8] =
@@ -71,6 +84,294 @@ fn self_test_probe_exit_code() -> Option<i32> {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => 10,
         Err(_) => 11,
     })
+}
+
+fn release_configuration_validation_exit_code() -> Option<i32> {
+    let mut arguments = std::env::args_os();
+    arguments.next();
+    if arguments.next().as_deref() != Some(OsStr::new(VALIDATE_RELEASE_CONFIGURATION_ARGUMENT)) {
+        return None;
+    }
+
+    let (Some(inf_path), Some(manifest_url), Some(public_key_hex)) =
+        (arguments.next(), arguments.next(), arguments.next())
+    else {
+        return Some(2);
+    };
+    if arguments.next().is_some() {
+        return Some(2);
+    }
+
+    let manifest_url = manifest_url.to_string_lossy();
+    let public_key_hex = public_key_hex.to_string_lossy();
+    let embedded_manifest = option_env!("BLACKSHARD_UPDATE_MANIFEST_URL");
+    let embedded_key = option_env!("BLACKSHARD_DEFINITION_PUBLIC_KEY_HEX");
+    let public_key_is_valid = hex::decode(public_key_hex.as_ref())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .is_some_and(|bytes| ed25519_dalek::VerifyingKey::from_bytes(&bytes).is_ok());
+    let manifest_is_valid = update_client::UpdateClientConfig::new(manifest_url.to_string())
+        .validate()
+        .is_ok();
+    let configuration_matches = embedded_manifest == Some(manifest_url.as_ref())
+        && embedded_key.is_some_and(|key| key.eq_ignore_ascii_case(&public_key_hex))
+        && public_key_is_valid
+        && manifest_is_valid;
+
+    Some(
+        if configuration_matches
+            && driver_installer::validate_release_inf(std::path::Path::new(&inf_path)).is_ok()
+        {
+            0
+        } else {
+            1
+        },
+    )
+}
+
+fn definition_update_verification_exit_code() -> Option<i32> {
+    let mut arguments = std::env::args_os();
+    arguments.next();
+    if arguments.next().as_deref() != Some(OsStr::new(VERIFY_DEFINITION_UPDATE_ARGUMENT)) {
+        return None;
+    }
+    let (Some(envelope_path), Some(payload_path), Some(public_key_hex)) =
+        (arguments.next(), arguments.next(), arguments.next())
+    else {
+        return Some(2);
+    };
+    if arguments.next().is_some() {
+        return Some(2);
+    }
+
+    let result = (|| -> Result<(), String> {
+        let envelope_bytes = read_validation_file(
+            std::path::Path::new(&envelope_path),
+            updater::MAX_ENVELOPE_BYTES as u64,
+        )?;
+        let payload = read_validation_file(
+            std::path::Path::new(&payload_path),
+            definitions::MAX_DEFINITION_BUNDLE_BYTES as u64,
+        )?;
+        let key = hex::decode(public_key_hex.to_string_lossy().as_ref())
+            .map_err(|_| "public key is not hexadecimal".to_owned())?;
+        let key: [u8; 32] = key
+            .try_into()
+            .map_err(|_| "public key must contain exactly 32 bytes".to_owned())?;
+        let envelope = updater::SignedUpdateEnvelope::from_json(&envelope_bytes)
+            .map_err(|error| error.to_string())?;
+        let installed_sequence = envelope.manifest.sequence.saturating_sub(1);
+        updater::verify_update(
+            &envelope,
+            &payload,
+            installed_sequence,
+            Utc::now(),
+            definitions::MAX_DEFINITION_BUNDLE_BYTES as u64,
+            &key,
+        )
+        .map_err(|error| error.to_string())?;
+        definitions::DefinitionBundle::from_json(&payload).map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    Some(if result.is_ok() { 0 } else { 1 })
+}
+
+#[derive(serde::Serialize)]
+struct CorpusFileResult {
+    path: String,
+    verdict: String,
+    risk_score: u8,
+    confidence: u8,
+    threat_name: Option<String>,
+    sha256: Option<String>,
+    file_size: u64,
+    elapsed_micros: u64,
+    container_findings: usize,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CorpusReport {
+    schema_version: u32,
+    product_version: &'static str,
+    generated_at: chrono::DateTime<Utc>,
+    root: String,
+    files: usize,
+    bytes: u64,
+    clean: usize,
+    suspicious: usize,
+    malicious: usize,
+    errors: usize,
+    wall_millis: u64,
+    throughput_mib_per_second: f64,
+    latency_p50_micros: u64,
+    latency_p95_micros: u64,
+    latency_p99_micros: u64,
+    results: Vec<CorpusFileResult>,
+}
+
+fn corpus_evaluation_exit_code() -> Option<i32> {
+    let mut arguments = std::env::args_os();
+    arguments.next();
+    if arguments.next().as_deref() != Some(OsStr::new(EVALUATE_CORPUS_ARGUMENT)) {
+        return None;
+    }
+    let (Some(root), Some(output)) = (arguments.next(), arguments.next()) else {
+        return Some(2);
+    };
+    if arguments.next().is_some() {
+        return Some(2);
+    }
+    Some(
+        match evaluate_corpus(std::path::Path::new(&root), std::path::Path::new(&output)) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        },
+    )
+}
+
+fn evaluate_corpus(root: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    const MAX_CORPUS_FILES: usize = 100_000;
+    const MAX_CORPUS_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+    let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    if !root.is_dir() {
+        return Err("corpus root is not a directory".to_owned());
+    }
+    let output = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(output)
+    };
+    if output.starts_with(&root) {
+        return Err("corpus report must be written outside the corpus root".to_owned());
+    }
+
+    let engine = detection::DetectionEngine::builtin()?;
+    let wall_started = std::time::Instant::now();
+    let mut results = Vec::new();
+    let mut total_bytes = 0u64;
+    let (mut clean, mut suspicious, mut malicious, mut errors) = (0, 0, 0, 0);
+    for entry in walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .max_depth(64)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if results.len() >= MAX_CORPUS_FILES {
+            return Err("corpus exceeds the 100,000-file evaluation limit".to_owned());
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or("corpus byte count overflow")?;
+        if total_bytes > MAX_CORPUS_BYTES {
+            return Err("corpus exceeds the 1 TiB evaluation limit".to_owned());
+        }
+        let report = engine.scan_path(entry.path());
+        let verdict = match report.verdict {
+            detection::DetectionVerdict::Clean => {
+                clean += 1;
+                "clean"
+            }
+            detection::DetectionVerdict::Suspicious => {
+                suspicious += 1;
+                "suspicious"
+            }
+            detection::DetectionVerdict::Malicious => {
+                malicious += 1;
+                "malicious"
+            }
+            detection::DetectionVerdict::Error => {
+                errors += 1;
+                "error"
+            }
+        };
+        results.push(CorpusFileResult {
+            path: entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .into_owned(),
+            verdict: verdict.to_owned(),
+            risk_score: report.risk_score,
+            confidence: report.confidence,
+            threat_name: report.threat_name,
+            sha256: report.sha256,
+            file_size: report.file_size,
+            elapsed_micros: report.elapsed.as_micros().min(u64::MAX as u128) as u64,
+            container_findings: report
+                .container_inspection
+                .as_ref()
+                .map(|inspection| inspection.findings.len())
+                .unwrap_or(0),
+            error: report.error,
+        });
+    }
+    let wall = wall_started.elapsed();
+    let mut latencies = results
+        .iter()
+        .map(|result| result.elapsed_micros)
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+    let percentile = |percent: usize| -> u64 {
+        if latencies.is_empty() {
+            return 0;
+        }
+        let index = (latencies.len() - 1).saturating_mul(percent) / 100;
+        latencies[index]
+    };
+    let seconds = wall.as_secs_f64();
+    let report = CorpusReport {
+        schema_version: 1,
+        product_version: env!("CARGO_PKG_VERSION"),
+        generated_at: Utc::now(),
+        root: root.to_string_lossy().into_owned(),
+        files: results.len(),
+        bytes: total_bytes,
+        clean,
+        suspicious,
+        malicious,
+        errors,
+        wall_millis: wall.as_millis().min(u64::MAX as u128) as u64,
+        throughput_mib_per_second: if seconds > 0.0 {
+            total_bytes as f64 / (1024.0 * 1024.0) / seconds
+        } else {
+            0.0
+        },
+        latency_p50_micros: percentile(50),
+        latency_p95_micros: percentile(95),
+        latency_p99_micros: percentile(99),
+        results,
+    };
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+    atomic_file::write(&output, &bytes).map_err(|error| error.to_string())
+}
+
+fn read_validation_file(path: &std::path::Path, maximum: u64) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum {
+        return Err(format!(
+            "validation input is not a bounded regular file: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > maximum {
+        return Err("validation input grew beyond its limit".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn run_service_mode() -> Result<(), Box<dyn Error>> {
@@ -142,6 +443,15 @@ fn apply_service_health(runtime: &SharedUiState, health: ServiceHealthSnapshot) 
     state.engine_version = health.product_version;
     state.realtime_scanned_files = health.counters.scanned;
     state.realtime_blocked_files = health.counters.blocked_replies;
+    state.realtime_bypassed_requests = health
+        .counters
+        .bypassed_due_to_load
+        .saturating_add(health.counters.driver_timeouts)
+        .saturating_add(health.counters.service_unavailable_bypasses)
+        .saturating_add(health.counters.object_resolution_bypasses)
+        .saturating_add(health.counters.oversize_path_bypasses)
+        .saturating_add(health.counters.irql_bypasses)
+        .saturating_add(health.counters.enforcement_bypasses);
     state.definitions = match health.definitions {
         ServiceDefinitionHealth::BuiltIn { version } => DefinitionStatus::BuiltInOnly { version },
         ServiceDefinitionHealth::Updating { current_version } => {
@@ -195,6 +505,12 @@ fn apply_service_health(runtime: &SharedUiState, health: ServiceHealthSnapshot) 
             ProtectionStatus::Unavailable("the protection service is stopped".to_owned())
         }
         ServiceLifecycle::Running if !health.real_time_enabled => ProtectionStatus::Paused,
+        ServiceLifecycle::Running if health.external_rules_suppressed => {
+            ProtectionStatus::Degraded(
+                "external rule matches exceeded the safety threshold and were suppressed"
+                    .to_owned(),
+            )
+        }
         ServiceLifecycle::Running if health.connection == ServiceConnection::Connected => {
             ProtectionStatus::Active
         }
@@ -350,9 +666,11 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
     initialize_runtime(&runtime);
     start_service_health_monitor(Arc::clone(&runtime));
 
-    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    wgpu_options.supported_backends = eframe::wgpu::Backends::DX12;
-    wgpu_options.power_preference = eframe::wgpu::PowerPreference::LowPower;
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        supported_backends: eframe::wgpu::Backends::DX12,
+        power_preference: eframe::wgpu::PowerPreference::LowPower,
+        ..Default::default()
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -373,6 +691,18 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     if let Some(exit_code) = self_test_probe_exit_code() {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = elevation::elevated_action_exit_code() {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = release_configuration_validation_exit_code() {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = definition_update_verification_exit_code() {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = corpus_evaluation_exit_code() {
         std::process::exit(exit_code);
     }
 
@@ -404,6 +734,7 @@ mod tests {
             connection: ServiceConnection::Connected,
             connection_detail: None,
             real_time_enabled: true,
+            external_rules_suppressed: false,
             started_at: now,
             updated_at: now,
             last_detection_at: None,
@@ -432,6 +763,7 @@ mod tests {
             connection: ServiceConnection::Connected,
             connection_detail: None,
             real_time_enabled: false,
+            external_rules_suppressed: false,
             started_at: now,
             updated_at: now,
             last_detection_at: None,

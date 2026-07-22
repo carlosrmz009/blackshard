@@ -329,10 +329,8 @@ fn requires_elevated_admin(command: &RpcCommand) -> bool {
     matches!(
         command,
         RpcCommand::SaveSettings { .. }
-            | RpcCommand::ListQuarantine
             | RpcCommand::RestoreQuarantine { .. }
             | RpcCommand::DeleteQuarantine { .. }
-            | RpcCommand::RecentActivity { .. }
             | RpcCommand::ClearActivity
     )
 }
@@ -1008,9 +1006,21 @@ mod windows_transport {
                     message: format!("could not read quarantine: {error}"),
                 })?;
                 records.truncate(MAX_QUARANTINE_RESULTS);
-                Ok(RpcResponse::Quarantine {
-                    records: records.iter().map(QuarantineRecordView::from).collect(),
-                })
+                let records = records
+                    .iter()
+                    .map(|record| {
+                        let mut view = QuarantineRecordView::from(record);
+                        if !caller.elevated_admin {
+                            view.original_path = record
+                                .original_path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "<protected path>".to_owned());
+                        }
+                        view
+                    })
+                    .collect();
+                Ok(RpcResponse::Quarantine { records })
             }
             RpcCommand::RestoreQuarantine { id } => {
                 let destination = resources
@@ -1043,7 +1053,7 @@ mod windows_transport {
                         message: format!("could not read activity history: {error}"),
                     })?
                     .into_iter()
-                    .map(sanitize_event)
+                    .map(|event| sanitize_event(event, caller.elevated_admin))
                     .collect();
                 Ok(RpcResponse::Activity { events })
             }
@@ -1151,15 +1161,25 @@ mod windows_transport {
         }
     }
 
-    fn sanitize_event(mut event: SecurityEvent) -> SecurityEvent {
+    fn sanitize_event(mut event: SecurityEvent, include_sensitive_paths: bool) -> SecurityEvent {
         event.summary = bounded_string(event.summary, 256);
-        event.path = event
-            .path
-            .map(|path| PathBuf::from(bounded_string(path.to_string_lossy(), MAX_WIRE_PATH_CHARS)));
+        event.path = event.path.map(|path| {
+            if include_sensitive_paths {
+                PathBuf::from(bounded_string(path.to_string_lossy(), MAX_WIRE_PATH_CHARS))
+            } else {
+                path.file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("<protected path>"))
+            }
+        });
         event.threat_name = event.threat_name.map(|value| bounded_string(value, 128));
-        event.details = event
-            .details
-            .map(|value| bounded_string(value, MAX_WIRE_TEXT_CHARS));
+        event.details = include_sensitive_paths
+            .then(|| {
+                event
+                    .details
+                    .map(|value| bounded_string(value, MAX_WIRE_TEXT_CHARS))
+            })
+            .flatten();
         event
     }
 
@@ -1657,14 +1677,14 @@ mod tests {
         assert!(requires_elevated_admin(&RpcCommand::SaveSettings {
             settings: Settings::default(),
         }));
-        assert!(requires_elevated_admin(&RpcCommand::ListQuarantine));
+        assert!(!requires_elevated_admin(&RpcCommand::ListQuarantine));
         assert!(requires_elevated_admin(&RpcCommand::RestoreQuarantine {
             id: Uuid::nil(),
         }));
         assert!(requires_elevated_admin(&RpcCommand::DeleteQuarantine {
             id: Uuid::nil(),
         }));
-        assert!(requires_elevated_admin(&RpcCommand::RecentActivity {
+        assert!(!requires_elevated_admin(&RpcCommand::RecentActivity {
             limit: 10,
         }));
         assert!(requires_elevated_admin(&RpcCommand::ClearActivity));
