@@ -1,0 +1,956 @@
+//! Windows Service Control Manager host for Blackshard's real-time engine.
+//!
+//! The service and GUI intentionally do not communicate over a network socket.
+//! The service publishes a small, read-only health snapshot beneath ProgramData;
+//! security events and quarantine metadata continue to use their dedicated
+//! stores.
+
+use crate::atomic_file;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// User-mode protection service. This must remain distinct from the
+/// `blackshard` FILE_SYSTEM_DRIVER service installed by the minifilter INF.
+pub const SERVICE_NAME: &str = "BlackshardProtectionService";
+pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 2;
+pub const SERVICE_HEALTH_FILE_NAME: &str = "service-health.json";
+pub const UPDATE_REQUEST_FILE_NAME: &str = "update-request";
+
+static HEALTH_WRITE_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+const MAX_SERVICE_HEALTH_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceLifecycle {
+    StartPending,
+    Running,
+    StopPending,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceConnection {
+    Connecting,
+    Connected,
+    Disconnected,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ServiceDefinitionHealth {
+    BuiltIn {
+        version: String,
+    },
+    Updating {
+        current_version: Option<String>,
+    },
+    Current {
+        version: String,
+        bundle_id: String,
+        expires_at: DateTime<Utc>,
+    },
+    LastKnownGood {
+        version: String,
+        bundle_id: String,
+        expires_at: DateTime<Utc>,
+    },
+    Failed {
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceCounters {
+    pub scanned: u64,
+    pub suspicious: u64,
+    pub detected: u64,
+    pub blocked_replies: u64,
+    pub quarantined: u64,
+    pub scan_errors: u64,
+    pub bypassed_due_to_load: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceHealthSnapshot {
+    pub schema_version: u32,
+    pub product_version: String,
+    pub process_id: u32,
+    pub lifecycle: ServiceLifecycle,
+    pub connection: ServiceConnection,
+    pub connection_detail: Option<String>,
+    pub real_time_enabled: bool,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_detection_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub definitions: ServiceDefinitionHealth,
+    pub counters: ServiceCounters,
+}
+
+impl ServiceHealthSnapshot {
+    fn starting(started_at: DateTime<Utc>, real_time_enabled: bool) -> Self {
+        Self {
+            schema_version: SERVICE_HEALTH_SCHEMA_VERSION,
+            product_version: env!("CARGO_PKG_VERSION").to_owned(),
+            process_id: std::process::id(),
+            lifecycle: ServiceLifecycle::StartPending,
+            connection: ServiceConnection::Connecting,
+            connection_detail: None,
+            real_time_enabled,
+            started_at,
+            updated_at: started_at,
+            last_detection_at: None,
+            last_error: None,
+            definitions: ServiceDefinitionHealth::BuiltIn {
+                version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
+            },
+            counters: ServiceCounters::default(),
+        }
+    }
+}
+
+/// Builds the health-file path without consulting process-global environment
+/// state, which keeps callers and tests deterministic.
+pub fn service_health_path_from_program_data(program_data: &Path) -> PathBuf {
+    program_data
+        .join("Blackshard")
+        .join(SERVICE_HEALTH_FILE_NAME)
+}
+
+pub fn default_service_health_path() -> PathBuf {
+    let program_data = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    service_health_path_from_program_data(&program_data)
+}
+
+pub fn default_update_request_path() -> PathBuf {
+    let program_data = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    program_data
+        .join("Blackshard")
+        .join("Requests")
+        .join(UPDATE_REQUEST_FILE_NAME)
+}
+
+pub fn read_service_health(path: &Path) -> io::Result<ServiceHealthSnapshot> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "service health is not a regular, non-symlink file",
+        ));
+    }
+    if metadata.len() > MAX_SERVICE_HEALTH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "service health exceeds its size limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)?
+        .take(MAX_SERVICE_HEALTH_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SERVICE_HEALTH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "service health exceeds its size limit",
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+/// Commits a complete JSON document with a same-volume atomic replacement.
+/// Readers therefore see either the previous snapshot or the new one, never a
+/// partially-written document.
+pub fn write_service_health_atomic(
+    path: &Path,
+    snapshot: &ServiceHealthSnapshot,
+) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    atomic_file::write(path, &bytes)
+}
+
+#[cfg(windows)]
+mod windows_service_host {
+    use super::*;
+    use crate::config::Settings;
+    use crate::definitions::{configured_trusted_public_key, DefinitionSource, DefinitionStore};
+    use crate::detection::{DetectionEngine, DetectionVerdict};
+    use crate::history::{EventHistory, EventKind, SecurityEvent};
+    use crate::ipc::{RpcServer, RpcServiceResources};
+    use crate::quarantine::QuarantineStore;
+    use crate::realtime::{
+        new_shared_detection_engine, replace_detection_engine, ProtectionConnection,
+        RealtimeCounters, RealtimeEvent, RealtimeProtection, SharedDetectionEngine,
+    };
+    use crate::update_client::{
+        start_update_client, ManualTriggerResult, UpdateClientConfig, UpdateClientHandle,
+        UpdateEvent,
+    };
+    use crate::updater::UpdateScheduler;
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
+    use std::sync::{mpsc, Arc, Mutex, RwLock};
+    use std::time::{Duration, Instant, SystemTime};
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{
+        self, ServiceControlHandlerResult, ServiceStatusHandle,
+    };
+    use windows_service::{define_windows_service, service_dispatcher};
+
+    const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+    const HEALTH_WRITE_INTERVAL: Duration = Duration::from_secs(2);
+    const SETTINGS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+    const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
+    const MANUAL_UPDATE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+    const REALTIME_EVENT_CHANNEL_CAPACITY: usize = 256;
+    const UPDATE_MANIFEST_URL: Option<&str> = option_env!("BLACKSHARD_UPDATE_MANIFEST_URL");
+    const UPDATE_ALLOWED_ORIGINS: Option<&str> = option_env!("BLACKSHARD_UPDATE_ALLOWED_ORIGINS");
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u8)]
+    enum BodyState {
+        StartPending = 0,
+        Running = 1,
+        StopPending = 2,
+        Stopped = 3,
+    }
+
+    impl BodyState {
+        fn from_raw(value: u8) -> Self {
+            match value {
+                1 => Self::Running,
+                2 => Self::StopPending,
+                3 => Self::Stopped,
+                _ => Self::StartPending,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SettingsStamp {
+        length: u64,
+        modified: Option<SystemTime>,
+    }
+
+    define_windows_service!(blackshard_service_main, service_main);
+
+    /// Enters the Windows Service Control Manager dispatcher. The executable's
+    /// `--service` mode should call this on its initial thread.
+    pub fn run_service_dispatcher() -> windows_service::Result<()> {
+        service_dispatcher::start(SERVICE_NAME, blackshard_service_main)
+    }
+
+    /// Runs the same service body without the SCM wrapper. This is useful for a
+    /// console harness: set `stop_requested` to true to request a clean stop.
+    pub fn run_service_console(stop_requested: Arc<AtomicBool>) -> Result<(), String> {
+        run_service_body(stop_requested)
+    }
+
+    /// Starts and owns the detector, quarantine store, event history, and
+    /// minifilter connection until `stop_requested` becomes true.
+    pub fn run_service_body(stop_requested: Arc<AtomicBool>) -> Result<(), String> {
+        run_service_body_with_reporter(stop_requested, |_| Ok(()))
+    }
+
+    fn service_main(_arguments: Vec<OsString>) {
+        if let Err(error) = run_registered_service() {
+            append_service_error(format!("Blackshard service stopped with an error: {error}"));
+        }
+    }
+
+    fn run_registered_service() -> Result<(), String> {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU8::new(BodyState::StartPending as u8));
+        let status_slot = Arc::new(Mutex::new(None::<ServiceStatusHandle>));
+
+        let handler_stop = Arc::clone(&stop_requested);
+        let handler_lifecycle = Arc::clone(&lifecycle);
+        let handler_status = Arc::clone(&status_slot);
+        let event_handler = move |control| -> ServiceControlHandlerResult {
+            match control {
+                ServiceControl::Interrogate => {
+                    if let Ok(slot) = handler_status.lock() {
+                        if let Some(handle) = *slot {
+                            let state =
+                                BodyState::from_raw(handler_lifecycle.load(Ordering::Acquire));
+                            let _ = handle.set_service_status(service_status(state, false, None));
+                        }
+                    }
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    handler_stop.store(true, Ordering::Release);
+                    handler_lifecycle.store(BodyState::StopPending as u8, Ordering::Release);
+                    if let Ok(slot) = handler_status.lock() {
+                        if let Some(handle) = *slot {
+                            let _ = handle.set_service_status(service_status(
+                                BodyState::StopPending,
+                                false,
+                                Some(1),
+                            ));
+                        }
+                    }
+                    ServiceControlHandlerResult::NoError
+                }
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+
+        let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
+            .map_err(|error| format!("could not register the SCM control handler: {error}"))?;
+        if let Ok(mut slot) = status_slot.lock() {
+            *slot = Some(status_handle);
+        }
+
+        let result = run_service_body_with_reporter(stop_requested, |state| {
+            lifecycle.store(state as u8, Ordering::Release);
+            status_handle
+                .set_service_status(service_status(state, false, None))
+                .map_err(|error| format!("could not report {state:?} to the SCM: {error}"))
+        });
+
+        if result.is_err() {
+            lifecycle.store(BodyState::Stopped as u8, Ordering::Release);
+            let _ =
+                status_handle.set_service_status(service_status(BodyState::Stopped, true, None));
+        }
+        result
+    }
+
+    fn service_status(
+        state: BodyState,
+        failed: bool,
+        checkpoint_override: Option<u32>,
+    ) -> ServiceStatus {
+        let (current_state, controls_accepted, checkpoint, wait_hint) = match state {
+            BodyState::StartPending => (
+                ServiceState::StartPending,
+                ServiceControlAccept::empty(),
+                1,
+                Duration::from_secs(20),
+            ),
+            BodyState::Running => (
+                ServiceState::Running,
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                0,
+                Duration::ZERO,
+            ),
+            BodyState::StopPending => (
+                ServiceState::StopPending,
+                ServiceControlAccept::empty(),
+                2,
+                STOP_WAIT_HINT,
+            ),
+            BodyState::Stopped => (
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                0,
+                Duration::ZERO,
+            ),
+        };
+        ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state,
+            controls_accepted,
+            exit_code: if failed {
+                ServiceExitCode::ServiceSpecific(1)
+            } else {
+                ServiceExitCode::NO_ERROR
+            },
+            checkpoint: checkpoint_override.unwrap_or(checkpoint),
+            wait_hint,
+            process_id: None,
+        }
+    }
+
+    fn run_service_body_with_reporter<F>(
+        stop_requested: Arc<AtomicBool>,
+        mut report_state: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(BodyState) -> Result<(), String>,
+    {
+        report_state(BodyState::StartPending)?;
+
+        let health_path = default_service_health_path();
+        let started_at = Utc::now();
+        let history = Arc::new(EventHistory::default_for_machine());
+        let settings_path = Settings::default_machine_path();
+        let initial_settings = match Settings::load(&settings_path) {
+            Ok(settings) => settings,
+            Err(error) => {
+                let message =
+                    format!("Settings could not be loaded; secure defaults are active: {error}");
+                append_error(&history, &message);
+                Settings::default()
+            }
+        };
+        let settings_stamp = settings_stamp(&settings_path);
+        let settings = Arc::new(RwLock::new(initial_settings));
+        let real_time_enabled = settings
+            .read()
+            .map(|value| value.real_time_protection)
+            .unwrap_or(true);
+
+        let mut snapshot = ServiceHealthSnapshot::starting(started_at, real_time_enabled);
+        write_health_best_effort(&health_path, &snapshot, &history);
+
+        let engine = match load_detection_engine(&mut snapshot, &history) {
+            Ok(engine) => new_shared_detection_engine(engine),
+            Err(error) => {
+                let message = format!("Detection engine initialization failed: {error}");
+                snapshot.lifecycle = ServiceLifecycle::Stopped;
+                snapshot.connection = ServiceConnection::Stopped;
+                snapshot.updated_at = Utc::now();
+                snapshot.last_error = Some(message.clone());
+                write_health_best_effort(&health_path, &snapshot, &history);
+                return Err(message);
+            }
+        };
+        let quarantine = Arc::new(QuarantineStore::default_for_machine());
+        let (event_sender, event_receiver) = mpsc::sync_channel(REALTIME_EVENT_CHANNEL_CAPACITY);
+        let mut protection = RealtimeProtection::start(
+            Arc::clone(&engine),
+            Arc::clone(&quarantine),
+            Arc::clone(&history),
+            Arc::clone(&settings),
+            event_sender,
+        );
+        let counters = Arc::clone(&protection.counters);
+        let (mut update_client, update_receiver) =
+            start_definition_updater(&settings, &mut snapshot, &history);
+        let mut stable_definitions = snapshot.definitions.clone();
+        let (rpc_update_sender, rpc_update_receiver) = mpsc::sync_channel(1);
+        let rpc_server = match RpcServer::start(RpcServiceResources::new(
+            Arc::clone(&engine),
+            Arc::clone(&quarantine),
+            Arc::clone(&history),
+            Arc::clone(&settings),
+            settings_path.clone(),
+            rpc_update_sender,
+            update_client.is_some(),
+        )) {
+            Ok(server) => server,
+            Err(error) => {
+                if let Some(client) = update_client.take() {
+                    client.stop();
+                }
+                protection.stop();
+                snapshot.lifecycle = ServiceLifecycle::Stopped;
+                snapshot.connection = ServiceConnection::Stopped;
+                snapshot.updated_at = Utc::now();
+                snapshot.last_error = Some(error.clone());
+                write_health_best_effort(&health_path, &snapshot, &history);
+                return Err(error);
+            }
+        };
+        let mut last_manual_update = None::<Instant>;
+
+        snapshot.lifecycle = ServiceLifecycle::Running;
+        snapshot.updated_at = Utc::now();
+        snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+        write_health_best_effort(&health_path, &snapshot, &history);
+        if let Err(error) = report_state(BodyState::Running) {
+            rpc_server.stop();
+            if let Some(client) = update_client.take() {
+                client.stop();
+            }
+            protection.stop();
+            snapshot.lifecycle = ServiceLifecycle::Stopped;
+            snapshot.connection = ServiceConnection::Stopped;
+            snapshot.updated_at = Utc::now();
+            snapshot.last_error = Some(error.clone());
+            snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+            write_health_best_effort(&health_path, &snapshot, &history);
+            return Err(error);
+        }
+
+        let mut last_health_write = Instant::now();
+        let mut last_settings_check = Instant::now();
+        let mut observed_settings_stamp = settings_stamp;
+        let mut runtime_error = None;
+        while !stop_requested.load(Ordering::Acquire) {
+            let mut changed = false;
+            match event_receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(event) => changed |= apply_realtime_event(&mut snapshot, event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let error = "real-time protection event channel disconnected".to_owned();
+                    snapshot.connection = ServiceConnection::Disconnected;
+                    snapshot.connection_detail = Some(error.clone());
+                    snapshot.last_error = Some(error.clone());
+                    runtime_error = Some(error);
+                    changed = true;
+                }
+            }
+            while let Ok(event) = event_receiver.try_recv() {
+                changed |= apply_realtime_event(&mut snapshot, event);
+            }
+
+            if let Some(receiver) = &update_receiver {
+                while let Ok(event) = receiver.try_recv() {
+                    changed |= apply_update_event(
+                        &mut snapshot,
+                        &mut stable_definitions,
+                        event,
+                        &engine,
+                        &history,
+                    );
+                }
+            }
+
+            while rpc_update_receiver.try_recv().is_ok() {
+                let allowed = last_manual_update
+                    .is_none_or(|attempt| attempt.elapsed() >= MANUAL_UPDATE_COOLDOWN);
+                if allowed {
+                    match update_client.as_ref().map(UpdateClientHandle::trigger) {
+                        Some(ManualTriggerResult::Queued)
+                        | Some(ManualTriggerResult::AlreadyQueued)
+                        | Some(ManualTriggerResult::AlreadyRunning) => {
+                            last_manual_update = Some(Instant::now());
+                        }
+                        Some(ManualTriggerResult::Stopped) | None => {
+                            snapshot.definitions = ServiceDefinitionHealth::Failed {
+                                detail: "the authenticated update client is not configured"
+                                    .to_owned(),
+                            };
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            if last_settings_check.elapsed() >= SETTINGS_CHECK_INTERVAL {
+                changed |= reload_settings_if_changed(
+                    &settings_path,
+                    &settings,
+                    &history,
+                    &mut observed_settings_stamp,
+                    &mut snapshot,
+                );
+                last_settings_check = Instant::now();
+            }
+
+            if changed || last_health_write.elapsed() >= HEALTH_WRITE_INTERVAL {
+                snapshot.updated_at = Utc::now();
+                snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+                write_health_best_effort(&health_path, &snapshot, &history);
+                last_health_write = Instant::now();
+            }
+            if runtime_error.is_some() {
+                break;
+            }
+        }
+
+        snapshot.lifecycle = ServiceLifecycle::StopPending;
+        snapshot.updated_at = Utc::now();
+        snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+        write_health_best_effort(&health_path, &snapshot, &history);
+        let stop_status_error = report_state(BodyState::StopPending).err();
+
+        rpc_server.stop();
+        if let Some(client) = update_client.take() {
+            client.stop();
+        }
+        protection.stop();
+
+        snapshot.lifecycle = ServiceLifecycle::Stopped;
+        snapshot.connection = ServiceConnection::Stopped;
+        snapshot.connection_detail = None;
+        snapshot.updated_at = Utc::now();
+        snapshot.counters = counter_snapshot(&counters, &mut snapshot.last_error);
+        write_health_best_effort(&health_path, &snapshot, &history);
+        if let Some(error) = runtime_error {
+            Err(error)
+        } else if let Some(error) = stop_status_error {
+            Err(error)
+        } else {
+            report_state(BodyState::Stopped)
+        }
+    }
+
+    fn start_definition_updater(
+        settings: &Arc<RwLock<Settings>>,
+        snapshot: &mut ServiceHealthSnapshot,
+        history: &EventHistory,
+    ) -> (
+        Option<UpdateClientHandle>,
+        Option<mpsc::Receiver<UpdateEvent>>,
+    ) {
+        let Some(manifest_url) = UPDATE_MANIFEST_URL else {
+            return (None, None);
+        };
+        let key = match configured_trusted_public_key() {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                snapshot.definitions = ServiceDefinitionHealth::Failed {
+                    detail: "the build has an update URL but no trusted definition key".to_owned(),
+                };
+                return (None, None);
+            }
+            Err(error) => {
+                snapshot.definitions = ServiceDefinitionHealth::Failed {
+                    detail: error.clone(),
+                };
+                append_error(history, &error);
+                return (None, None);
+            }
+        };
+        let store = match DefinitionStore::program_data() {
+            Ok(store) => store,
+            Err(error) => {
+                let detail = format!("definition update store could not be opened: {error}");
+                snapshot.definitions = ServiceDefinitionHealth::Failed {
+                    detail: detail.clone(),
+                };
+                append_error(history, &detail);
+                return (None, None);
+            }
+        };
+
+        let interval_hours = settings
+            .read()
+            .map(|value| value.definition_update_interval_hours.clamp(1, 24))
+            .unwrap_or(4);
+        let interval = Duration::from_secs(interval_hours * 60 * 60);
+        let mut config = UpdateClientConfig::new(manifest_url);
+        config.scheduler = UpdateScheduler {
+            interval,
+            maximum_jitter: Duration::from_secs(15 * 60).min(interval / 4),
+        };
+        if let Some(origins) = UPDATE_ALLOWED_ORIGINS {
+            config.allowed_payload_origins = origins
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+
+        match start_update_client(config, store, key) {
+            Ok((client, receiver)) => (Some(client), Some(receiver)),
+            Err(error) => {
+                let detail = format!("definition updater could not start: {error}");
+                snapshot.definitions = ServiceDefinitionHealth::Failed {
+                    detail: detail.clone(),
+                };
+                append_error(history, &detail);
+                (None, None)
+            }
+        }
+    }
+
+    fn apply_update_event(
+        snapshot: &mut ServiceHealthSnapshot,
+        stable_definitions: &mut ServiceDefinitionHealth,
+        event: UpdateEvent,
+        engine: &SharedDetectionEngine,
+        history: &EventHistory,
+    ) -> bool {
+        match event {
+            UpdateEvent::CheckStarted { .. } => {
+                snapshot.definitions = ServiceDefinitionHealth::Updating {
+                    current_version: definition_version(stable_definitions),
+                };
+            }
+            UpdateEvent::Installed { .. } => match load_detection_engine(snapshot, history) {
+                Ok(updated) => {
+                    replace_detection_engine(engine, updated);
+                    *stable_definitions = snapshot.definitions.clone();
+                }
+                Err(error) => {
+                    snapshot.definitions = ServiceDefinitionHealth::Failed {
+                        detail: error.clone(),
+                    };
+                    append_error(history, &error);
+                }
+            },
+            UpdateEvent::Current { .. } => {
+                snapshot.definitions = stable_definitions.clone();
+            }
+            UpdateEvent::Failed { message, .. } => {
+                snapshot.definitions = ServiceDefinitionHealth::Failed {
+                    detail: message.clone(),
+                };
+                append_error(history, &message);
+            }
+            UpdateEvent::Scheduled { .. } | UpdateEvent::Stopped => {}
+        }
+        true
+    }
+
+    fn definition_version(definitions: &ServiceDefinitionHealth) -> Option<String> {
+        match definitions {
+            ServiceDefinitionHealth::BuiltIn { version }
+            | ServiceDefinitionHealth::Current { version, .. }
+            | ServiceDefinitionHealth::LastKnownGood { version, .. } => Some(version.clone()),
+            ServiceDefinitionHealth::Updating { current_version } => current_version.clone(),
+            ServiceDefinitionHealth::Failed { .. } => None,
+        }
+    }
+
+    fn load_detection_engine(
+        snapshot: &mut ServiceHealthSnapshot,
+        history: &EventHistory,
+    ) -> Result<DetectionEngine, String> {
+        let trusted_key = match configured_trusted_public_key() {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                snapshot.definitions = ServiceDefinitionHealth::BuiltIn {
+                    version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
+                };
+                return DetectionEngine::builtin();
+            }
+            Err(error) => {
+                snapshot.definitions = ServiceDefinitionHealth::Failed {
+                    detail: error.clone(),
+                };
+                return Err(error);
+            }
+        };
+
+        let store = DefinitionStore::program_data()
+            .map_err(|error| format!("definition store could not be opened: {error}"))?;
+        let outcome = store
+            .load_with_defaults(Utc::now(), &trusted_key)
+            .map_err(|error| format!("definitions could not be loaded: {error}"))?;
+        for issue in &outcome.issues {
+            append_error(
+                history,
+                &format!(
+                    "Definition {:?} {:?}: {}",
+                    issue.candidate, issue.stage, issue.message
+                ),
+            );
+        }
+        snapshot.definitions = match outcome.source {
+            DefinitionSource::BuiltIn => ServiceDefinitionHealth::BuiltIn {
+                version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
+            },
+            DefinitionSource::Current {
+                version,
+                bundle_id,
+                expires_at,
+                ..
+            } => ServiceDefinitionHealth::Current {
+                version,
+                bundle_id,
+                expires_at,
+            },
+            DefinitionSource::LastKnownGood {
+                version,
+                bundle_id,
+                expires_at,
+                ..
+            } => ServiceDefinitionHealth::LastKnownGood {
+                version,
+                bundle_id,
+                expires_at,
+            },
+        };
+        Ok(outcome.engine)
+    }
+
+    fn apply_realtime_event(snapshot: &mut ServiceHealthSnapshot, event: RealtimeEvent) -> bool {
+        match event {
+            RealtimeEvent::Connection(connection) => {
+                let (state, detail) = match connection {
+                    ProtectionConnection::Connecting => (ServiceConnection::Connecting, None),
+                    ProtectionConnection::Connected => (ServiceConnection::Connected, None),
+                    ProtectionConnection::Disconnected(error) => {
+                        (ServiceConnection::Disconnected, Some(error))
+                    }
+                    ProtectionConnection::Stopped => (ServiceConnection::Stopped, None),
+                };
+                snapshot.connection = state;
+                snapshot.connection_detail = detail.clone();
+                if state == ServiceConnection::Disconnected {
+                    snapshot.last_error = detail;
+                }
+                true
+            }
+            RealtimeEvent::Decision(decision) => {
+                match decision.report.verdict {
+                    DetectionVerdict::Malicious | DetectionVerdict::Suspicious => {
+                        snapshot.last_detection_at = Some(Utc::now());
+                    }
+                    DetectionVerdict::Error => {
+                        snapshot.last_error = decision.report.error.clone();
+                    }
+                    DetectionVerdict::Clean => {}
+                }
+                if let Some(error) = decision.action_error {
+                    snapshot.last_error = Some(error);
+                }
+                true
+            }
+            RealtimeEvent::QueueSaturated { path, .. } => {
+                snapshot.last_error = Some(format!(
+                    "real-time scan queue saturated while opening {}",
+                    path.display()
+                ));
+                true
+            }
+        }
+    }
+
+    fn counter_snapshot(
+        counters: &Arc<Mutex<RealtimeCounters>>,
+        last_error: &mut Option<String>,
+    ) -> ServiceCounters {
+        match counters.lock() {
+            Ok(value) => ServiceCounters {
+                scanned: value.scanned,
+                suspicious: value.suspicious,
+                detected: value.detected,
+                blocked_replies: value.blocked_replies,
+                quarantined: value.quarantined,
+                scan_errors: value.scan_errors,
+                bypassed_due_to_load: value.bypassed_due_to_load,
+            },
+            Err(_) => {
+                *last_error = Some("real-time counter lock was poisoned".to_owned());
+                ServiceCounters::default()
+            }
+        }
+    }
+
+    fn settings_stamp(path: &Path) -> Option<SettingsStamp> {
+        fs::metadata(path).ok().map(|metadata| SettingsStamp {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn reload_settings_if_changed(
+        path: &Path,
+        settings: &Arc<RwLock<Settings>>,
+        history: &EventHistory,
+        observed_stamp: &mut Option<SettingsStamp>,
+        snapshot: &mut ServiceHealthSnapshot,
+    ) -> bool {
+        let current_stamp = settings_stamp(path);
+        if current_stamp == *observed_stamp {
+            return false;
+        }
+        *observed_stamp = current_stamp;
+
+        match Settings::load(path) {
+            Ok(updated) => {
+                snapshot.real_time_enabled = updated.real_time_protection;
+                match settings.write() {
+                    Ok(mut active) => {
+                        *active = updated;
+                        true
+                    }
+                    Err(_) => {
+                        snapshot.last_error = Some("settings lock was poisoned".to_owned());
+                        true
+                    }
+                }
+            }
+            Err(error) => {
+                let message =
+                    format!("Settings reload failed; previous settings remain active: {error}");
+                snapshot.last_error = Some(message.clone());
+                append_error(history, &message);
+                true
+            }
+        }
+    }
+
+    fn write_health_best_effort(
+        path: &Path,
+        snapshot: &ServiceHealthSnapshot,
+        history: &EventHistory,
+    ) {
+        match write_service_health_atomic(path, snapshot) {
+            Ok(()) => {
+                HEALTH_WRITE_ERROR_REPORTED.store(false, Ordering::Release);
+            }
+            Err(error) => {
+                if !HEALTH_WRITE_ERROR_REPORTED.swap(true, Ordering::AcqRel) {
+                    append_error(
+                        history,
+                        &format!("Could not publish the service health snapshot: {error}"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn append_error(history: &EventHistory, message: &str) {
+        let mut event = SecurityEvent::new(EventKind::Error, message);
+        event.details = Some(message.to_owned());
+        let _ = history.append(&event);
+    }
+
+    fn append_service_error(message: String) {
+        let history = EventHistory::default_for_machine();
+        append_error(&history, &message);
+    }
+}
+
+#[cfg(windows)]
+#[allow(unused_imports)]
+pub use windows_service_host::{run_service_body, run_service_console, run_service_dispatcher};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_snapshot(now: DateTime<Utc>, lifecycle: ServiceLifecycle) -> ServiceHealthSnapshot {
+        let mut snapshot = ServiceHealthSnapshot::starting(now, true);
+        snapshot.lifecycle = lifecycle;
+        snapshot
+    }
+
+    #[test]
+    fn health_path_is_stable_and_machine_scoped() {
+        let path = service_health_path_from_program_data(Path::new(r"D:\MachineData"));
+        assert_eq!(
+            path,
+            PathBuf::from(r"D:\MachineData\Blackshard\service-health.json")
+        );
+    }
+
+    #[test]
+    fn health_snapshot_is_atomically_replaced_and_readable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary
+            .path()
+            .join("state")
+            .join(SERVICE_HEALTH_FILE_NAME);
+        let now = Utc::now();
+
+        let first = test_snapshot(now, ServiceLifecycle::StartPending);
+        write_service_health_atomic(&path, &first).unwrap();
+        assert_eq!(read_service_health(&path).unwrap(), first);
+
+        let mut second = test_snapshot(now, ServiceLifecycle::Running);
+        second.connection = ServiceConnection::Connected;
+        second.counters.scanned = 42;
+        write_service_health_atomic(&path, &second).unwrap();
+        assert_eq!(read_service_health(&path).unwrap(), second);
+
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+}

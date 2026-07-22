@@ -1,0 +1,10 @@
+BuiltPdbOutput	C:\Users\Carlos\Documents\GitHub\blackshard\installer\package\obj\Debug\Blackshard.wixpdb
+BuiltTargetOutput	C:\Users\Carlos\Documents\GitHub\blackshard\installer\package\obj\Debug\Blackshard.msi
+Input	C:\Users\Carlos\.nuget\packages\wixtoolset.util.wixext\7.0.0\wixext7\WixToolset.Util.wixext.dll
+Input	C:\Users\Carlos\AppData\Local\Temp\blackshard-wix-cli-validate\stage\blackshard.exe
+Input	C:\Users\Carlos\AppData\Local\Temp\blackshard-wix-cli-validate\stage\DriverPackage\blackshard.cat
+Input	C:\Users\Carlos\AppData\Local\Temp\blackshard-wix-cli-validate\stage\DriverPackage\blackshard.inf
+Input	C:\Users\Carlos\AppData\Local\Temp\blackshard-wix-cli-validate\stage\DriverPackage\blackshard.sys
+Input	C:\Users\Carlos\AppData\Local\Temp\blackshard-wix-cli-validate\stage\LICENSE.txt
+Intermediate	C:\Users\Carlos\Documents\GitHub\blackshard\installer\package\obj\Debug\#cab1.cab
+Intermediate	C:\Users\Carlos\Documents\GitHub\blackshard\installer\package\obj\Debug\WixToolset.Util.wixext_Dgw4i3WU42a5wCI60AeMyvjR7ow\wix-ir\utilca.dll-1

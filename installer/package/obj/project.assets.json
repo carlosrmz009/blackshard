@@ -1,0 +1,132 @@
+{
+  "version": 3,
+  "targets": {
+    "native,Version=v0.0": {
+      "WixToolset.Util.wixext/7.0.0": {
+        "type": "package",
+        "build": {
+          "build/WixToolset.Util.wixext.targets": {}
+        }
+      }
+    },
+    "native,Version=v0.0/win": {
+      "WixToolset.Util.wixext/7.0.0": {
+        "type": "package",
+        "build": {
+          "build/WixToolset.Util.wixext.targets": {}
+        }
+      }
+    },
+    "native,Version=v0.0/win-arm64": {
+      "WixToolset.Util.wixext/7.0.0": {
+        "type": "package",
+        "build": {
+          "build/WixToolset.Util.wixext.targets": {}
+        }
+      }
+    },
+    "native,Version=v0.0/win-x64": {
+      "WixToolset.Util.wixext/7.0.0": {
+        "type": "package",
+        "build": {
+          "build/WixToolset.Util.wixext.targets": {}
+        }
+      }
+    },
+    "native,Version=v0.0/win-x86": {
+      "WixToolset.Util.wixext/7.0.0": {
+        "type": "package",
+        "build": {
+          "build/WixToolset.Util.wixext.targets": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "WixToolset.Util.wixext/7.0.0": {
+      "sha512": "Ecz/118E0DcVKl/PFe1T6jJieY7RYAGZYfCBwcWodA6taqKx/LgFOev8o1mnNAfP7+NcdpCQNrcoww+EAtzPWQ==",
+      "type": "package",
+      "path": "wixtoolset.util.wixext/7.0.0",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "OSMFEULA.txt",
+        "README.md",
+        "build/CheckLicenseAcceptance.targets",
+        "build/WixToolset.Util.wixext.targets",
+        "icon.png",
+        "wixext7/WixToolset.Util.wixext.dll",
+        "wixtoolset.util.wixext.7.0.0.nupkg.sha512",
+        "wixtoolset.util.wixext.nuspec"
+      ]
+    }
+  },
+  "projectFileDependencyGroups": {
+    "native,Version=v0.0": [
+      "WixToolset.Util.wixext >= 7.0.0"
+    ]
+  },
+  "packageFolders": {
+    "C:\\Users\\Carlos\\.nuget\\packages\\": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "C:\\Users\\Carlos\\Documents\\GitHub\\blackshard\\installer\\package\\Blackshard.Package.wixproj",
+      "projectName": "Blackshard",
+      "projectPath": "C:\\Users\\Carlos\\Documents\\GitHub\\blackshard\\installer\\package\\Blackshard.Package.wixproj",
+      "packagesPath": "C:\\Users\\Carlos\\.nuget\\packages\\",
+      "outputPath": "C:\\Users\\Carlos\\Documents\\GitHub\\blackshard\\installer\\package\\obj\\",
+      "projectStyle": "PackageReference",
+      "UsingMicrosoftNETSdk": false,
+      "configFilePaths": [
+        "C:\\Users\\Carlos\\AppData\\Roaming\\NuGet\\NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "native"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "native": {
+          "targetAlias": "native",
+          "projectReferences": {}
+        }
+      },
+      "warningProperties": {
+        "allWarningsAsErrors": true
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      }
+    },
+    "frameworks": {
+      "native": {
+        "targetAlias": "native",
+        "dependencies": {
+          "WixToolset.Util.wixext": {
+            "target": "Package",
+            "version": "[7.0.0, )"
+          }
+        }
+      }
+    },
+    "runtimes": {
+      "win": {
+        "#import": []
+      },
+      "win-arm64": {
+        "#import": []
+      },
+      "win-x64": {
+        "#import": []
+      },
+      "win-x86": {
+        "#import": []
+      }
+    }
+  }
+}

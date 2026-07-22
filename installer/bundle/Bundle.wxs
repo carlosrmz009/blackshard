@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix
+    xmlns="http://wixtoolset.org/schemas/v4/wxs"
+    xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle
+      Name="Blackshard"
+      Manufacturer="Blackshard Project"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="{1E04EC71-3143-4295-986C-B9D7D1FAF585}"
+      AboutUrl="https://blackshard.dev/"
+      HelpUrl="https://blackshard.dev/"
+      Copyright="Copyright (c) Blackshard contributors">
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl="https://www.gnu.org/licenses/gpl-3.0.html"
+          ShowVersion="yes"
+          SuppressOptionsUI="yes"
+          LaunchTarget="[ProgramFiles64Folder]Blackshard\blackshard.exe"
+          LaunchWorkingFolder="[ProgramFiles64Folder]Blackshard" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage
+          Id="BlackshardMsi"
+          SourceFile="$(var.MsiPath)"
+          Compressed="yes"
+          Visible="no"
+          Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

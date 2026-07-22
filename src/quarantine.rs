@@ -1,0 +1,683 @@
+use crate::atomic_file;
+use crate::detection::opened_file_id;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
+use chrono::{DateTime, Utc};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+const CONTAINER_MAGIC: &[u8; 8] = b"BSQ\0\0\0\x01\0";
+const COPY_BUFFER_SIZE: usize = 256 * 1024;
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_QUARANTINE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IsolationState {
+    /// The source was removed after the neutralized container was committed.
+    Isolated,
+    /// A protected copy exists, but Windows would not remove the source.
+    /// Callers must not report this state as successfully quarantined.
+    SourceStillPresent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineRecord {
+    pub id: Uuid,
+    pub original_path: PathBuf,
+    pub quarantined_at: DateTime<Utc>,
+    pub sha256: String,
+    pub size: u64,
+    pub threat_name: String,
+    pub risk_score: u8,
+    pub state: IsolationState,
+    key: [u8; 32],
+    nonce: [u8; 12],
+}
+
+#[derive(Debug, Clone)]
+pub struct QuarantineStore {
+    root: PathBuf,
+}
+
+impl QuarantineStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn default_for_machine() -> Self {
+        let base = std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        Self::new(base.join("Blackshard").join("Quarantine"))
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Copies a file into a neutralized stream-cipher container and only then
+    /// removes the source. The container cannot be executed as its original
+    /// file type, and the SHA-256 is checked again before any restore.
+    #[cfg(test)]
+    pub fn quarantine(
+        &self,
+        source: &Path,
+        threat_name: impl Into<String>,
+        risk_score: u8,
+    ) -> io::Result<QuarantineRecord> {
+        let bytes = fs::read(source)?;
+        let expected_size = bytes.len() as u64;
+        let expected_sha256 = hex::encode(Sha256::digest(&bytes));
+        self.quarantine_inner(
+            source,
+            threat_name.into(),
+            risk_score,
+            &expected_sha256,
+            expected_size,
+            None,
+        )
+    }
+
+    /// Quarantines only if the file still has the hash that was analyzed.
+    /// This closes the path-replacement race between a scan verdict and the
+    /// enforcement action. Hash-less/truncated reports should not call this.
+    pub fn quarantine_verified(
+        &self,
+        source: &Path,
+        threat_name: impl Into<String>,
+        risk_score: u8,
+        expected_sha256: &str,
+        expected_size: u64,
+        expected_file_id: Option<u64>,
+    ) -> io::Result<QuarantineRecord> {
+        self.quarantine_inner(
+            source,
+            threat_name.into(),
+            risk_score,
+            expected_sha256,
+            expected_size,
+            expected_file_id,
+        )
+    }
+
+    fn quarantine_inner(
+        &self,
+        source: &Path,
+        threat_name: String,
+        risk_score: u8,
+        expected_sha256: &str,
+        expected_size: u64,
+        expected_file_id: Option<u64>,
+    ) -> io::Result<QuarantineRecord> {
+        self.ensure_root()?;
+
+        if expected_size > MAX_QUARANTINE_SOURCE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the candidate exceeds Blackshard's hard quarantine size limit",
+            ));
+        }
+        if expected_sha256.len() != 64
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the expected SHA-256 digest is invalid",
+            ));
+        }
+
+        let source_metadata = fs::symlink_metadata(source)?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "quarantine only accepts regular files and never follows symlinks",
+            ));
+        }
+
+        let original_path = fs::canonicalize(source)?;
+        let canonical_root = fs::canonicalize(&self.root)?;
+        if original_path.starts_with(&canonical_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a quarantine container cannot be quarantined again",
+            ));
+        }
+
+        let id = Uuid::new_v4();
+        let payload_path = self.payload_path(id);
+        let temporary_payload = self.root.join(format!(".{id}.payload.tmp"));
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut key);
+        OsRng.fill_bytes(&mut nonce);
+
+        let copy_result = (|| -> io::Result<(String, u64, File)> {
+            let input = open_source_for_quarantine(&original_path)?;
+            let opened_metadata = input.metadata()?;
+            if opened_metadata.file_type().is_symlink() || !opened_metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the source changed into a non-regular file before quarantine",
+                ));
+            }
+            if opened_metadata.len() != expected_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the file size changed after it was scanned; quarantine was aborted",
+                ));
+            }
+            if let Some(expected_file_id) = expected_file_id {
+                let actual_file_id = opened_file_id(&input)?;
+                if actual_file_id != expected_file_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the file identity changed after it was scanned; quarantine was aborted",
+                    ));
+                }
+            }
+            let output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary_payload)?;
+            let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, input);
+            let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, output);
+            writer.write_all(CONTAINER_MAGIC)?;
+
+            let mut cipher = ChaCha20::new((&key).into(), (&nonce).into());
+            let mut hasher = Sha256::new();
+            let mut size = 0u64;
+            let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+
+            loop {
+                if size > expected_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the file grew while it was being quarantined",
+                    ));
+                }
+                let remaining = expected_size.saturating_sub(size).saturating_add(1);
+                let read_limit = remaining.min(buffer.len() as u64) as usize;
+                let read = reader.read(&mut buffer[..read_limit])?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                size = size.saturating_add(read as u64);
+                cipher.apply_keystream(&mut buffer[..read]);
+                writer.write_all(&buffer[..read])?;
+            }
+
+            if size != expected_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the file size changed while it was being quarantined",
+                ));
+            }
+
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok((hex::encode(hasher.finalize()), size, reader.into_inner()))
+        })();
+
+        let (sha256, size, opened_source) = match copy_result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_payload);
+                return Err(error);
+            }
+        };
+
+        if !sha256.eq_ignore_ascii_case(expected_sha256) {
+            let _ = fs::remove_file(&temporary_payload);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the file changed after it was scanned; quarantine was aborted",
+            ));
+        }
+
+        if let Err(error) = rename_no_replace(&temporary_payload, &payload_path) {
+            let _ = fs::remove_file(&temporary_payload);
+            return Err(error);
+        }
+
+        let mut record = QuarantineRecord {
+            id,
+            original_path,
+            quarantined_at: Utc::now(),
+            sha256,
+            size,
+            threat_name,
+            risk_score,
+            state: IsolationState::SourceStillPresent,
+            key,
+            nonce,
+        };
+
+        if let Err(error) = self.write_record(&record) {
+            let _ = fs::remove_file(&payload_path);
+            return Err(error);
+        }
+
+        let delete_result = delete_open_file(&opened_source, &record.original_path);
+        drop(opened_source);
+        if delete_result.is_ok() && !record.original_path.exists() {
+            record.state = IsolationState::Isolated;
+            self.write_record(&record)?;
+        }
+
+        Ok(record)
+    }
+
+    pub fn list(&self) -> io::Result<Vec<QuarantineRecord>> {
+        self.ensure_root()?;
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+
+            match read_record_file(&path) {
+                Ok(mut record)
+                    if path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                        == Some(record.id) =>
+                {
+                    self.reconcile_state(&mut record);
+                    records.push(record)
+                }
+                Err(error) => {
+                    eprintln!("Blackshard ignored corrupt quarantine metadata {path:?}: {error}");
+                }
+                Ok(_) => {
+                    eprintln!("Blackshard ignored mismatched quarantine metadata {path:?}");
+                }
+            }
+        }
+        records.sort_by(|left, right| right.quarantined_at.cmp(&left.quarantined_at));
+        Ok(records)
+    }
+
+    pub fn load(&self, id: Uuid) -> io::Result<QuarantineRecord> {
+        let mut record = read_record_file(&self.metadata_path(id))?;
+        if record.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "quarantine metadata identifier does not match its file name",
+            ));
+        }
+        self.reconcile_state(&mut record);
+        Ok(record)
+    }
+
+    /// Restores to `destination`, or to the recorded path when it is `None`.
+    /// Existing files are never overwritten. The quarantine record is retained
+    /// unless `remove_after_restore` is explicitly requested.
+    pub fn restore(
+        &self,
+        id: Uuid,
+        destination: Option<&Path>,
+        remove_after_restore: bool,
+    ) -> io::Result<PathBuf> {
+        let record = self.load(id)?;
+        let destination = destination
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| record.original_path.clone());
+
+        if destination.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("restore target already exists: {}", destination.display()),
+            ));
+        }
+
+        let parent = destination.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "restore target has no parent")
+        })?;
+        fs::create_dir_all(parent)?;
+
+        let temporary_name = destination
+            .file_name()
+            .map(OsString::from)
+            .unwrap_or_else(|| OsString::from("restored"));
+        let mut temporary_name_with_suffix = temporary_name;
+        temporary_name_with_suffix.push(format!(".blackshard-{id}.tmp"));
+        let temporary_path = parent.join(temporary_name_with_suffix);
+
+        let restore_result = (|| -> io::Result<String> {
+            let input = File::open(self.payload_path(id))?;
+            let output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary_path)?;
+            let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, input);
+            let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, output);
+
+            let mut magic = [0u8; CONTAINER_MAGIC.len()];
+            reader.read_exact(&mut magic)?;
+            if &magic != CONTAINER_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Blackshard quarantine container",
+                ));
+            }
+
+            let mut cipher = ChaCha20::new((&record.key).into(), (&record.nonce).into());
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+            let mut restored_size = 0u64;
+            loop {
+                if restored_size > record.size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "quarantine container exceeds its recorded size",
+                    ));
+                }
+                let remaining = record.size.saturating_sub(restored_size).saturating_add(1);
+                let read_limit = remaining.min(buffer.len() as u64) as usize;
+                let read = reader.read(&mut buffer[..read_limit])?;
+                if read == 0 {
+                    break;
+                }
+                cipher.apply_keystream(&mut buffer[..read]);
+                hasher.update(&buffer[..read]);
+                writer.write_all(&buffer[..read])?;
+                restored_size = restored_size.saturating_add(read as u64);
+            }
+            if restored_size != record.size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "quarantine container size does not match its metadata",
+                ));
+            }
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(hex::encode(hasher.finalize()))
+        })();
+
+        let restored_hash = match restore_result {
+            Ok(hash) => hash,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(error);
+            }
+        };
+
+        if !restored_hash.eq_ignore_ascii_case(&record.sha256) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "quarantine integrity check failed; nothing was restored",
+            ));
+        }
+
+        rename_no_replace(&temporary_path, &destination)?;
+        if remove_after_restore {
+            self.delete(id)?;
+        }
+        Ok(destination)
+    }
+
+    pub fn delete(&self, id: Uuid) -> io::Result<()> {
+        let payload = self.payload_path(id);
+        let metadata = self.metadata_path(id);
+        let mut first_error = None;
+
+        for path in [payload, metadata] {
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != io::ErrorKind::NotFound && first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn ensure_root(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.root)
+    }
+
+    fn payload_path(&self, id: Uuid) -> PathBuf {
+        self.root.join(format!("{id}.payload"))
+    }
+
+    fn metadata_path(&self, id: Uuid) -> PathBuf {
+        self.root.join(format!("{id}.json"))
+    }
+
+    fn write_record(&self, record: &QuarantineRecord) -> io::Result<()> {
+        let final_path = self.metadata_path(record.id);
+        let bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
+        atomic_file::write(&final_path, &bytes)
+    }
+
+    fn reconcile_state(&self, record: &mut QuarantineRecord) {
+        if record.state == IsolationState::SourceStillPresent && !record.original_path.exists() {
+            record.state = IsolationState::Isolated;
+            let _ = self.write_record(record);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::hard_link(source, destination)?;
+    fs::remove_file(source)
+}
+
+#[cfg(windows)]
+fn open_source_for_quarantine(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE_ACCESS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_source_for_quarantine(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn delete_open_file(file: &File, _original_path: &Path) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileDispositionInfo {
+        // FILE_DISPOSITION_INFO::DeleteFile is a Win32 BOOLEAN (one byte),
+        // not the four-byte BOOL used by most Win32 APIs.
+        delete_file: u8,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetFileInformationByHandle(
+            file: isize,
+            information_class: i32,
+            information: *const c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+    let disposition = FileDispositionInfo { delete_file: 1 };
+    let result = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as isize,
+            FILE_DISPOSITION_INFO_CLASS,
+            (&disposition as *const FileDispositionInfo).cast(),
+            std::mem::size_of::<FileDispositionInfo>() as u32,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn delete_open_file(_file: &File, original_path: &Path) -> io::Result<()> {
+    fs::remove_file(original_path)
+}
+
+fn read_record_file(path: &Path) -> io::Result<QuarantineRecord> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quarantine metadata is not a regular, non-symlink file",
+        ));
+    }
+    if metadata.len() > MAX_METADATA_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quarantine metadata exceeds its size limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)?
+        .take(MAX_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_METADATA_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quarantine metadata exceeds its size limit",
+        ));
+    }
+    decode_json(&bytes)
+}
+
+fn decode_json(bytes: &[u8]) -> io::Result<QuarantineRecord> {
+    serde_json::from_slice(bytes).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quarantine_round_trip_neutralizes_and_restores() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(temporary.path().join("vault"));
+        let source = temporary.path().join("sample.exe");
+        let original = b"MZ harmless unit-test payload".repeat(4096);
+        fs::write(&source, &original).unwrap();
+
+        let record = store
+            .quarantine(&source, "Unit.Test.Detection", 100)
+            .unwrap();
+        assert_eq!(record.state, IsolationState::Isolated);
+        assert!(!source.exists());
+
+        let payload = fs::read(store.payload_path(record.id)).unwrap();
+        assert!(payload.starts_with(CONTAINER_MAGIC));
+        assert_ne!(&payload[CONTAINER_MAGIC.len()..], original.as_slice());
+
+        let restored = store.restore(record.id, Some(&source), false).unwrap();
+        assert_eq!(restored, source);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn restore_never_overwrites_an_existing_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(temporary.path().join("vault"));
+        let source = temporary.path().join("sample.bin");
+        fs::write(&source, b"original").unwrap();
+        let record = store.quarantine(&source, "Unit.Test", 100).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+
+        let error = store.restore(record.id, None, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn corrupt_container_is_not_restored() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(temporary.path().join("vault"));
+        let source = temporary.path().join("sample.bin");
+        fs::write(&source, b"original").unwrap();
+        let record = store.quarantine(&source, "Unit.Test", 100).unwrap();
+        fs::write(store.payload_path(record.id), b"corrupt").unwrap();
+
+        assert!(store.restore(record.id, None, false).is_err());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn verified_quarantine_rejects_a_replaced_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(temporary.path().join("vault"));
+        let source = temporary.path().join("sample.bin");
+        fs::write(&source, b"replacement").unwrap();
+
+        let error = store
+            .quarantine_verified(&source, "Unit.Test", 100, &"00".repeat(32), 11, None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(source.exists());
+        assert!(store.list().unwrap().is_empty());
+    }
+}

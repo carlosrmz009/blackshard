@@ -1,467 +1,58 @@
-use chrono::Local;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod atomic_file;
+mod config;
+mod definitions;
+mod detection;
+mod driver_installer;
+mod engine;
+mod history;
+mod ipc;
+mod notification_agent;
+mod notifications;
+mod quarantine;
+mod realtime;
+mod rules;
+mod scan_manager;
+mod service;
+mod trust;
+mod ui;
+mod update_client;
+mod updater;
+
+use crate::ipc::IpcClient;
+use crate::service::{
+    default_service_health_path, read_service_health, ServiceConnection, ServiceDefinitionHealth,
+    ServiceHealthSnapshot, ServiceLifecycle, SERVICE_HEALTH_SCHEMA_VERSION,
+};
+use crate::ui::{
+    complete_protection_test, new_shared_ui_state, take_protection_test_request, BlackshardApp,
+    BuildTrustStatus, CertificationStatus, DefinitionStatus, DriverStatus, ProtectionStatus,
+    SharedUiState,
+};
+use chrono::Utc;
 use eframe::egui;
-use std::collections::VecDeque;
-use std::ffi::{c_void, OsStr};
+use std::error::Error;
+use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Read};
-use std::mem;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
+use std::time::Duration;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[link(name = "FltLib")]
-extern "system" {
-    fn FilterConnectCommunicationPort(
-        port_name: *const u16,
-        options: u32,
-        context: *const c_void,
-        context_size: u16,
-        security_attributes: *const c_void,
-        port: *mut HANDLE,
-    ) -> i32;
-
-    fn FilterGetMessage(
-        port: HANDLE,
-        message_buffer: *mut c_void,
-        message_buffer_size: u32,
-        overlapped: *mut c_void,
-    ) -> i32;
-
-    fn FilterReplyMessage(port: HANDLE, reply_buffer: *mut c_void, reply_buffer_size: u32) -> i32;
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct FilterMessageHeader {
-    reply_length: u32,
-    message_id: u64,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct FilterReplyHeader {
-    status: i32,
-    message_id: u64,
-}
-
-const MAX_FILE_PATH_LENGTH: usize = 260;
-const MAX_LOG_ENTRIES: usize = 1_000;
-const ENTROPY_THRESHOLD: f64 = 7.2;
+const SERVICE_ARGUMENT: &str = "--service";
+const SERVICE_CONSOLE_ARGUMENT: &str = "--service-console";
 const SELF_TEST_ARGUMENT: &str = "--blackshard-self-test-open";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const INSTALL_DRIVER_ARGUMENT: &str = "--install-driver";
+const UNINSTALL_DRIVER_ARGUMENT: &str = "--uninstall-driver";
+const NOTIFICATION_AGENT_ARGUMENT: &str = "--notification-agent";
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const HEALTH_STALE_AFTER_SECONDS: i64 = 10;
+const SELF_TEST_PAYLOAD: &[u8] =
+    b"BLACKSHARD-HARMLESS-SELF-TEST-V2\nThis file contains no executable code.\n";
 
-#[repr(C)]
-#[derive(Debug)]
-struct BlackshardNotification {
-    process_id: u32,
-    file_path: [u16; MAX_FILE_PATH_LENGTH],
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct BlackshardMessage {
-    header: FilterMessageHeader,
-    notification: BlackshardNotification,
-}
-
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlackshardVerdict {
-    Allow = 0,
-    Block = 1,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct BlackshardReplyMessage {
-    header: FilterReplyHeader,
-    verdict: BlackshardVerdict,
-}
-
-#[derive(Clone)]
-struct LogEntry {
-    timestamp: String,
-    pid: u32,
-    file_path: String,
-    entropy: f64,
-    verdict: BlackshardVerdict,
-    scan_error: Option<String>,
-}
-
-#[derive(Clone)]
-enum ConnectionState {
-    Connecting,
-    Connected,
-    Disconnected(String),
-}
-
-#[derive(Clone)]
-enum SelfTestState {
-    Idle,
-    Running,
-    Passed,
-    Failed(String),
-}
-
-struct SharedState {
-    connection: ConnectionState,
-    self_test: SelfTestState,
-    logs: VecDeque<LogEntry>,
-    scanned: u64,
-    blocked: u64,
-}
-
-impl Default for SharedState {
-    fn default() -> Self {
-        Self {
-            connection: ConnectionState::Connecting,
-            self_test: SelfTestState::Idle,
-            logs: VecDeque::new(),
-            scanned: 0,
-            blocked: 0,
-        }
-    }
-}
-
-struct BlackshardApp {
-    state: Arc<Mutex<SharedState>>,
-}
-
-impl eframe::App for BlackshardApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(egui::Visuals::dark());
-
-        let (connection, self_test, scanned, blocked, logs) = {
-            let state = self.state.lock().unwrap();
-            (
-                state.connection.clone(),
-                state.self_test.clone(),
-                state.scanned,
-                state.blocked,
-                state.logs.iter().cloned().collect::<Vec<_>>(),
-            )
-        };
-
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            let (status_text, status_color, detail) = match &connection {
-                ConnectionState::Connecting => (
-                    "BLACKSHARD // CONNECTING",
-                    egui::Color32::YELLOW,
-                    "Waiting for the kernel minifilter".to_owned(),
-                ),
-                ConnectionState::Connected => (
-                    "BLACKSHARD // FILTER CONNECTED",
-                    egui::Color32::GREEN,
-                    "Kernel enforcement and user-mode analysis are connected".to_owned(),
-                ),
-                ConnectionState::Disconnected(error) => (
-                    "BLACKSHARD // FILTER DISCONNECTED",
-                    egui::Color32::RED,
-                    error.clone(),
-                ),
-            };
-
-            ui.heading(egui::RichText::new(status_text).color(status_color));
-            ui.label(detail);
-            ui.horizontal(|ui| {
-                ui.label(format!("Scanned: {scanned}"));
-                ui.separator();
-                ui.label(format!("Blocked: {blocked}"));
-                ui.separator();
-                ui.label(format!("Entropy threshold: {ENTROPY_THRESHOLD:.1}"));
-            });
-
-            ui.horizontal(|ui| {
-                let can_test = matches!(connection, ConnectionState::Connected)
-                    && !matches!(self_test, SelfTestState::Running);
-
-                if ui
-                    .add_enabled(can_test, egui::Button::new("Run harmless self-test"))
-                    .clicked()
-                {
-                    {
-                        let mut state = self.state.lock().unwrap();
-                        state.self_test = SelfTestState::Running;
-                    }
-                    let state = Arc::clone(&self.state);
-                    thread::spawn(move || run_self_test(state));
-                }
-
-                match &self_test {
-                    SelfTestState::Idle => {
-                        ui.label("Self-test has not run");
-                    }
-                    SelfTestState::Running => {
-                        ui.colored_label(egui::Color32::YELLOW, "Self-test running...");
-                    }
-                    SelfTestState::Passed => {
-                        ui.colored_label(
-                            egui::Color32::GREEN,
-                            "PASS: kernel denied the harmless test file",
-                        );
-                    }
-                    SelfTestState::Failed(error) => {
-                        ui.colored_label(egui::Color32::RED, format!("FAIL: {error}"));
-                    }
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if logs.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("No file decisions yet. Connect the filter or run the self-test.");
-                });
-                return;
-            }
-
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for log in &logs {
-                        let color = if log.verdict == BlackshardVerdict::Block {
-                            egui::Color32::RED
-                        } else if log.scan_error.is_some() {
-                            egui::Color32::YELLOW
-                        } else {
-                            egui::Color32::WHITE
-                        };
-
-                        let mut text = format!(
-                            "[{}] PID: {:<6} | Entropy: {:.2} | Verdict: {:?} | File: {}",
-                            log.timestamp, log.pid, log.entropy, log.verdict, log.file_path
-                        );
-                        if let Some(error) = &log.scan_error {
-                            text.push_str(&format!(" | Scan error: {error}"));
-                        }
-
-                        ui.colored_label(color, text);
-                    }
-                });
-        });
-
-        ctx.request_repaint_after(Duration::from_millis(250));
-    }
-}
-
-fn calculate_entropy(file_path: &Path) -> io::Result<f64> {
-    let mut file = File::open(file_path)?;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    let bytes_read = file.read(&mut buffer)?;
-
-    Ok(shannon_entropy(&buffer[..bytes_read]))
-}
-
-fn shannon_entropy(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() {
-        return 0.0;
-    }
-
-    let mut frequency = [0usize; 256];
-    for &byte in bytes {
-        frequency[byte as usize] += 1;
-    }
-
-    let total_bytes = bytes.len() as f64;
-    frequency
-        .iter()
-        .filter(|&&count| count > 0)
-        .map(|&count| {
-            let probability = count as f64 / total_bytes;
-            -probability * probability.log2()
-        })
-        .sum()
-}
-
-fn device_path_to_openable_path(path: &str) -> PathBuf {
-    if path.starts_with("\\Device\\") {
-        PathBuf::from(format!("\\\\?\\GLOBALROOT{path}"))
-    } else {
-        PathBuf::from(path)
-    }
-}
-
-fn set_connection_state(state: &Arc<Mutex<SharedState>>, connection: ConnectionState) {
-    state.lock().unwrap().connection = connection;
-}
-
-fn hresult_text(hr: i32) -> String {
-    match hr as u32 {
-        0x8007_0002 => {
-            "Kernel communication port not found; load the minifilter, then retry".to_owned()
-        }
-        0x8007_0005 => {
-            "Access denied by the filter port; run Blackshard as Administrator".to_owned()
-        }
-        code => format!("Filter communication error 0x{code:08X}; retrying"),
-    }
-}
-
-fn run_telemetry_loop(state: Arc<Mutex<SharedState>>) {
-    let port_name: Vec<u16> = "\\BlackshardPort\0".encode_utf16().collect();
-
-    loop {
-        set_connection_state(&state, ConnectionState::Connecting);
-        let mut port_handle: HANDLE = 0;
-        let connect_hr = unsafe {
-            FilterConnectCommunicationPort(
-                port_name.as_ptr(),
-                0,
-                ptr::null(),
-                0,
-                ptr::null(),
-                &mut port_handle,
-            )
-        };
-
-        if connect_hr != S_OK {
-            set_connection_state(
-                &state,
-                ConnectionState::Disconnected(hresult_text(connect_hr)),
-            );
-            thread::sleep(Duration::from_secs(2));
-            continue;
-        }
-
-        set_connection_state(&state, ConnectionState::Connected);
-        let disconnect_reason = loop {
-            let mut message = unsafe { mem::zeroed::<BlackshardMessage>() };
-            let get_message_hr = unsafe {
-                FilterGetMessage(
-                    port_handle,
-                    &mut message as *mut _ as *mut c_void,
-                    mem::size_of::<BlackshardMessage>() as u32,
-                    ptr::null_mut(),
-                )
-            };
-
-            if get_message_hr != S_OK {
-                break hresult_text(get_message_hr);
-            }
-
-            let path_length = message
-                .notification
-                .file_path
-                .iter()
-                .position(|&character| character == 0)
-                .unwrap_or(MAX_FILE_PATH_LENGTH);
-            let path = String::from_utf16_lossy(&message.notification.file_path[..path_length]);
-            let openable_path = device_path_to_openable_path(&path);
-
-            let (entropy, scan_error) = match calculate_entropy(&openable_path) {
-                Ok(entropy) => (entropy, None),
-                Err(error) => (0.0, Some(error.to_string())),
-            };
-            let verdict = if scan_error.is_none() && entropy > ENTROPY_THRESHOLD {
-                BlackshardVerdict::Block
-            } else {
-                BlackshardVerdict::Allow
-            };
-
-            {
-                let mut shared = state.lock().unwrap();
-                shared.scanned += 1;
-                if verdict == BlackshardVerdict::Block {
-                    shared.blocked += 1;
-                }
-                if shared.logs.len() == MAX_LOG_ENTRIES {
-                    shared.logs.pop_front();
-                }
-                shared.logs.push_back(LogEntry {
-                    timestamp: Local::now().format("%H:%M:%S").to_string(),
-                    pid: message.notification.process_id,
-                    file_path: path,
-                    entropy,
-                    verdict,
-                    scan_error,
-                });
-            }
-
-            let mut reply = BlackshardReplyMessage {
-                header: FilterReplyHeader {
-                    status: 0,
-                    message_id: message.header.message_id,
-                },
-                verdict,
-            };
-
-            // A late reply can fail if the driver's bounded timeout elapsed. The
-            // communication port remains valid, so continue receiving messages.
-            let _ = unsafe {
-                FilterReplyMessage(
-                    port_handle,
-                    &mut reply as *mut _ as *mut c_void,
-                    mem::size_of::<BlackshardReplyMessage>() as u32,
-                )
-            };
-        };
-
-        unsafe { CloseHandle(port_handle) };
-        set_connection_state(&state, ConnectionState::Disconnected(disconnect_reason));
-        thread::sleep(Duration::from_secs(2));
-    }
-}
-
-fn fill_self_test_bytes(bytes: &mut [u8]) {
-    let mut value = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-        ^ u64::from(std::process::id());
-
-    for chunk in bytes.chunks_mut(8) {
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        let generated = value.to_le_bytes();
-        chunk.copy_from_slice(&generated[..chunk.len()]);
-    }
-}
-
-fn run_self_test(state: Arc<Mutex<SharedState>>) {
-    let result = run_self_test_inner();
-    let mut shared = state.lock().unwrap();
-    shared.self_test = match result {
-        Ok(()) => SelfTestState::Passed,
-        Err(error) => SelfTestState::Failed(error),
-    };
-}
-
-fn run_self_test_inner() -> Result<(), String> {
-    let test_path =
-        std::env::temp_dir().join(format!("blackshard-self-test-{}.bin", std::process::id()));
-    let mut test_bytes = vec![0u8; 256 * 1024];
-    fill_self_test_bytes(&mut test_bytes);
-    fs::write(&test_path, test_bytes)
-        .map_err(|error| format!("could not create test file: {error}"))?;
-
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("could not locate blackshard.exe: {error}"))?;
-    let status = Command::new(executable)
-        .arg(SELF_TEST_ARGUMENT)
-        .arg(&test_path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map_err(|error| format!("could not start test probe: {error}"));
-
-    let _ = fs::remove_file(&test_path);
-
-    match status {
-        Ok(status) if status.code() == Some(10) => Ok(()),
-        Ok(status) if status.success() => Err("test file was opened instead of blocked".to_owned()),
-        Ok(status) => Err(format!(
-            "test probe failed unexpectedly with exit code {:?}",
-            status.code()
-        )),
-        Err(error) => Err(error),
-    }
+fn requested_mode() -> Option<String> {
+    std::env::args().nth(1)
 }
 
 fn self_test_probe_exit_code() -> Option<i32> {
@@ -482,21 +73,291 @@ fn self_test_probe_exit_code() -> Option<i32> {
     })
 }
 
-fn main() -> Result<(), eframe::Error> {
-    if let Some(exit_code) = self_test_probe_exit_code() {
-        std::process::exit(exit_code);
+fn run_service_mode() -> Result<(), Box<dyn Error>> {
+    service::run_service_dispatcher()?;
+    Ok(())
+}
+
+fn run_service_console_mode() -> Result<(), Box<dyn Error>> {
+    use std::sync::atomic::AtomicBool;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    service::run_service_console(stop).map_err(Into::into)
+}
+
+fn driver_change_exit_code(install: bool) -> i32 {
+    let mut arguments = std::env::args_os();
+    arguments.next();
+    arguments.next();
+    let Some(inf_path) = arguments.next() else {
+        return 2;
+    };
+    if arguments.next().is_some() {
+        return 2;
     }
 
-    let state = Arc::new(Mutex::new(SharedState::default()));
-    let telemetry_state = Arc::clone(&state);
-    thread::spawn(move || run_telemetry_loop(telemetry_state));
+    let result = if install {
+        driver_installer::install_driver(std::path::Path::new(&inf_path))
+    } else {
+        driver_installer::uninstall_driver(std::path::Path::new(&inf_path))
+    };
+    match result {
+        Ok(driver_installer::DriverChange::Complete) => 0,
+        Ok(driver_installer::DriverChange::RebootRequired) => {
+            driver_installer::REBOOT_REQUIRED_EXIT_CODE
+        }
+        Err(_error) => 1,
+    }
+}
+
+fn apply_service_health(runtime: &SharedUiState, health: ServiceHealthSnapshot) {
+    let mut state = match runtime.lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+
+    if health.schema_version != SERVICE_HEALTH_SCHEMA_VERSION {
+        let detail = format!(
+            "unsupported service health schema {}",
+            health.schema_version
+        );
+        state.driver = DriverStatus::Error(detail.clone());
+        state.protection = ProtectionStatus::Unavailable(detail.clone());
+        state.attention = Some(detail);
+        return;
+    }
+
+    let age = Utc::now().signed_duration_since(health.updated_at);
+    if age.num_seconds() > HEALTH_STALE_AFTER_SECONDS || age.num_seconds() < -30 {
+        let detail = format!(
+            "the protection service health timestamp is outside the trusted window ({})",
+            age.num_seconds(),
+        );
+        state.driver = DriverStatus::Error(detail.clone());
+        state.protection = ProtectionStatus::Unavailable(detail.clone());
+        state.attention = Some(detail);
+        return;
+    }
+
+    state.engine_version = health.product_version;
+    state.realtime_scanned_files = health.counters.scanned;
+    state.realtime_blocked_files = health.counters.blocked_replies;
+    state.definitions = match health.definitions {
+        ServiceDefinitionHealth::BuiltIn { version } => DefinitionStatus::BuiltInOnly { version },
+        ServiceDefinitionHealth::Updating { current_version } => {
+            DefinitionStatus::Updating { current_version }
+        }
+        ServiceDefinitionHealth::Current {
+            version,
+            expires_at,
+            ..
+        }
+        | ServiceDefinitionHealth::LastKnownGood {
+            version,
+            expires_at,
+            ..
+        } if expires_at > Utc::now() => DefinitionStatus::Current {
+            version,
+            expires_at,
+        },
+        ServiceDefinitionHealth::Current {
+            version,
+            expires_at,
+            ..
+        }
+        | ServiceDefinitionHealth::LastKnownGood {
+            version,
+            expires_at,
+            ..
+        } => DefinitionStatus::Stale {
+            version,
+            expired_at: expires_at,
+        },
+        ServiceDefinitionHealth::Failed { detail } => DefinitionStatus::Failed(detail),
+    };
+    state.driver = match &health.connection {
+        ServiceConnection::Connecting => DriverStatus::Checking,
+        ServiceConnection::Connected => DriverStatus::Connected,
+        ServiceConnection::Disconnected => DriverStatus::Disconnected(
+            health
+                .connection_detail
+                .clone()
+                .unwrap_or_else(|| "the minifilter channel is disconnected".to_owned()),
+        ),
+        ServiceConnection::Stopped => {
+            DriverStatus::Disconnected("the protection service is stopped".to_owned())
+        }
+    };
+
+    state.protection = match health.lifecycle {
+        ServiceLifecycle::StartPending => ProtectionStatus::Starting,
+        ServiceLifecycle::StopPending | ServiceLifecycle::Stopped => {
+            ProtectionStatus::Unavailable("the protection service is stopped".to_owned())
+        }
+        ServiceLifecycle::Running if !health.real_time_enabled => ProtectionStatus::Paused,
+        ServiceLifecycle::Running if health.connection == ServiceConnection::Connected => {
+            ProtectionStatus::Active
+        }
+        ServiceLifecycle::Running => ProtectionStatus::Degraded(
+            health
+                .connection_detail
+                .clone()
+                .or(health.last_error.clone())
+                .unwrap_or_else(|| "the kernel minifilter is not connected".to_owned()),
+        ),
+    };
+
+    state.attention = match &state.protection {
+        ProtectionStatus::Active | ProtectionStatus::Paused | ProtectionStatus::Starting => None,
+        ProtectionStatus::Degraded(detail) | ProtectionStatus::Unavailable(detail) => {
+            Some(detail.clone())
+        }
+    };
+}
+
+fn set_health_read_error(runtime: &SharedUiState, error: &io::Error) {
+    let mut state = match runtime.lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+
+    if error.kind() == io::ErrorKind::NotFound {
+        let detail = "the Blackshard protection service is not installed or has not started";
+        state.driver = DriverStatus::NotInstalled;
+        state.protection = ProtectionStatus::Unavailable(detail.to_owned());
+        state.attention = Some(detail.to_owned());
+    } else {
+        let detail = format!("could not read protection-service health: {error}");
+        state.driver = DriverStatus::Error(detail.clone());
+        state.protection = ProtectionStatus::Unavailable(detail.clone());
+        state.attention = Some(detail);
+    }
+}
+
+fn start_service_health_monitor(runtime: SharedUiState) {
+    thread::spawn(move || {
+        let path = default_service_health_path();
+        loop {
+            match read_service_health(&path) {
+                Ok(health) => apply_service_health(&runtime, health),
+                Err(error) => set_health_read_error(&runtime, &error),
+            }
+            if take_protection_test_request(&runtime) {
+                let test_runtime = Arc::clone(&runtime);
+                thread::spawn(move || {
+                    complete_protection_test(&test_runtime, run_harmless_protection_test());
+                });
+            }
+            process_update_request(&runtime);
+            thread::sleep(HEALTH_POLL_INTERVAL);
+        }
+    });
+}
+
+fn process_update_request(runtime: &SharedUiState) {
+    let requested = match runtime.lock() {
+        Ok(mut state) if state.update_check_requested => {
+            state.update_check_requested = false;
+            true
+        }
+        _ => false,
+    };
+    if !requested {
+        return;
+    }
+
+    match IpcClient.request_update() {
+        Ok(_) => {
+            if let Ok(mut state) = runtime.lock() {
+                let current_version = match &state.definitions {
+                    DefinitionStatus::BuiltInOnly { version }
+                    | DefinitionStatus::Current { version, .. }
+                    | DefinitionStatus::Stale { version, .. } => Some(version.clone()),
+                    DefinitionStatus::Updating { current_version } => current_version.clone(),
+                    DefinitionStatus::Failed(_) => None,
+                };
+                state.definitions = DefinitionStatus::Updating { current_version };
+            }
+        }
+        Err(error) => {
+            if let Ok(mut state) = runtime.lock() {
+                state.definitions = DefinitionStatus::Failed(format!(
+                    "could not ask the protection service to update: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn run_harmless_protection_test() -> Result<String, String> {
+    let path = std::env::temp_dir().join(format!(
+        "blackshard-harmless-test-{}.com",
+        std::process::id()
+    ));
+    fs::write(&path, SELF_TEST_PAYLOAD)
+        .map_err(|error| format!("could not create the harmless test file: {error}"))?;
+
+    let result = std::env::current_exe()
+        .map_err(|error| format!("could not locate the Blackshard executable: {error}"))
+        .and_then(|executable| {
+            realtime::launch_hidden_probe(&executable, SELF_TEST_ARGUMENT, &path)
+                .map_err(|error| format!("could not launch the isolated test probe: {error}"))
+        });
+    let _ = fs::remove_file(&path);
+
+    match result {
+        Ok(10) => Ok("The minifilter denied the inert test signature end to end.".to_owned()),
+        Ok(0) => Err(
+            "the inert test signature was opened; real-time enforcement did not block it"
+                .to_owned(),
+        ),
+        Ok(code) => Err(format!(
+            "the protection-test probe exited unexpectedly ({code})"
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn initialize_runtime(runtime: &SharedUiState) {
+    if let Ok(mut state) = runtime.lock() {
+        state.build_trust = BuildTrustStatus::Checking;
+        state.certification = CertificationStatus::NotEvaluated;
+        state.definitions = DefinitionStatus::BuiltInOnly {
+            version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
+        };
+    }
+
+    let trust_runtime = Arc::clone(runtime);
+    thread::spawn(move || {
+        let trust = match trust::verify_current_executable() {
+            trust::AuthenticodeStatus::Trusted { publisher } => {
+                BuildTrustStatus::AuthenticodeVerified { publisher }
+            }
+            trust::AuthenticodeStatus::Unsigned => BuildTrustStatus::UnsignedDevelopmentBuild,
+            trust::AuthenticodeStatus::Untrusted(error)
+            | trust::AuthenticodeStatus::Error(error) => {
+                BuildTrustStatus::VerificationFailed(error)
+            }
+        };
+        if let Ok(mut state) = trust_runtime.lock() {
+            state.build_trust = trust;
+        }
+    });
+}
+
+fn run_ui() -> Result<(), Box<dyn Error>> {
+    let runtime = new_shared_ui_state();
+    initialize_runtime(&runtime);
+    start_service_health_monitor(Arc::clone(&runtime));
 
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
     wgpu_options.supported_backends = eframe::wgpu::Backends::DX12;
     wgpu_options.power_preference = eframe::wgpu::PowerPreference::LowPower;
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1120.0, 720.0])
+            .with_min_inner_size([920.0, 600.0]),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         ..Default::default()
@@ -505,40 +366,106 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Blackshard",
         options,
-        Box::new(|_creation_context| Box::new(BlackshardApp { state })),
-    )
+        Box::new(move |_creation_context| Box::new(BlackshardApp::with_machine_defaults(runtime))),
+    )?;
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    if let Some(exit_code) = self_test_probe_exit_code() {
+        std::process::exit(exit_code);
+    }
+
+    match requested_mode().as_deref() {
+        Some(SERVICE_ARGUMENT) => run_service_mode(),
+        Some(SERVICE_CONSOLE_ARGUMENT) => run_service_console_mode(),
+        Some(INSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(true)),
+        Some(UNINSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(false)),
+        Some(NOTIFICATION_AGENT_ARGUMENT) => notification_agent::run().map_err(Into::into),
+        _ => run_ui(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
+    use std::path::Path;
 
     #[test]
-    fn uniform_bytes_have_zero_entropy() {
-        assert_eq!(shannon_entropy(&[0u8; 4096]), 0.0);
+    fn health_monitor_requires_a_fresh_connected_running_service() {
+        let now = Utc::now();
+        let runtime = new_shared_ui_state();
+        let health = ServiceHealthSnapshot {
+            schema_version: SERVICE_HEALTH_SCHEMA_VERSION,
+            product_version: "1.2.3".to_owned(),
+            process_id: 42,
+            lifecycle: ServiceLifecycle::Running,
+            connection: ServiceConnection::Connected,
+            connection_detail: None,
+            real_time_enabled: true,
+            started_at: now,
+            updated_at: now,
+            last_detection_at: None,
+            last_error: None,
+            definitions: ServiceDefinitionHealth::BuiltIn {
+                version: "embedded-test".to_owned(),
+            },
+            counters: service::ServiceCounters::default(),
+        };
+
+        apply_service_health(&runtime, health);
+        let state = runtime.lock().unwrap();
+        assert_eq!(state.protection, ProtectionStatus::Active);
+        assert_eq!(state.driver, DriverStatus::Connected);
     }
 
     #[test]
-    fn self_test_bytes_exceed_blocking_threshold() {
-        let mut bytes = vec![0u8; 256 * 1024];
-        fill_self_test_bytes(&mut bytes);
-        assert!(shannon_entropy(&bytes) > ENTROPY_THRESHOLD);
+    fn disabled_realtime_is_reported_as_paused_not_active() {
+        let now = Utc::now();
+        let runtime = new_shared_ui_state();
+        let health = ServiceHealthSnapshot {
+            schema_version: SERVICE_HEALTH_SCHEMA_VERSION,
+            product_version: "1.2.3".to_owned(),
+            process_id: 42,
+            lifecycle: ServiceLifecycle::Running,
+            connection: ServiceConnection::Connected,
+            connection_detail: None,
+            real_time_enabled: false,
+            started_at: now,
+            updated_at: now,
+            last_detection_at: None,
+            last_error: None,
+            definitions: ServiceDefinitionHealth::BuiltIn {
+                version: "embedded-test".to_owned(),
+            },
+            counters: service::ServiceCounters::default(),
+        };
+
+        apply_service_health(&runtime, health);
+        assert_eq!(runtime.lock().unwrap().protection, ProtectionStatus::Paused);
     }
 
     #[test]
-    fn device_paths_are_mapped_through_globalroot() {
-        assert_eq!(
-            device_path_to_openable_path("\\Device\\HarddiskVolume3\\sample.bin"),
-            PathBuf::from("\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\sample.bin")
+    fn missing_health_file_never_claims_protection() {
+        let runtime = new_shared_ui_state();
+        set_health_read_error(
+            &runtime,
+            &io::Error::new(io::ErrorKind::NotFound, "missing"),
         );
+        let state = runtime.lock().unwrap();
+        assert_eq!(state.driver, DriverStatus::NotInstalled);
+        assert!(matches!(state.protection, ProtectionStatus::Unavailable(_)));
     }
 
     #[test]
-    fn filter_protocol_layout_matches_x64_minifilter_abi() {
-        assert_eq!(mem::size_of::<FilterMessageHeader>(), 16);
-        assert_eq!(mem::size_of::<BlackshardNotification>(), 524);
-        assert_eq!(mem::size_of::<BlackshardMessage>(), 544);
-        assert_eq!(mem::size_of::<FilterReplyHeader>(), 16);
-        assert_eq!(mem::size_of::<BlackshardReplyMessage>(), 24);
+    fn self_test_probe_argument_is_stable() {
+        assert_eq!(SELF_TEST_ARGUMENT, "--blackshard-self-test-open");
+        assert!(Path::new(SELF_TEST_ARGUMENT).file_name().is_some());
+        assert_eq!(SELF_TEST_PAYLOAD.len(), 72);
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(SELF_TEST_PAYLOAD)),
+            engine::BLACKSHARD_SELF_TEST_SHA256
+        );
     }
 }

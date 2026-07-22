@@ -87,7 +87,10 @@ $instancePath = Join-Path $instancesPath "blackshard Instance"
 New-Item -Path $instancesPath -Force | Out-Null
 New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
 New-Item -Path $instancePath -Force | Out-Null
-New-ItemProperty -Path $instancePath -Name "Altitude" -Value "328000" -PropertyType String -Force | Out-Null
+# Development-only placeholder. A production package must use the unique
+# altitude assigned to Blackshard by Microsoft and install its signed INF/CAT
+# through the Driver Store instead of this development script.
+New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
 New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
 
 Write-Host "[*] Loading Blackshard minifilter..." -ForegroundColor Cyan

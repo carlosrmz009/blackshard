@@ -1,0 +1,39 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <PropertyGroup>
+    <OutputType>Bundle</OutputType>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputName>BlackshardSetup</OutputName>
+    <SignOutput>true</SignOutput>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <DefineConstants>ProductVersion=$(ProductVersion);MsiPath=$(MsiPath)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.BootstrapperApplications.wixext" Version="7.0.0" />
+  </ItemGroup>
+
+  <Target Name="ValidateProductionInputs" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(AcceptEula)' != 'wix7'"
+           Text="WiX v7 EULA acceptance is required. Use installer\build-production-installer.ps1 -AcceptWixEula after reviewing the WiX OSMF terms." />
+    <Error Condition="'$(SignOutput)' != 'true'"
+           Text="Unsigned Blackshard installer output is forbidden. SignOutput must be true." />
+    <Error Condition="'$(ProductVersion)' == ''"
+           Text="ProductVersion is required." />
+    <Error Condition="'$(MsiPath)' == '' Or !Exists('$(MsiPath)')"
+           Text="MsiPath must identify the signed Blackshard MSI." />
+    <Error Condition="'$(SignToolPath)' == '' Or !Exists('$(SignToolPath)')"
+           Text="SignToolPath must identify an installed x64 signtool.exe." />
+    <Error Condition="'$(SigningCertificateThumbprint)' == ''"
+           Text="SigningCertificateThumbprint is required." />
+    <Error Condition="'$(TimestampUrl)' == ''"
+           Text="TimestampUrl is required." />
+  </Target>
+
+  <Target Name="SignBundleEngine">
+    <Exec Command="&quot;$(SignToolPath)&quot; sign /v $(CertificateStoreArguments) /sha1 &quot;$(SigningCertificateThumbprint)&quot; /fd SHA256 /tr &quot;$(TimestampUrl)&quot; /td SHA256 /d &quot;Blackshard Setup Engine&quot; &quot;%(SignBundleEngine.FullPath)&quot;" />
+  </Target>
+
+  <Target Name="SignBundle">
+    <Exec Command="&quot;$(SignToolPath)&quot; sign /v $(CertificateStoreArguments) /sha1 &quot;$(SigningCertificateThumbprint)&quot; /fd SHA256 /tr &quot;$(TimestampUrl)&quot; /td SHA256 /d &quot;Blackshard Windows Client Setup&quot; &quot;%(SignBundle.FullPath)&quot;" />
+  </Target>
+</Project>

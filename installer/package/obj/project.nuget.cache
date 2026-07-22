@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "fzsMKRsP5pQ=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Carlos\\Documents\\GitHub\\blackshard\\installer\\package\\Blackshard.Package.wixproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Carlos\\.nuget\\packages\\wixtoolset.util.wixext\\7.0.0\\wixtoolset.util.wixext.7.0.0.nupkg.sha512"
+  ],
+  "logs": []
+}

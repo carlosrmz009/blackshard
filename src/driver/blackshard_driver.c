@@ -1,11 +1,34 @@
 #include <fltKernel.h>
 #include <dontuse.h>
 
-#define MAX_FILE_PATH_LENGTH 260
+#define BLACKSHARD_PROTOCOL_MAGIC 0x33485342UL /* "BSH3" */
+#define BLACKSHARD_PROTOCOL_VERSION 3
+#define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
+#define BLACKSHARD_STREAM_CONTEXT_TAG 'cShB'
+#define MAX_FILE_PATH_LENGTH 1024
 
+#define BLACKSHARD_OPERATION_OPEN 1UL
+#define BLACKSHARD_OPERATION_EXECUTE_SECTION 2UL
+#define BLACKSHARD_CONTROL_GET_HEALTH 1UL
+
+/*
+ * Protocol V3 is intentionally fixed-width. User mode must validate Size,
+ * Magic, and Version before using any field. FileId is the live file-system
+ * identity returned by FileInternalInformation for the exact FILE_OBJECT.
+ */
 typedef struct _BLACKSHARD_NOTIFICATION {
+    ULONG Magic;
+    USHORT Version;
+    USHORT Size;
     ULONG ProcessId;
+    ULONG DesiredAccess;
+    ULONG Operation;
+    ULONG PathLength;
     WCHAR FilePath[MAX_FILE_PATH_LENGTH];
+    ULONGLONG FileId;
+    ULONGLONG ContentGeneration;
+    ULONG MustEnforce;
+    ULONG Reserved;
 } BLACKSHARD_NOTIFICATION, *PBLACKSHARD_NOTIFICATION;
 
 typedef enum _BLACKSHARD_VERDICT {
@@ -14,21 +37,75 @@ typedef enum _BLACKSHARD_VERDICT {
 } BLACKSHARD_VERDICT;
 
 typedef struct _BLACKSHARD_REPLY {
+    ULONG Magic;
+    USHORT Version;
+    USHORT Size;
     BLACKSHARD_VERDICT Verdict;
+    ULONG RiskScore;
 } BLACKSHARD_REPLY, *PBLACKSHARD_REPLY;
+
+typedef struct _BLACKSHARD_CONTROL_REQUEST {
+    ULONG Magic;
+    USHORT Version;
+    USHORT Size;
+    ULONG Command;
+} BLACKSHARD_CONTROL_REQUEST, *PBLACKSHARD_CONTROL_REQUEST;
+
+typedef struct _BLACKSHARD_HEALTH_REPLY {
+    ULONG Magic;
+    USHORT Version;
+    USHORT Size;
+    ULONGLONG ScanRequests;
+    ULONGLONG Blocks;
+    ULONGLONG Timeouts;
+    ULONGLONG ServiceUnavailableBypasses;
+    ULONGLONG ObjectResolutionBypasses;
+    ULONGLONG OversizePathBypasses;
+    ULONGLONG IrqlBypasses;
+    ULONGLONG InvalidReplies;
+    ULONGLONG DirtyWrites;
+    ULONGLONG EnforcementBypasses;
+    ULONGLONG ContentRaceBlocks;
+} BLACKSHARD_HEALTH_REPLY, *PBLACKSHARD_HEALTH_REPLY;
+
+typedef struct _BLACKSHARD_STREAM_CONTEXT {
+    volatile LONG64 FileId;
+    volatile LONG IdentityValid;
+    volatile LONG Reserved;
+    volatile LONG64 ContentGeneration;
+} BLACKSHARD_STREAM_CONTEXT, *PBLACKSHARD_STREAM_CONTEXT;
 
 typedef struct _BLACKSHARD_DATA {
     PFLT_FILTER FilterHandle;
     PFLT_PORT ServerPort;
     PFLT_PORT ClientPort;
     HANDLE ClientProcessId;
+    volatile LONG64 ScanRequests;
+    volatile LONG64 Blocks;
+    volatile LONG64 Timeouts;
+    volatile LONG64 ServiceUnavailableBypasses;
+    volatile LONG64 ObjectResolutionBypasses;
+    volatile LONG64 OversizePathBypasses;
+    volatile LONG64 IrqlBypasses;
+    volatile LONG64 InvalidReplies;
+    volatile LONG64 DirtyWrites;
+    volatile LONG64 EnforcementBypasses;
+    volatile LONG64 ContentRaceBlocks;
 } BLACKSHARD_DATA, *PBLACKSHARD_DATA;
+
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FilePath) == 24);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FileId) == 2072);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ContentGeneration) == 2080);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, MustEnforce) == 2088);
+C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 2096);
+C_ASSERT(sizeof(BLACKSHARD_REPLY) == 16);
+C_ASSERT(sizeof(BLACKSHARD_CONTROL_REQUEST) == 12);
+C_ASSERT(sizeof(BLACKSHARD_HEALTH_REPLY) == 96);
 
 BLACKSHARD_DATA gBlackshardData;
 
-#define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
-
 DRIVER_INITIALIZE DriverEntry;
+
 NTSTATUS
 BlackshardUnload (
     _In_ FLT_FILTER_UNLOAD_FLAGS Flags
@@ -36,6 +113,28 @@ BlackshardUnload (
 
 FLT_PREOP_CALLBACK_STATUS
 BlackshardPreCreate (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    );
+
+FLT_POSTOP_CALLBACK_STATUS
+BlackshardPostCreate (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
+    );
+
+FLT_PREOP_CALLBACK_STATUS
+BlackshardPreWrite (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    );
+
+FLT_PREOP_CALLBACK_STATUS
+BlackshardPreAcquireForSectionSynchronization (
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
@@ -65,29 +164,79 @@ BlackshardPortMessage (
     _Out_ PULONG ReturnOutputBufferLength
     );
 
+BOOLEAN
+BlackshardShouldScanName (
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo,
+    _In_ ACCESS_MASK DesiredAccess
+    );
+
+BOOLEAN
+BlackshardEvaluateOpenedObject (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ ULONG Operation,
+    _In_ ULONG MustEnforce,
+    _In_ ULONG DesiredAccess,
+    _In_ BOOLEAN RestrictToHighRiskName
+    );
+
+NTSTATUS
+BlackshardGetOrCreateStreamContext (
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ BOOLEAN IdentityValid,
+    _In_ ULONGLONG FileId,
+    _Outptr_ PBLACKSHARD_STREAM_CONTEXT *ReturnedContext
+    );
+
 #pragma alloc_text(INIT, DriverEntry)
 #pragma alloc_text(PAGE, BlackshardUnload)
-#pragma alloc_text(PAGE, BlackshardPreCreate)
 #pragma alloc_text(PAGE, BlackshardPortConnect)
 #pragma alloc_text(PAGE, BlackshardPortDisconnect)
 #pragma alloc_text(PAGE, BlackshardPortMessage)
+#pragma alloc_text(PAGE, BlackshardShouldScanName)
+#pragma alloc_text(PAGE, BlackshardEvaluateOpenedObject)
+
+CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
+    {
+        FLT_STREAM_CONTEXT,
+        0,
+        NULL,
+        sizeof(BLACKSHARD_STREAM_CONTEXT),
+        BLACKSHARD_STREAM_CONTEXT_TAG,
+        NULL,
+        NULL,
+        NULL
+    },
+    { FLT_CONTEXT_END }
+};
 
 CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
-
-    { IRP_MJ_CREATE,
-      0,
-      BlackshardPreCreate,
-      NULL },
-
+    {
+        IRP_MJ_CREATE,
+        0,
+        BlackshardPreCreate,
+        BlackshardPostCreate
+    },
+    {
+        IRP_MJ_WRITE,
+        0,
+        BlackshardPreWrite,
+        NULL
+    },
+    {
+        IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION,
+        0,
+        BlackshardPreAcquireForSectionSynchronization,
+        NULL
+    },
     { IRP_MJ_OPERATION_END }
 };
 
 CONST FLT_REGISTRATION FilterRegistration = {
-
-    sizeof( FLT_REGISTRATION ),
+    sizeof(FLT_REGISTRATION),
     FLT_REGISTRATION_VERSION,
     0,
-    NULL,
+    Contexts,
     Callbacks,
     BlackshardUnload,
     NULL,
@@ -106,60 +255,68 @@ DriverEntry (
     )
 {
     NTSTATUS status;
-    PSECURITY_DESCRIPTOR sd;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING uniString;
+    PSECURITY_DESCRIPTOR securityDescriptor;
+    OBJECT_ATTRIBUTES objectAttributes;
+    UNICODE_STRING portName;
 
-    UNREFERENCED_PARAMETER( RegistryPath );
+    UNREFERENCED_PARAMETER(RegistryPath);
 
-    KdPrint(("Blackshard: DriverEntry - Loading Minifilter\n"));
+    RtlZeroMemory(&gBlackshardData, sizeof(gBlackshardData));
 
-    RtlZeroMemory(&gBlackshardData, sizeof(BLACKSHARD_DATA));
+    status = FltRegisterFilter(
+        DriverObject,
+        &FilterRegistration,
+        &gBlackshardData.FilterHandle
+        );
 
-    status = FltRegisterFilter( DriverObject,
-                                &FilterRegistration,
-                                &gBlackshardData.FilterHandle );
+    FLT_ASSERT(NT_SUCCESS(status));
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
-    FLT_ASSERT( NT_SUCCESS( status ) );
+    status = FltBuildDefaultSecurityDescriptor(
+        &securityDescriptor,
+        FLT_PORT_ALL_ACCESS
+        );
+    if (!NT_SUCCESS(status)) {
+        FltUnregisterFilter(gBlackshardData.FilterHandle);
+        gBlackshardData.FilterHandle = NULL;
+        return status;
+    }
 
-    if (NT_SUCCESS( status )) {
+    RtlInitUnicodeString(&portName, BLACKSHARD_PORT_NAME);
+    InitializeObjectAttributes(
+        &objectAttributes,
+        &portName,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+        NULL,
+        securityDescriptor
+        );
 
-        status = FltBuildDefaultSecurityDescriptor( &sd, FLT_PORT_ALL_ACCESS );
+    status = FltCreateCommunicationPort(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ServerPort,
+        &objectAttributes,
+        NULL,
+        BlackshardPortConnect,
+        BlackshardPortDisconnect,
+        BlackshardPortMessage,
+        1
+        );
 
-        if (NT_SUCCESS( status )) {
+    FltFreeSecurityDescriptor(securityDescriptor);
+    if (!NT_SUCCESS(status)) {
+        FltUnregisterFilter(gBlackshardData.FilterHandle);
+        gBlackshardData.FilterHandle = NULL;
+        return status;
+    }
 
-            RtlInitUnicodeString( &uniString, BLACKSHARD_PORT_NAME );
-
-            InitializeObjectAttributes( &oa,
-                                        &uniString,
-                                        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
-                                        NULL,
-                                        sd );
-
-            status = FltCreateCommunicationPort( gBlackshardData.FilterHandle,
-                                                 &gBlackshardData.ServerPort,
-                                                 &oa,
-                                                 NULL,
-                                                 BlackshardPortConnect,
-                                                 BlackshardPortDisconnect,
-                                                 BlackshardPortMessage,
-                                                 1 );
-
-            FltFreeSecurityDescriptor( sd );
-
-            if (NT_SUCCESS( status )) {
-
-                status = FltStartFiltering( gBlackshardData.FilterHandle );
-
-                if (NT_SUCCESS( status )) {
-                    return STATUS_SUCCESS;
-                }
-
-                FltCloseCommunicationPort( gBlackshardData.ServerPort );
-            }
-        }
-
-        FltUnregisterFilter( gBlackshardData.FilterHandle );
+    status = FltStartFiltering(gBlackshardData.FilterHandle);
+    if (!NT_SUCCESS(status)) {
+        FltCloseCommunicationPort(gBlackshardData.ServerPort);
+        gBlackshardData.ServerPort = NULL;
+        FltUnregisterFilter(gBlackshardData.FilterHandle);
+        gBlackshardData.FilterHandle = NULL;
     }
 
     return status;
@@ -170,18 +327,18 @@ BlackshardUnload (
     _In_ FLT_FILTER_UNLOAD_FLAGS Flags
     )
 {
-    UNREFERENCED_PARAMETER( Flags );
+    UNREFERENCED_PARAMETER(Flags);
 
     PAGED_CODE();
 
-    KdPrint(("Blackshard: BlackshardUnload - Unloading Minifilter\n"));
-
-    if (gBlackshardData.ServerPort) {
-        FltCloseCommunicationPort( gBlackshardData.ServerPort );
+    if (gBlackshardData.ServerPort != NULL) {
+        FltCloseCommunicationPort(gBlackshardData.ServerPort);
+        gBlackshardData.ServerPort = NULL;
     }
 
-    if (gBlackshardData.FilterHandle) {
-        FltUnregisterFilter( gBlackshardData.FilterHandle );
+    if (gBlackshardData.FilterHandle != NULL) {
+        FltUnregisterFilter(gBlackshardData.FilterHandle);
+        gBlackshardData.FilterHandle = NULL;
     }
 
     return STATUS_SUCCESS;
@@ -194,38 +351,27 @@ BlackshardPreCreate (
     _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
     )
 {
-    NTSTATUS status;
-    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
-    BLACKSHARD_NOTIFICATION notification;
-    BLACKSHARD_REPLY reply;
-    ULONG replyLength = sizeof(BLACKSHARD_REPLY);
-    ULONG copyLength;
     ULONG requestorProcessId;
     UCHAR createDisposition;
     ACCESS_MASK desiredAccess;
-    LARGE_INTEGER timeout;
 
-    UNREFERENCED_PARAMETER( FltObjects );
-    UNREFERENCED_PARAMETER( CompletionContext );
+    UNREFERENCED_PARAMETER(FltObjects);
 
-    PAGED_CODE();
+    if (CompletionContext != NULL) {
+        *CompletionContext = NULL;
+    }
 
-    if (Data->RequestorMode != UserMode) {
+    if (Data->RequestorMode != UserMode ||
+        Data->Iopb->Parameters.Create.SecurityContext == NULL ||
+        FlagOn(Data->Iopb->Parameters.Create.Options, FILE_DIRECTORY_FILE) ||
+        FlagOn(Data->Iopb->OperationFlags, SL_OPEN_TARGET_DIRECTORY)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     requestorProcessId = FltGetRequestorProcessId(Data);
-
-    /*
-     * The user-mode agent opens candidate files to inspect them. Sending those
-     * opens back to the same agent would deadlock the single message consumer.
-     */
-    if (gBlackshardData.ClientProcessId != NULL &&
-        requestorProcessId == HandleToULong(gBlackshardData.ClientProcessId)) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    if (FlagOn(Data->Iopb->Parameters.Create.Options, FILE_DIRECTORY_FILE)) {
+    if (requestorProcessId == 0 ||
+        (gBlackshardData.ClientProcessId != NULL &&
+         requestorProcessId == HandleToULong(gBlackshardData.ClientProcessId))) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -238,64 +384,518 @@ BlackshardPreCreate (
     }
 
     desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
-    if ((desiredAccess & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) == 0) {
+    if ((desiredAccess &
+         (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) == 0) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    status = FltGetFileNameInformation( Data,
-                                        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-                                        &nameInfo );
-    if (!NT_SUCCESS( status )) {
+    if (gBlackshardData.ClientPort == NULL) {
+        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    status = FltParseFileNameInformation( nameInfo );
-    if (!NT_SUCCESS( status )) {
-        FltReleaseFileNameInformation( nameInfo );
+    /* Create operations are already synchronized by Filter Manager. */
+    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+}
+
+FLT_POSTOP_CALLBACK_STATUS
+BlackshardPostCreate (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags
+    )
+{
+    ACCESS_MASK desiredAccess;
+    BOOLEAN block;
+
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING) ||
+        !NT_SUCCESS(Data->IoStatus.Status) ||
+        Data->IoStatus.Status == STATUS_REPARSE ||
+        Data->IoStatus.Information != FILE_OPENED ||
+        FltObjects->FileObject == NULL ||
+        FlagOn(FltObjects->FileObject->Flags, FO_STREAM_FILE | FO_VOLUME_OPEN)) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    if (Data->Iopb->Parameters.Create.SecurityContext == NULL) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
+        KeAreAllApcsDisabled() ||
+        IoGetTopLevelIrp() != NULL) {
+        InterlockedIncrement64(&gBlackshardData.IrqlBypasses);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    block = BlackshardEvaluateOpenedObject(
+        Data,
+        FltObjects,
+        BLACKSHARD_OPERATION_OPEN,
+        FALSE,
+        desiredAccess,
+        TRUE
+        );
+
+    if (!block) {
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    /* FltCancelFileOpen is legal only here, at PASSIVE_LEVEL, before a handle. */
+    if (FlagOn(FltObjects->FileObject->Flags, FO_HANDLE_CREATED)) {
+        InterlockedIncrement64(&gBlackshardData.EnforcementBypasses);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
+    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+    Data->IoStatus.Information = 0;
+    InterlockedIncrement64(&gBlackshardData.Blocks);
+
+    return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+FLT_PREOP_CALLBACK_STATUS
+BlackshardPreWrite (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    )
+{
+    NTSTATUS status;
+    PBLACKSHARD_STREAM_CONTEXT streamContext;
+
+    if (CompletionContext != NULL) {
+        *CompletionContext = NULL;
+    }
+
+    if (KeGetCurrentIrql() > APC_LEVEL ||
+        Data->Iopb->Parameters.Write.Length == 0 ||
+        FltObjects->Instance == NULL ||
+        FltObjects->FileObject == NULL ||
+        FlagOn(FltObjects->FileObject->Flags, FO_STREAM_FILE | FO_VOLUME_OPEN)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    if (gBlackshardData.ClientPort != NULL) {
-
-        RtlZeroMemory(&notification, sizeof(BLACKSHARD_NOTIFICATION));
-        RtlZeroMemory(&reply, sizeof(BLACKSHARD_REPLY));
-
-        notification.ProcessId = requestorProcessId;
-
-        copyLength = nameInfo->Name.Length;
-        if (copyLength >= (MAX_FILE_PATH_LENGTH * sizeof(WCHAR))) {
-            copyLength = (MAX_FILE_PATH_LENGTH - 1) * sizeof(WCHAR);
-        }
-        RtlCopyMemory(notification.FilePath, nameInfo->Name.Buffer, copyLength);
-        notification.FilePath[copyLength / sizeof(WCHAR)] = L'\0';
-
-        /* Relative timeout: never hold a file open for more than three seconds. */
-        timeout.QuadPart = -3LL * 10LL * 1000LL * 1000LL;
-
-        status = FltSendMessage( gBlackshardData.FilterHandle,
-                                 &gBlackshardData.ClientPort,
-                                 &notification,
-                                 sizeof(BLACKSHARD_NOTIFICATION),
-                                 &reply,
-                                 &replyLength,
-                                 &timeout );
-
-        if (status == STATUS_SUCCESS &&
-            replyLength == sizeof(BLACKSHARD_REPLY) &&
-            reply.Verdict == VERDICT_BLOCK) {
-            
-            KdPrint(("Blackshard: BLOCKED IRP_MJ_CREATE for PID %d, File: %ws\n", notification.ProcessId, notification.FilePath));
-
-            FltReleaseFileNameInformation( nameInfo );
-
-            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-            Data->IoStatus.Information = 0;
-            return FLT_PREOP_COMPLETE;
-        }
+    status = BlackshardGetOrCreateStreamContext(
+        FltObjects,
+        FALSE,
+        0,
+        &streamContext
+        );
+    if (NT_SUCCESS(status)) {
+        InterlockedIncrement64(&streamContext->ContentGeneration);
+        InterlockedIncrement64(&gBlackshardData.DirtyWrites);
+        FltReleaseContext(streamContext);
     }
 
-    FltReleaseFileNameInformation( nameInfo );
+    /* Mark before dispatch: a failed write causes only a conservative rescan. */
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+FLT_PREOP_CALLBACK_STATUS
+BlackshardPreAcquireForSectionSynchronization (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    )
+{
+    ULONG pageProtection;
+    BOOLEAN block;
+
+    if (CompletionContext != NULL) {
+        *CompletionContext = NULL;
+    }
+
+    if (Data->Iopb->Parameters.AcquireForSectionSynchronization.SyncType !=
+            SyncTypeCreateSection ||
+        FltObjects->Instance == NULL ||
+        FltObjects->FileObject == NULL ||
+        FlagOn(FltObjects->FileObject->Flags, FO_STREAM_FILE | FO_VOLUME_OPEN)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    pageProtection =
+        Data->Iopb->Parameters.AcquireForSectionSynchronization.PageProtection;
+    if ((pageProtection &
+         (PAGE_EXECUTE |
+          PAGE_EXECUTE_READ |
+          PAGE_EXECUTE_READWRITE |
+          PAGE_EXECUTE_WRITECOPY)) == 0) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (gBlackshardData.ClientPort == NULL) {
+        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    /* FltQueryInformationFile, used below, is PASSIVE_LEVEL-only. */
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
+        KeAreAllApcsDisabled() ||
+        IoGetTopLevelIrp() != NULL) {
+        InterlockedIncrement64(&gBlackshardData.IrqlBypasses);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    block = BlackshardEvaluateOpenedObject(
+        Data,
+        FltObjects,
+        BLACKSHARD_OPERATION_EXECUTE_SECTION,
+        TRUE,
+        pageProtection,
+        FALSE
+        );
+
+    if (block) {
+        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+        Data->IoStatus.Information = 0;
+        InterlockedIncrement64(&gBlackshardData.Blocks);
+        return FLT_PREOP_COMPLETE;
+    }
+
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+BOOLEAN
+BlackshardEvaluateOpenedObject (
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ ULONG Operation,
+    _In_ ULONG MustEnforce,
+    _In_ ULONG DesiredAccess,
+    _In_ BOOLEAN RestrictToHighRiskName
+    )
+{
+    NTSTATUS status;
+    FILE_STANDARD_INFORMATION standardInformation;
+    FILE_INTERNAL_INFORMATION internalInformation;
+    PFLT_FILE_NAME_INFORMATION nameInformation;
+    PBLACKSHARD_STREAM_CONTEXT streamContext;
+    BLACKSHARD_NOTIFICATION notification;
+    BLACKSHARD_REPLY reply;
+    ULONG replyLength;
+    ULONG requestorProcessId;
+    ULONG pathLength;
+    ULONGLONG contentGeneration;
+    LARGE_INTEGER timeout;
+
+    PAGED_CODE();
+
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        return FALSE;
+    }
+
+    requestorProcessId = FltGetRequestorProcessId(Data);
+    if (requestorProcessId == 0 ||
+        (gBlackshardData.ClientProcessId != NULL &&
+         requestorProcessId == HandleToULong(gBlackshardData.ClientProcessId))) {
+        return FALSE;
+    }
+
+    nameInformation = NULL;
+    status = FltGetFileNameInformation(
+        Data,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+        &nameInformation
+        );
+    if (!NT_SUCCESS(status)) {
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        return FALSE;
+    }
+
+    status = FltParseFileNameInformation(nameInformation);
+    if (!NT_SUCCESS(status)) {
+        FltReleaseFileNameInformation(nameInformation);
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        return FALSE;
+    }
+
+    if (RestrictToHighRiskName &&
+        !BlackshardShouldScanName(nameInformation, (ACCESS_MASK)DesiredAccess)) {
+        FltReleaseFileNameInformation(nameInformation);
+        return FALSE;
+    }
+
+    /* Resolve object identity only after the inexpensive name prefilter. */
+    RtlZeroMemory(&standardInformation, sizeof(standardInformation));
+    status = FltQueryInformationFile(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        &standardInformation,
+        sizeof(standardInformation),
+        FileStandardInformation,
+        NULL
+        );
+    if (!NT_SUCCESS(status) || standardInformation.Directory) {
+        FltReleaseFileNameInformation(nameInformation);
+        if (!NT_SUCCESS(status)) {
+            InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        }
+        return FALSE;
+    }
+
+    RtlZeroMemory(&internalInformation, sizeof(internalInformation));
+    status = FltQueryInformationFile(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        &internalInformation,
+        sizeof(internalInformation),
+        FileInternalInformation,
+        NULL
+        );
+    if (!NT_SUCCESS(status)) {
+        FltReleaseFileNameInformation(nameInformation);
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        return FALSE;
+    }
+
+    /* Generation zero is reserved as an invalid/uninitialized wire value. */
+    contentGeneration = 1;
+    status = BlackshardGetOrCreateStreamContext(
+        FltObjects,
+        TRUE,
+        (ULONGLONG)internalInformation.IndexNumber.QuadPart,
+        &streamContext
+        );
+    if (NT_SUCCESS(status)) {
+        contentGeneration = (ULONGLONG)InterlockedCompareExchange64(
+            &streamContext->ContentGeneration,
+            0,
+            0
+            );
+        FltReleaseContext(streamContext);
+    }
+
+    pathLength = (ULONG)(nameInformation->Name.Length / sizeof(WCHAR));
+    if (pathLength >= MAX_FILE_PATH_LENGTH) {
+        FltReleaseFileNameInformation(nameInformation);
+        InterlockedIncrement64(&gBlackshardData.OversizePathBypasses);
+        return FALSE;
+    }
+
+    if (gBlackshardData.ClientPort == NULL) {
+        FltReleaseFileNameInformation(nameInformation);
+        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
+        return FALSE;
+    }
+
+    RtlZeroMemory(&notification, sizeof(notification));
+    RtlZeroMemory(&reply, sizeof(reply));
+
+    notification.Magic = BLACKSHARD_PROTOCOL_MAGIC;
+    notification.Version = BLACKSHARD_PROTOCOL_VERSION;
+    notification.Size = (USHORT)sizeof(notification);
+    notification.ProcessId = requestorProcessId;
+    notification.DesiredAccess = DesiredAccess;
+    notification.Operation = Operation;
+    notification.PathLength = pathLength;
+    RtlCopyMemory(
+        notification.FilePath,
+        nameInformation->Name.Buffer,
+        nameInformation->Name.Length
+        );
+    notification.FilePath[pathLength] = L'\0';
+    notification.FileId = (ULONGLONG)internalInformation.IndexNumber.QuadPart;
+    notification.ContentGeneration = contentGeneration;
+    notification.MustEnforce = MustEnforce;
+
+    FltReleaseFileNameInformation(nameInformation);
+
+    replyLength = sizeof(reply);
+    timeout.QuadPart = -15LL * 1000LL * 1000LL;
+    InterlockedIncrement64(&gBlackshardData.ScanRequests);
+
+    status = FltSendMessage(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ClientPort,
+        &notification,
+        sizeof(notification),
+        &reply,
+        &replyLength,
+        &timeout
+        );
+
+    /* STATUS_TIMEOUT is an NT success code, so test it explicitly. */
+    if (status == STATUS_TIMEOUT) {
+        InterlockedIncrement64(&gBlackshardData.Timeouts);
+        return FALSE;
+    }
+
+    if (status != STATUS_SUCCESS) {
+        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
+        return FALSE;
+    }
+
+    if (replyLength != sizeof(reply) ||
+        reply.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
+        reply.Version != BLACKSHARD_PROTOCOL_VERSION ||
+        reply.Size != sizeof(reply) ||
+        (reply.Verdict != VERDICT_ALLOW && reply.Verdict != VERDICT_BLOCK)) {
+        InterlockedIncrement64(&gBlackshardData.InvalidReplies);
+        return FALSE;
+    }
+
+    /*
+     * An executable image must not be authorized from bytes that changed
+     * while user mode was scanning them. A later execution attempt will be
+     * rescanned against the new generation.
+     */
+    if (MustEnforce != 0) {
+        status = FltGetStreamContext(
+            FltObjects->Instance,
+            FltObjects->FileObject,
+            &streamContext
+            );
+        if (NT_SUCCESS(status)) {
+            ULONGLONG currentGeneration;
+
+            currentGeneration = (ULONGLONG)InterlockedCompareExchange64(
+                &streamContext->ContentGeneration,
+                0,
+                0
+                );
+            FltReleaseContext(streamContext);
+            if (currentGeneration != contentGeneration) {
+                InterlockedIncrement64(&gBlackshardData.ContentRaceBlocks);
+                return TRUE;
+            }
+        }
+    }
+
+    return (BOOLEAN)(reply.Verdict == VERDICT_BLOCK);
+}
+
+NTSTATUS
+BlackshardGetOrCreateStreamContext (
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ BOOLEAN IdentityValid,
+    _In_ ULONGLONG FileId,
+    _Outptr_ PBLACKSHARD_STREAM_CONTEXT *ReturnedContext
+    )
+{
+    NTSTATUS status;
+    PBLACKSHARD_STREAM_CONTEXT streamContext;
+    PBLACKSHARD_STREAM_CONTEXT oldContext;
+
+    *ReturnedContext = NULL;
+
+    if (FltObjects->Instance == NULL ||
+        FltObjects->FileObject == NULL ||
+        !FltSupportsStreamContexts(FltObjects->FileObject)) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    status = FltGetStreamContext(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        &streamContext
+        );
+    if (NT_SUCCESS(status)) {
+        if (IdentityValid) {
+            InterlockedExchange64(&streamContext->FileId, (LONG64)FileId);
+            InterlockedExchange(&streamContext->IdentityValid, TRUE);
+        }
+        *ReturnedContext = streamContext;
+        return STATUS_SUCCESS;
+    }
+
+    if (status != STATUS_NOT_FOUND) {
+        return status;
+    }
+
+    status = FltAllocateContext(
+        gBlackshardData.FilterHandle,
+        FLT_STREAM_CONTEXT,
+        sizeof(BLACKSHARD_STREAM_CONTEXT),
+        NonPagedPoolNx,
+        &streamContext
+        );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlZeroMemory(streamContext, sizeof(*streamContext));
+    streamContext->ContentGeneration = 1;
+    if (IdentityValid) {
+        streamContext->FileId = (LONG64)FileId;
+        streamContext->IdentityValid = TRUE;
+    }
+
+    oldContext = NULL;
+    status = FltSetStreamContext(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        FLT_SET_CONTEXT_KEEP_IF_EXISTS,
+        streamContext,
+        &oldContext
+        );
+
+    if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED && oldContext != NULL) {
+        FltReleaseContext(streamContext);
+        streamContext = oldContext;
+        if (IdentityValid) {
+            InterlockedExchange64(&streamContext->FileId, (LONG64)FileId);
+            InterlockedExchange(&streamContext->IdentityValid, TRUE);
+        }
+        status = STATUS_SUCCESS;
+    } else if (!NT_SUCCESS(status)) {
+        FltReleaseContext(streamContext);
+        return status;
+    }
+
+    *ReturnedContext = streamContext;
+    return STATUS_SUCCESS;
+}
+
+BOOLEAN
+BlackshardShouldScanName (
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo,
+    _In_ ACCESS_MASK DesiredAccess
+    )
+{
+    static const UNICODE_STRING extensions[] = {
+        RTL_CONSTANT_STRING(L"exe"), RTL_CONSTANT_STRING(L"dll"),
+        RTL_CONSTANT_STRING(L"sys"), RTL_CONSTANT_STRING(L"scr"),
+        RTL_CONSTANT_STRING(L"com"), RTL_CONSTANT_STRING(L"cpl"),
+        RTL_CONSTANT_STRING(L"msi"), RTL_CONSTANT_STRING(L"msp"),
+        RTL_CONSTANT_STRING(L"ps1"), RTL_CONSTANT_STRING(L"psm1"),
+        RTL_CONSTANT_STRING(L"vbs"), RTL_CONSTANT_STRING(L"vbe"),
+        RTL_CONSTANT_STRING(L"js"),  RTL_CONSTANT_STRING(L"jse"),
+        RTL_CONSTANT_STRING(L"wsf"), RTL_CONSTANT_STRING(L"wsh"),
+        RTL_CONSTANT_STRING(L"hta"), RTL_CONSTANT_STRING(L"bat"),
+        RTL_CONSTANT_STRING(L"cmd"), RTL_CONSTANT_STRING(L"lnk"),
+        RTL_CONSTANT_STRING(L"doc"), RTL_CONSTANT_STRING(L"docm"),
+        RTL_CONSTANT_STRING(L"xls"), RTL_CONSTANT_STRING(L"xlsm"),
+        RTL_CONSTANT_STRING(L"ppt"), RTL_CONSTANT_STRING(L"pptm"),
+        RTL_CONSTANT_STRING(L"rtf"), RTL_CONSTANT_STRING(L"pdf"),
+        RTL_CONSTANT_STRING(L"zip"), RTL_CONSTANT_STRING(L"rar"),
+        RTL_CONSTANT_STRING(L"7z"),  RTL_CONSTANT_STRING(L"iso")
+    };
+    ULONG index;
+
+    PAGED_CODE();
+
+    if ((DesiredAccess & (FILE_EXECUTE | GENERIC_EXECUTE)) != 0) {
+        return TRUE;
+    }
+
+    if (NameInfo->Extension.Length == 0) {
+        return FALSE;
+    }
+
+    for (index = 0; index < RTL_NUMBER_OF(extensions); index++) {
+        if (RtlEqualUnicodeString(&NameInfo->Extension, &extensions[index], TRUE)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 NTSTATUS
@@ -307,14 +907,15 @@ BlackshardPortConnect (
     _Outptr_result_maybenull_ PVOID *ConnectionPortCookie
     )
 {
-    UNREFERENCED_PARAMETER( ServerPortCookie );
-    UNREFERENCED_PARAMETER( ConnectionContext );
-    UNREFERENCED_PARAMETER( SizeOfContext );
-    UNREFERENCED_PARAMETER( ConnectionPortCookie );
+    UNREFERENCED_PARAMETER(ServerPortCookie);
+    UNREFERENCED_PARAMETER(ConnectionContext);
+    UNREFERENCED_PARAMETER(SizeOfContext);
 
     PAGED_CODE();
 
-    KdPrint(("Blackshard: User-space daemon connected.\n"));
+    if (ConnectionPortCookie != NULL) {
+        *ConnectionPortCookie = NULL;
+    }
 
     gBlackshardData.ClientProcessId = PsGetCurrentProcessId();
     gBlackshardData.ClientPort = ClientPort;
@@ -327,14 +928,14 @@ BlackshardPortDisconnect (
     _In_opt_ PVOID ConnectionCookie
     )
 {
-    UNREFERENCED_PARAMETER( ConnectionCookie );
+    UNREFERENCED_PARAMETER(ConnectionCookie);
 
     PAGED_CODE();
 
-    KdPrint(("Blackshard: User-space daemon disconnected.\n"));
-
-    FltCloseClientPort( gBlackshardData.FilterHandle, &gBlackshardData.ClientPort );
-    gBlackshardData.ClientPort = NULL;
+    FltCloseClientPort(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ClientPort
+        );
     gBlackshardData.ClientProcessId = NULL;
 }
 
@@ -348,17 +949,86 @@ BlackshardPortMessage (
     _Out_ PULONG ReturnOutputBufferLength
     )
 {
-    UNREFERENCED_PARAMETER( PortCookie );
-    UNREFERENCED_PARAMETER( InputBuffer );
-    UNREFERENCED_PARAMETER( InputBufferLength );
-    UNREFERENCED_PARAMETER( OutputBuffer );
-    UNREFERENCED_PARAMETER( OutputBufferLength );
+    BLACKSHARD_CONTROL_REQUEST request;
+    BLACKSHARD_HEALTH_REPLY reply;
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(PortCookie);
 
     PAGED_CODE();
 
-    if (ReturnOutputBufferLength != NULL) {
-        *ReturnOutputBufferLength = 0;
+    if (ReturnOutputBufferLength == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *ReturnOutputBufferLength = 0;
+
+    if (InputBuffer == NULL ||
+        InputBufferLength < sizeof(request) ||
+        OutputBuffer == NULL ||
+        OutputBufferLength < sizeof(reply)) {
+        return STATUS_BUFFER_TOO_SMALL;
     }
 
+    RtlZeroMemory(&request, sizeof(request));
+    status = STATUS_SUCCESS;
+    __try {
+        RtlCopyMemory(&request, InputBuffer, sizeof(request));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (request.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
+        request.Version != BLACKSHARD_PROTOCOL_VERSION ||
+        request.Size != sizeof(request) ||
+        request.Command != BLACKSHARD_CONTROL_GET_HEALTH) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(&reply, sizeof(reply));
+    reply.Magic = BLACKSHARD_PROTOCOL_MAGIC;
+    reply.Version = BLACKSHARD_PROTOCOL_VERSION;
+    reply.Size = (USHORT)sizeof(reply);
+    reply.ScanRequests = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.ScanRequests, 0, 0);
+    reply.Blocks = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.Blocks, 0, 0);
+    reply.Timeouts = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.Timeouts, 0, 0);
+    reply.ServiceUnavailableBypasses =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.ServiceUnavailableBypasses, 0, 0);
+    reply.ObjectResolutionBypasses =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.ObjectResolutionBypasses, 0, 0);
+    reply.OversizePathBypasses =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.OversizePathBypasses, 0, 0);
+    reply.IrqlBypasses = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.IrqlBypasses, 0, 0);
+    reply.InvalidReplies = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.InvalidReplies, 0, 0);
+    reply.DirtyWrites = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.DirtyWrites, 0, 0);
+    reply.EnforcementBypasses =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.EnforcementBypasses, 0, 0);
+    reply.ContentRaceBlocks =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.ContentRaceBlocks, 0, 0);
+
+    status = STATUS_SUCCESS;
+    __try {
+        RtlCopyMemory(OutputBuffer, &reply, sizeof(reply));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    *ReturnOutputBufferLength = sizeof(reply);
     return STATUS_SUCCESS;
 }

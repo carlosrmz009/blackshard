@@ -4,7 +4,36 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-windows-sys = { version = "0.52.0", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.52.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 eframe = { version = "0.27.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
 wgpu = { version = "0.19.4", default-features = false, features = ["dx12"] }
-chrono = "0.4.38"
+chrono = { version = "0.4.38", features = ["serde"] }
+goblin = "0.9.3"
+sha2 = "0.10.8"
+chacha20 = "0.9.1"
+ed25519-dalek = "2.1.1"
+fs2 = "0.4.3"
+hex = "0.4.3"
+rand = "0.8.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+url = "2.5"
+uuid = { version = "1.10", features = ["serde", "v4"] }
+walkdir = "2.5"
+yara-x = { version = "1.19.0", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp"] }
+
+[target.'cfg(windows)'.dependencies]
+winrt-notification = "0.5.1"
+windows-service = "0.8.1"
+
+[dev-dependencies]
+tempfile = "3.12"

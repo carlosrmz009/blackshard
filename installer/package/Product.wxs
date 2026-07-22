@@ -1,0 +1,286 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix
+    xmlns="http://wixtoolset.org/schemas/v4/wxs"
+    xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package
+      Name="Blackshard"
+      Manufacturer="Blackshard Project"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="{FCD7BF91-C8CB-40CD-99F7-2FDFD431C0A8}"
+      Language="1033"
+      InstallerVersion="500"
+      Scope="perMachine">
+
+    <SummaryInformation
+        Description="Blackshard Windows antivirus client"
+        Manufacturer="Blackshard Project" />
+
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of Blackshard is already installed." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://blackshard.dev/" />
+    <Property Id="ARPHELPLINK" Value="https://blackshard.dev/" />
+    <SetProperty
+        Id="ARPINSTALLLOCATION"
+        Value="[INSTALLFOLDER]"
+        After="CostFinalize"
+        Sequence="execute" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Blackshard">
+        <Directory Id="DRIVERPACKAGEFOLDER" Name="DriverPackage" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="BLACKSHARDDATAFOLDER" Name="Blackshard">
+        <Directory Id="DEFINITIONSFOLDER" Name="Definitions" />
+        <Directory Id="QUARANTINEFOLDER" Name="Quarantine" />
+        <Directory Id="STATEFOLDER" Name="State" />
+        <Directory Id="LOGSFOLDER" Name="Logs" />
+        <Directory Id="UPDATESFOLDER" Name="Updates">
+          <Directory Id="UPDATESTAGINGFOLDER" Name="Staging" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="PROGRAMMENUBLACKSHARDFOLDER" Name="Blackshard" />
+    </StandardDirectory>
+
+    <Component Id="AgentExecutableComponent" Directory="INSTALLFOLDER" Guid="*">
+      <File
+          Id="BlackshardExecutable"
+          Source="$(var.StageDir)\blackshard.exe"
+          Name="blackshard.exe"
+          KeyPath="yes" />
+      <ServiceInstall
+          Id="BlackshardProtectionServiceInstall"
+          Name="BlackshardProtectionService"
+          DisplayName="Blackshard Protection Service"
+          Description="Provides Blackshard real-time malware scanning and quarantine services."
+          Arguments="--service"
+          Account="LocalSystem"
+          Type="ownProcess"
+          Start="auto"
+          ErrorControl="normal"
+          Vital="yes">
+        <!-- Avoid the broken MSI 5 service-configuration tables. -->
+        <util:ServiceConfig
+            FirstFailureActionType="restart"
+            SecondFailureActionType="restart"
+            ThirdFailureActionType="none"
+            RestartServiceDelayInSeconds="30"
+            ResetPeriodInDays="1" />
+      </ServiceInstall>
+      <ServiceControl
+          Id="BlackshardProtectionServiceControl"
+          Name="BlackshardProtectionService"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+    </Component>
+
+    <Component Id="LicenseComponent" Directory="INSTALLFOLDER" Guid="*">
+      <File
+          Id="BlackshardLicense"
+          Source="$(var.StageDir)\LICENSE.txt"
+          Name="LICENSE.txt"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="DriverInfComponent" Directory="DRIVERPACKAGEFOLDER" Guid="*">
+      <File
+          Id="BlackshardDriverInf"
+          Source="$(var.StageDir)\DriverPackage\blackshard.inf"
+          Name="blackshard.inf"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="DriverBinaryComponent" Directory="DRIVERPACKAGEFOLDER" Guid="*">
+      <File
+          Id="BlackshardDriverBinary"
+          Source="$(var.StageDir)\DriverPackage\blackshard.sys"
+          Name="blackshard.sys"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="DriverCatalogComponent" Directory="DRIVERPACKAGEFOLDER" Guid="*">
+      <File
+          Id="BlackshardDriverCatalog"
+          Source="$(var.StageDir)\DriverPackage\blackshard.cat"
+          Name="blackshard.cat"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="RuntimeDataDirectoriesComponent" Directory="BLACKSHARDDATAFOLDER" Guid="*">
+      <!--
+        The root permits authenticated users to read settings.json,
+        service-health.json, and history.jsonl but not create, replace, or
+        delete them. Sensitive children use protected DACLs so this read ACE
+        cannot leak into quarantine, updater staging, or private state.
+      -->
+      <CreateFolder>
+        <PermissionEx
+            Id="BlackshardDataRootAcl"
+            Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;AU)" />
+      </CreateFolder>
+      <CreateFolder Directory="DEFINITIONSFOLDER">
+        <PermissionEx
+            Id="BlackshardDefinitionsAcl"
+            Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;AU)" />
+      </CreateFolder>
+      <CreateFolder Directory="QUARANTINEFOLDER">
+        <PermissionEx
+            Id="BlackshardQuarantineAcl"
+            Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+      </CreateFolder>
+      <CreateFolder Directory="STATEFOLDER">
+        <PermissionEx
+            Id="BlackshardStateAcl"
+            Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+      </CreateFolder>
+      <CreateFolder Directory="LOGSFOLDER">
+        <PermissionEx
+            Id="BlackshardLogsAcl"
+            Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;AU)" />
+      </CreateFolder>
+      <CreateFolder Directory="UPDATESFOLDER">
+        <PermissionEx
+            Id="BlackshardUpdatesAcl"
+            Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+      </CreateFolder>
+      <CreateFolder Directory="UPDATESTAGINGFOLDER">
+        <PermissionEx
+            Id="BlackshardUpdateStagingAcl"
+            Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+      </CreateFolder>
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Blackshard"
+          Name="Installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="StartMenuShortcutComponent" Directory="PROGRAMMENUBLACKSHARDFOLDER" Guid="*">
+      <Shortcut
+          Id="BlackshardStartMenuShortcut"
+          Name="Blackshard"
+          Description="Open the Blackshard Windows client"
+          Target="[#BlackshardExecutable]"
+          WorkingDirectory="INSTALLFOLDER">
+        <!-- Must match notifications::APP_USER_MODEL_ID exactly. -->
+        <ShortcutProperty
+            Key="System.AppUserModel.ID"
+            Value="Blackshard.Security.Client" />
+      </Shortcut>
+      <RemoveFolder Id="RemoveProgramMenuBlackshardFolder" On="uninstall" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Blackshard"
+          Name="StartMenuShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+    </Component>
+
+    <!--
+      Services cannot display desktop notifications from session 0. Start one
+      hidden, single-instance broker in each interactive user's session and
+      let MSI ownership remove the registration during upgrade/uninstall.
+    -->
+    <Component Id="NotificationAgentAutostartComponent" Directory="INSTALLFOLDER" Guid="*">
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="BlackshardNotificationAgent"
+          Type="string"
+          Value="&quot;[#BlackshardExecutable]&quot; --notification-agent"
+          KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Complete" Title="Blackshard" Level="1">
+      <ComponentRef Id="AgentExecutableComponent" />
+      <ComponentRef Id="LicenseComponent" />
+      <ComponentRef Id="DriverInfComponent" />
+      <ComponentRef Id="DriverBinaryComponent" />
+      <ComponentRef Id="DriverCatalogComponent" />
+      <ComponentRef Id="RuntimeDataDirectoriesComponent" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+      <ComponentRef Id="NotificationAgentAutostartComponent" />
+    </Feature>
+
+    <!--
+      The same signed binary supplies narrow, non-interactive driver lifecycle
+      modes. Arguments are resolved exclusively from MSI-owned File rows; no
+      user-controlled command line is accepted. These type-18 actions must
+      remain after InstallFiles and before RemoveFiles respectively.
+
+      Helper contract: the executable accepts the install-driver or
+      uninstall-driver switch followed by the absolute INF path.
+
+      Return 0 only after the requested operation is complete. Every nonzero
+      exit is fatal because Return="check" is intentional.
+    -->
+    <CustomAction
+        Id="RollbackBlackshardDriverInstall"
+        FileRef="BlackshardExecutable"
+        ExeCommand="--uninstall-driver &quot;[#BlackshardDriverInf]&quot;"
+        Execute="rollback"
+        Impersonate="no"
+        Return="check"
+        HideTarget="yes" />
+    <CustomAction
+        Id="InstallBlackshardDriverPackage"
+        FileRef="BlackshardExecutable"
+        ExeCommand="--install-driver &quot;[#BlackshardDriverInf]&quot;"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check"
+        HideTarget="yes" />
+    <CustomAction
+        Id="RollbackBlackshardDriverUninstall"
+        FileRef="BlackshardExecutable"
+        ExeCommand="--install-driver &quot;[#BlackshardDriverInf]&quot;"
+        Execute="rollback"
+        Impersonate="no"
+        Return="check"
+        HideTarget="yes" />
+    <CustomAction
+        Id="UninstallBlackshardDriverPackage"
+        FileRef="BlackshardExecutable"
+        ExeCommand="--uninstall-driver &quot;[#BlackshardDriverInf]&quot;"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check"
+        HideTarget="yes" />
+
+    <InstallExecuteSequence>
+      <!-- Stop the user-mode service before attempting to unload its filter. -->
+      <Custom
+          Action="RollbackBlackshardDriverUninstall"
+          After="StopServices"
+          Condition="$DriverInfComponent = 2" />
+      <Custom
+          Action="UninstallBlackshardDriverPackage"
+          After="RollbackBlackshardDriverUninstall"
+          Condition="$DriverInfComponent = 2" />
+
+      <!-- Install the filter before InstallServices/StartServices run. -->
+      <Custom
+          Action="RollbackBlackshardDriverInstall"
+          After="InstallFiles"
+          Condition="NOT Installed AND $DriverInfComponent = 3" />
+      <Custom
+          Action="InstallBlackshardDriverPackage"
+          After="RollbackBlackshardDriverInstall"
+          Condition="$DriverInfComponent = 3 AND NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
