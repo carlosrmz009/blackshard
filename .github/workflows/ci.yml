@@ -26,6 +26,13 @@ jobs:
       - name: Build minifilter and development distribution
         shell: pwsh
         run: .\deploy.ps1
+      - name: Build one-click VM development installer
+        shell: pwsh
+        run: |
+          .\installer\build-development-vm-installer.ps1 `
+            -AgentPath .\dist\blackshard.exe `
+            -DriverPath .\dist\blackshard.sys `
+            -OutputDirectory .\dist
       - name: Upload development test package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

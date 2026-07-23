@@ -220,6 +220,8 @@ After installing a qualified build, open an elevated PowerShell in the repositor
 
 The root `deploy.ps1`, `install.ps1`, `enable-test-signing.ps1`, `disable-test-signing.ps1`, and `uninstall.ps1` scripts are **development tools for a disposable, snapshotted VM only**. They are not an alternative installer and must never be given to end users.
 
+Clean CI builds also emit `BlackshardVmSetup.exe`, a one-click **development VM installer** with a Blackshard-styled graphical progress/error interface. It bundles the agent and test minifilter, configures test-signing, resumes automatically after reboot, installs and verifies both services, repairs partial attempts, and registers uninstall. It refuses systems that Windows does not identify as virtual machines and does not weaken the production installer's signature gates. See [the testing guide](docs/TESTING.md#one-click-vm-setup).
+
 They use a placeholder altitude and may require Windows test-signing mode. Do not enable test signing, disable Secure Boot or Memory Integrity, install an unsigned driver, or add antivirus exclusions on a personal or production computer.
 
 In an isolated VM:

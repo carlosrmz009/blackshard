@@ -376,14 +376,17 @@ fn connection_loop(
             )
         };
         if connect_result != S_OK {
+            let error_text = hresult_text(connect_result);
+            log::error!("FilterConnectCommunicationPort failed: connect {error_text}");
             let _ = events.try_send(RealtimeEvent::Connection(
-                ProtectionConnection::Disconnected(hresult_text(connect_result)),
+                ProtectionConnection::Disconnected(format!("connect {error_text}")),
             ));
             interruptible_wait(&stop, Duration::from_secs(2));
             continue;
         }
 
         published_port.store(port_handle, Ordering::Release);
+        log::info!("Kernel real-time protection connected via FilterConnectCommunicationPort");
         let _ = history.append(&SecurityEvent::new(
             EventKind::ProtectionStarted,
             "Kernel real-time protection connected",
@@ -423,12 +426,15 @@ fn connection_loop(
                 )
             }));
         }
-
         let disconnect_reason = loop {
             if stop.load(Ordering::Acquire) {
                 break "real-time protection stopped".to_owned();
             }
-            let mut message = unsafe { mem::zeroed::<BlackshardMessage>() };
+
+            #[repr(C, align(16))]
+            struct AlignedMessage(BlackshardMessage);
+
+            let mut message = unsafe { mem::zeroed::<AlignedMessage>() };
             let get_result = unsafe {
                 FilterGetMessage(
                     port_handle,
@@ -438,9 +444,12 @@ fn connection_loop(
                 )
             };
             if get_result != S_OK {
-                break hresult_text(get_result);
+                let error_text = hresult_text(get_result);
+                log::error!("FilterGetMessage failed: get {error_text}");
+                break format!("get {error_text}");
             }
 
+            let message = message.0;
             if !valid_notification(&message.notification) {
                 let _ = reply(
                     port_handle,

@@ -560,24 +560,29 @@ mod windows_transport {
     ) {
         let mut first = true;
         while !stop.load(Ordering::Acquire) {
-            let pipe = match create_server_pipe() {
-                Ok(pipe) => {
-                    if first {
-                        let _ = ready.send(Ok(()));
-                        first = false;
+            let pipe = loop {
+                match create_server_pipe() {
+                    Ok(pipe) => break pipe,
+                    Err(error) => {
+                        if error.raw_os_error() == Some(5) {
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        let detail = format!("could not create protected local pipe: {error}");
+                        if first {
+                            let _ = ready.send(Err(detail));
+                        } else {
+                            append_rpc_error(&resources.history, &detail);
+                        }
+                        return;
                     }
-                    pipe
-                }
-                Err(error) => {
-                    let detail = format!("could not create protected local pipe: {error}");
-                    if first {
-                        let _ = ready.send(Err(detail));
-                    } else {
-                        append_rpc_error(&resources.history, &detail);
-                    }
-                    return;
                 }
             };
+
+            if first {
+                let _ = ready.send(Ok(()));
+                first = false;
+            }
 
             let connected = unsafe { ConnectNamedPipe(pipe.raw(), null_mut()) } != 0
                 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
@@ -618,20 +623,30 @@ mod windows_transport {
             }
 
             let response = match authorize_client(pipe.raw()) {
-                Ok(caller) => process_one_request(pipe.raw(), &resources, &caller),
-                Err(error) => Err(RpcFailure {
-                    code: RpcErrorCode::AccessDenied,
-                    message: format!("local client authentication failed: {error}"),
-                }),
+                Ok(caller) => {
+                    log::info!("IPC client connected and authorized: process {:?}", caller.sid);
+                    process_one_request(pipe.raw(), &resources, &caller)
+                }
+                Err(error) => {
+                    log::error!("IPC client authentication failed: {error}");
+                    Err(RpcFailure {
+                        code: RpcErrorCode::AccessDenied,
+                        message: format!("local client authentication failed: {error}"),
+                    })
+                }
             };
             if let Ok(envelope) = response {
                 let _ = write_json_frame(pipe.raw(), &envelope, MAX_RESPONSE_BYTES);
-                // Do not call FlushFileBuffers: it waits indefinitely for a
-                // misbehaving client to consume every response byte.
+                // Wait for the authenticated client to read the response and disconnect.
+                // This prevents the OS from discarding unread pipe data, without
+                // the infinite hang risk of FlushFileBuffers.
+                let mut dummy = [0u8; 1];
+                let _ = read_exact_until(pipe.raw(), &mut dummy, Instant::now() + IO_TIMEOUT);
             }
             unsafe {
                 DisconnectNamedPipe(pipe.raw());
             }
+            log::info!("IPC client disconnected");
         }
     }
 
@@ -1318,21 +1333,38 @@ mod windows_transport {
 
     fn connect_client() -> io::Result<OwnedHandle> {
         let name = wide(PIPE_NAME);
-        if unsafe { WaitNamedPipeW(name.as_ptr(), PIPE_DEFAULT_TIMEOUT_MS) } == 0 {
-            return Err(io::Error::last_os_error());
+        let deadline = Instant::now() + Duration::from_millis(PIPE_DEFAULT_TIMEOUT_MS as u64);
+        loop {
+            if unsafe { WaitNamedPipeW(name.as_ptr(), 500) } != 0 {
+                let handle = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        0,
+                        null(),
+                        OPEN_EXISTING,
+                        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                        0,
+                    )
+                };
+                if handle != INVALID_HANDLE_VALUE {
+                    return OwnedHandle::new(handle);
+                }
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(231) { // ERROR_PIPE_BUSY
+                    return Err(err);
+                }
+            } else {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(2) { // ERROR_FILE_NOT_FOUND
+                    return Err(err);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::last_os_error());
+            }
+            thread::sleep(Duration::from_millis(50));
         }
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                null(),
-                OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                0,
-            )
-        };
-        OwnedHandle::new(handle)
     }
 
     fn wake_listener() {

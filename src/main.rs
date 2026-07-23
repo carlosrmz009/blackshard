@@ -1,4 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 // Blackshard is intentionally a single binary with service, GUI, installer-helper,
 // and test-only subsystem entry points. Some public subsystem APIs are dormant in
 // any one build mode, so retain them while keeping every other warning fatal.
@@ -690,6 +689,8 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     if let Some(exit_code) = self_test_probe_exit_code() {
         std::process::exit(exit_code);
     }

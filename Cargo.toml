@@ -33,6 +33,8 @@ uuid = { version = "1.10", features = ["serde", "v4"] }
 walkdir = "2.5"
 yara-x = { version = "1.19.0", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp"] }
 zip = { version = "8.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+log = "0.4.33"
+env_logger = "0.11.11"
 
 [target.'cfg(windows)'.dependencies]
 winrt-notification = "0.5.1"

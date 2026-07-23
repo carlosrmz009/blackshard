@@ -22,6 +22,39 @@ function Test-BlackshardFilterLoaded {
     return ($filterOutput -match "(?im)^blackshard\s")
 }
 
+function Get-DriverLoadDiagnostics {
+    $lines = New-Object Collections.Generic.List[string]
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $destinationDriver
+        $lines.Add("Installed driver signature: $($signature.Status) - $($signature.StatusMessage)")
+    }
+    catch {
+        $lines.Add("Installed driver signature could not be inspected: $($_.Exception.Message)")
+    }
+
+    try {
+        $since = (Get-Date).AddMinutes(-5)
+        $events = Get-WinEvent -FilterHashtable @{ LogName = "System"; StartTime = $since } -ErrorAction Stop |
+            Where-Object {
+                $_.ProviderName -match "(?i)(FilterManager|Service Control Manager|CodeIntegrity)" -and
+                $_.Message -match "(?i)(blackshard|driver|filter)"
+            } |
+            Select-Object -First 8
+        foreach ($event in $events) {
+            $message = ([string]$event.Message -replace "\s+", " ").Trim()
+            $lines.Add("System event $($event.Id) [$($event.ProviderName)]: $message")
+        }
+    }
+    catch {
+        $lines.Add("Recent driver events could not be read: $($_.Exception.Message)")
+    }
+
+    if ($lines.Count -eq 0) {
+        return "No relevant Windows driver events were found in the last five minutes."
+    }
+    return $lines -join "`n"
+}
+
 function Remove-BlackshardInstallation {
     Write-Host "[*] Stopping Blackshard protection service..." -ForegroundColor Cyan
     & sc.exe stop $protectionServiceName 2>$null | Out-Host
@@ -98,40 +131,90 @@ if (Test-BlackshardFilterLoaded) {
 }
 & sc.exe stop $driverName 2>$null | Out-Host
 & sc.exe delete $driverName 2>$null | Out-Host
-Start-Sleep -Seconds 1
+
+# Wait for the SCM to fully remove the service. sc.exe delete only marks the
+# service for deletion; the actual registry key removal is deferred until all
+# handles are closed. If we create the new service too early, the deferred
+# cleanup can wipe out the Instances subkey we add for the minifilter, causing
+# fltmc load to fail with 0x800704db ("The specified service does not exist").
+$waitLimit = 20          # 20 × 500 ms = 10 seconds
+for ($i = 0; $i -lt $waitLimit; $i++) {
+    $query = & sc.exe query $driverName 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        # Service no longer exists in SCM — safe to proceed.
+        break
+    }
+    Start-Sleep -Milliseconds 500
+}
+if (Test-Path -LiteralPath $serviceRegistryPath) {
+    # The registry key is still present even though SCM says the service is
+    # gone (handles from a filter-manager reference, etc.). Force-remove it
+    # so the subsequent sc.exe create starts from a clean slate.
+    Remove-Item -LiteralPath $serviceRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+}
 
 Copy-Item -LiteralPath $sourceDriver -Destination $destinationDriver -Force
 
-$createOutput = & sc.exe create $driverName "type= filesys" "start= demand" "error= normal" "binPath= $destinationDriver" "group= FSFilter Anti-Virus" "depend= FltMgr" 2>&1
+$createCmd = 'sc.exe create "{0}" type= filesys start= demand error= normal binPath= "{1}" group= "FSFilter Anti-Virus" depend= FltMgr' -f $driverName, $destinationDriver
+$createOutput = & cmd.exe /c $createCmd 2>&1
 $createExitCode = $LASTEXITCODE
 $createOutput | Out-Host
 if ($createExitCode -ne 0) {
     throw "Could not create the Blackshard driver service (sc.exe exit code $createExitCode)."
 }
 
-New-Item -Path $serviceRegistryPath -Force | Out-Null
-New-ItemProperty -Path $serviceRegistryPath -Name "DebugFlags" -Value 0 -PropertyType DWord -Force | Out-Null
-New-ItemProperty -Path $serviceRegistryPath -Name "SupportedFeatures" -Value 3 -PropertyType DWord -Force | Out-Null
+if (-not (Test-Path -LiteralPath $serviceRegistryPath)) {
+    New-Item -Path $serviceRegistryPath -Force | Out-Null
+}
 
-$instancesPath = Join-Path $serviceRegistryPath "Instances"
-$instancePath = Join-Path $instancesPath "blackshard Instance"
-New-Item -Path $instancesPath -Force | Out-Null
-New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
-New-Item -Path $instancePath -Force | Out-Null
-# Development-only placeholder. A production package must use the unique
-# altitude assigned to Blackshard by Microsoft and install its signed INF/CAT
-# through the Driver Store instead of this development script.
-New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
-New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
+# Minifilter instance registration. Some Windows builds read the instances
+# from Services\<name>\Instances (the "legacy" layout) while others read from
+# Services\<name>\Parameters\Instances (the INF-standard layout populated by
+# DiInstallDriverW).  The production Rust installer covers both paths; this
+# development script must do the same.
+$instanceLayouts = @(
+    (Join-Path $serviceRegistryPath "Instances"),
+    (Join-Path $serviceRegistryPath "Parameters\Instances")
+)
+foreach ($instancesPath in $instanceLayouts) {
+    $instancePath = Join-Path $instancesPath "blackshard Instance"
+    New-Item -Path $instancesPath -Force | Out-Null
+    New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
+    New-Item -Path $instancePath -Force | Out-Null
+    # Development-only placeholder. A production package must use the unique
+    # altitude assigned to Blackshard by Microsoft and install its signed INF/CAT
+    # through the Driver Store instead of this development script.
+    New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
+}
+
+# Parameters-level driver settings (matching the INF's AddRegistry section).
+$parametersPath = Join-Path $serviceRegistryPath "Parameters"
+New-Item -Path $parametersPath -Force | Out-Null
+New-ItemProperty -Path $parametersPath -Name "DebugFlags" -Value 0 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $parametersPath -Name "SupportedFeatures" -Value 3 -PropertyType DWord -Force | Out-Null
 
 Write-Host "[*] Loading Blackshard minifilter..." -ForegroundColor Cyan
+
+# Capture a registry snapshot before the load attempt so failures are
+# diagnosable from the log alone.
+$registryDump = & reg.exe query "HKLM\System\CurrentControlSet\Services\$driverName" /s 2>&1
+$registryDump | Out-Host
+
 $loadOutput = & fltmc.exe load $driverName 2>&1
 $loadExitCode = $LASTEXITCODE
 $loadOutput | Out-Host
 if ($loadExitCode -ne 0) {
+    $loadMessage = ($loadOutput | Out-String).Trim()
+    $diagnostics = Get-DriverLoadDiagnostics
+    $regDump = ($registryDump | Out-String).Trim()
     throw @"
 The service was installed, but Windows refused to load the minifilter (fltmc exit code $loadExitCode).
-Check driver signing, Secure Boot/test-signing configuration, and the System event log.
+fltmc output: $loadMessage
+$diagnostics
+Service registry state:
+$regDump
 "@
 }
 
@@ -140,21 +223,17 @@ if (-not (Test-BlackshardFilterLoaded)) {
 }
 
 Write-Host "[*] Installing Blackshard protection service..." -ForegroundColor Cyan
-$serviceCommand = '"{0}" --service' -f $destinationAgent
-$serviceOutput = & sc.exe create $protectionServiceName "type= own" "start= auto" "error= normal" "obj= LocalSystem" "binPath= $serviceCommand" 2>&1
-$serviceExitCode = $LASTEXITCODE
-$serviceOutput | Out-Host
-if ($serviceExitCode -ne 0) {
-    throw "Could not create the Blackshard protection service (sc.exe exit code $serviceExitCode)."
-}
-& sc.exe description $protectionServiceName "Blackshard real-time protection and quarantine service" | Out-Host
+$null = New-Service `
+    -Name $protectionServiceName `
+    -BinaryPathName $destinationAgent `
+    -StartupType Automatic `
+    -Description "Blackshard real-time protection and quarantine service"
+
+$serviceCommand = "`"$destinationAgent`" --service"
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$protectionServiceName" -Name ImagePath -Value $serviceCommand -Type ExpandString
+
 & sc.exe failure $protectionServiceName "reset= 86400" "actions= restart/30000/restart/30000/none/0" | Out-Host
-$startOutput = & sc.exe start $protectionServiceName 2>&1
-$startExitCode = $LASTEXITCODE
-$startOutput | Out-Host
-if ($startExitCode -ne 0) {
-    throw "Could not start the Blackshard protection service (sc.exe exit code $startExitCode)."
-}
+Start-Service -Name $protectionServiceName
 
 $serviceRunning = $false
 for ($attempt = 0; $attempt -lt 20; $attempt++) {

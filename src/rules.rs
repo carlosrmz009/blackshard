@@ -12,6 +12,13 @@ rule Blackshard_EICAR_Test_File {
         filesize == 68 and $eicar at 0
 }
 
+rule Blackshard_Harmless_Self_Test {
+    strings:
+        $v2 = "BLACKSHARD-HARMLESS-SELF-TEST-V2" ascii
+    condition:
+        $v2 at 0
+}
+
 rule Blackshard_PowerShell_Obfuscated_Download_Execute {
     strings:
         $ps1 = "powershell" ascii wide nocase
@@ -190,6 +197,13 @@ fn builtin_policies() -> HashMap<String, RulePolicy> {
             100,
             "EICAR-Test-File",
             "matched the industry-standard harmless antivirus test file",
+        ),
+        (
+            "Blackshard_Harmless_Self_Test",
+            RuleDisposition::Malicious,
+            100,
+            "Blackshard-Self-Test",
+            "matched the internal Blackshard harmless protection test payload",
         ),
         (
             "Blackshard_PowerShell_Obfuscated_Download_Execute",

@@ -51,6 +51,23 @@ Use an x64 VM with no personal accounts, credentials, secrets, shared clipboard,
 
 Copy the complete `dist` directory into the clean VM before introducing samples. In an elevated PowerShell:
 
+### One-click VM setup
+
+The CI development artifact contains `BlackshardVmSetup.exe`. This development-only installer bundles the UI/engine, LocalSystem service, and minifilter. It refuses to run when Windows does not identify the system as a virtual machine. Before launching it:
+
+1. Take a powered-off clean snapshot.
+2. Disconnect the VM from the host, LAN, and Internet and disable every host integration.
+3. Disable Secure Boot in the **VM firmware settings**. Do not change the host's Secure Boot setting.
+4. Double-click `BlackshardVmSetup.exe`, approve its administrator prompt, confirm the isolation checkbox, and select **Install full protection**. The Blackshard-styled setup window keeps PowerShell hidden, shows every installation phase, retains failures in its activity log, and supports retrying a partial installation.
+
+Setup creates and trusts a VM-local development certificate, test-signs the bundled driver, enables Windows test-signing, and schedules setup to resume during the required reboot. It restarts the VM after a 15-second warning. After boot, the scheduled SYSTEM task installs and starts the driver and protection service, runs `verify.ps1 -DevelopmentVm`, creates a Start-menu shortcut, registers an uninstaller, and opens Blackshard at the next sign-in. Setup logs are written to `C:\ProgramData\BlackshardDevelopmentInstaller\setup.log`. Pre-staging failures are also retained in `%TEMP%\BlackshardVmSetup.log`; interactive failures remain visible in a message box instead of disappearing with a console window.
+
+This installer is intentionally unsigned and is not a public release installer. Never run it on a physical or personal machine. Remove it from **Installed apps** when testing is complete, then reboot to finish leaving test-signing mode.
+
+### Manual setup and troubleshooting
+
+The equivalent manual sequence remains available when diagnosing installer or boot-resume failures:
+
 ```powershell
 .\enable-test-signing.ps1
 # Reboot.

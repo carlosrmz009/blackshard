@@ -397,6 +397,7 @@ mod windows_service_host {
         F: FnMut(BodyState) -> Result<(), String>,
     {
         report_state(BodyState::StartPending)?;
+        log::info!("Blackshard service is starting");
 
         let health_path = default_service_health_path();
         let started_at = Utc::now();
@@ -425,6 +426,7 @@ mod windows_service_host {
             Ok(engine) => new_shared_detection_engine(engine),
             Err(error) => {
                 let message = format!("Detection engine initialization failed: {error}");
+                log::error!("{message}");
                 snapshot.lifecycle = ServiceLifecycle::Stopped;
                 snapshot.connection = ServiceConnection::Stopped;
                 snapshot.updated_at = Utc::now();
