@@ -663,6 +663,8 @@ mod tests {
                 version: "embedded-test".to_owned(),
             },
             counters: service::ServiceCounters::default(),
+            clamav_engine_version: Some("ClamAV test".to_owned()),
+            clamav_database_version: Some("1".to_owned()),
         };
 
         apply_service_health(&runtime, health);
@@ -693,6 +695,8 @@ mod tests {
                 version: "embedded-test".to_owned(),
             },
             counters: service::ServiceCounters::default(),
+            clamav_engine_version: Some("ClamAV test".to_owned()),
+            clamav_database_version: Some("1".to_owned()),
         };
 
         apply_service_health(&runtime, health);

@@ -71,6 +71,41 @@ impl NativeIndex {
         Ok(())
     }
 
+    /// Load the SHA-256 hash databases unpacked from an authenticated ClamAV
+    /// generation. MD5 `.hdb` records are intentionally not promoted into the
+    /// SHA-256 exact-match path.
+    pub fn load_from_directory<P: AsRef<Path>>(&mut self, root: P) -> io::Result<usize> {
+        let before = self.signatures.len();
+        for entry in walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .max_depth(3)
+            .into_iter()
+        {
+            let entry = entry.map_err(io::Error::other)?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let extension = entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if matches!(extension, "hsb" | "hsu") {
+                self.load_from_file(entry.path())?;
+            }
+        }
+        self.sort_index();
+        Ok(self.signatures.len() - before)
+    }
+
+    pub fn len(&self) -> usize {
+        self.signatures.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.signatures.is_empty()
+    }
+
     /// Sorts the internal signature list to enable fast lookups.
     pub fn sort_index(&mut self) {
         self.signatures.sort_by(|a, b| a.hash.cmp(&b.hash));
@@ -132,5 +167,28 @@ impl NativeIndex {
             // If the signature needs a specific size but file size is unknown, it's not a match
             (Some(_), None) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn loads_only_sha256_database_extensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let digest = "11".repeat(32);
+        let mut hsb = File::create(directory.path().join("daily.hsb")).unwrap();
+        writeln!(hsb, "{digest}:4:Test.Signature").unwrap();
+        let mut hdb = File::create(directory.path().join("main.hdb")).unwrap();
+        writeln!(hdb, "{}:4:Legacy.Md5", "22".repeat(16)).unwrap();
+
+        let mut index = NativeIndex::new();
+        assert_eq!(index.load_from_directory(directory.path()).unwrap(), 1);
+        assert_eq!(
+            index.evaluate(&hex::decode(digest).unwrap(), Some(4)),
+            Some("Test.Signature")
+        );
     }
 }

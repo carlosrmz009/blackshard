@@ -1,6 +1,7 @@
 /target/
 /fuzz/target/
 /dist/
+/build/
 /src/x64/
 /src/driver/x64/
 /installer/**/bin/

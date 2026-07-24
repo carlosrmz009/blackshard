@@ -1445,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn externally_defined_yara_can_report_malicious_but_cannot_auto_quarantine() {
+    fn externally_defined_yara_is_alert_only_even_when_labelled_malicious() {
         let directory = tempfile::tempdir().unwrap();
         let store = DefinitionStore::new(directory.path()).unwrap();
         stage(
@@ -1460,6 +1460,7 @@ mod tests {
         let report = outcome.engine.scan_bytes(b"blackshard-external-marker");
         assert_eq!(report.verdict, DetectionVerdict::Malicious);
         assert!(!report.should_quarantine());
+        assert!(!report.should_block());
         assert!(!report.automatic_quarantine_eligible);
         assert_eq!(report.threat_name.as_deref(), Some("Test.External.Yara"));
     }

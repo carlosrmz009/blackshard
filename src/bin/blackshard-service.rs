@@ -16,6 +16,9 @@ const UNINSTALL_DRIVER_ARGUMENT: &str = "--uninstall-driver";
 const NOTIFICATION_AGENT_ARGUMENT: &str = "--notification-agent";
 const CLAMAV_WORKER_ARGUMENT: &str = "--clamav-worker";
 const PARSER_WORKER_ARGUMENT: &str = "--parser-worker";
+const FRESHCLAM_UPDATE_ARGUMENT: &str = "--freshclam-update";
+const CLAMAV_SCAN_ARGUMENT: &str = "--clamav-scan";
+const CLAMAV_HEALTH_ARGUMENT: &str = "--clamav-health";
 const VALIDATE_RELEASE_CONFIGURATION_ARGUMENT: &str = "--validate-release-configuration";
 const VERIFY_DEFINITION_UPDATE_ARGUMENT: &str = "--verify-definition-update";
 const EVALUATE_CORPUS_ARGUMENT: &str = "--evaluate-corpus";
@@ -396,6 +399,43 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(NOTIFICATION_AGENT_ARGUMENT) => notification_agent::run().map_err(Into::into),
         Some(CLAMAV_WORKER_ARGUMENT) => clamav_worker::run_worker_process().map_err(Into::into),
         Some(PARSER_WORKER_ARGUMENT) => parser_worker::run_worker_process().map_err(Into::into),
+        Some(FRESHCLAM_UPDATE_ARGUMENT) => {
+            let destination = std::env::args_os()
+                .nth(2)
+                .map(std::path::PathBuf::from)
+                .ok_or("usage: blackshard-service --freshclam-update <Blackshard data path>")?;
+            let active = freshclam::downloader::download_databases(&destination)?;
+            println!(
+                "Activated ClamAV generation {} version {} at {}",
+                active.generation,
+                active.version,
+                active.path.display()
+            );
+            Ok(())
+        }
+        Some(CLAMAV_SCAN_ARGUMENT) => {
+            let path = std::env::args_os()
+                .nth(2)
+                .map(std::path::PathBuf::from)
+                .ok_or("usage: blackshard-service --clamav-scan <file>")?;
+            let mut worker = clamav_worker::ClamAvWorker::new()?;
+            worker.health_check()?;
+            let verdict = worker.scan_path(
+                path.to_str()
+                    .ok_or("the ClamAV diagnostic path is not valid Unicode")?,
+            )?;
+            println!("{verdict:?}");
+            Ok(())
+        }
+        Some(CLAMAV_HEALTH_ARGUMENT) => {
+            let mut worker = clamav_worker::ClamAvWorker::new()?;
+            let versions = worker.health_check()?;
+            println!(
+                "ClamAV worker {} loaded database {} and detected its inert EICAR self-test.",
+                versions.engine_version, versions.database_version
+            );
+            Ok(())
+        }
         _ => Err("UI mode is not supported in this build".into()),
     }
 }

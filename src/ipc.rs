@@ -170,6 +170,7 @@ pub enum RpcErrorCode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreshClamStatusView {
+    pub engine_version: String,
     pub database_version: String,
     pub database_age_hours: u64,
 }
@@ -1447,12 +1448,44 @@ mod windows_transport {
             RpcCommand::CheckForUpdates => Ok(RpcResponse::Acknowledged {
                 message: "Update check queued.".to_owned(),
             }),
-            RpcCommand::GetFreshClamStatus => Ok(RpcResponse::FreshClamStatus {
-                status: FreshClamStatusView {
-                    database_version: "daily.cvd".to_owned(),
-                    database_age_hours: 0,
-                },
-            }),
+            RpcCommand::GetFreshClamStatus => {
+                let data_root = std::env::var_os("PROGRAMDATA")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+                    .join("Blackshard");
+                let active =
+                    crate::freshclam::downloader::active_database(&data_root).map_err(|error| {
+                        RpcFailure {
+                            code: RpcErrorCode::NotConfigured,
+                            message: format!(
+                                "no authenticated FreshClam database is active: {error}"
+                            ),
+                        }
+                    })?;
+                let age = chrono::Utc::now()
+                    .signed_duration_since(active.activated_at)
+                    .num_hours()
+                    .max(0) as u64;
+                Ok(RpcResponse::FreshClamStatus {
+                    status: FreshClamStatusView {
+                        engine_version: resources
+                            .engine
+                            .read()
+                            .map_err(|_| RpcFailure {
+                                code: RpcErrorCode::Internal,
+                                message: "detection engine state is unavailable".to_owned(),
+                            })?
+                            .clamav_worker_health()
+                            .map_err(|error| RpcFailure {
+                                code: RpcErrorCode::NotConfigured,
+                                message: error,
+                            })?
+                            .engine_version,
+                        database_version: active.version,
+                        database_age_hours: age,
+                    },
+                })
+            }
         }
     }
 

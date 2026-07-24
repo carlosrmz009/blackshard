@@ -9,10 +9,11 @@ Blackshard's target is measurable protection quality competitive with leading co
 3. Signed bottom-k similarity profiles look for close PE-family variants with fixed memory and linear sampled work. Size gating avoids computing a sketch when no profile could match.
 4. Built-in and authenticated YARA-X rules evaluate semantic byte/string relationships under source, count, and time limits.
 5. Eligible script, Office, or rule-selected content is submitted to the installed Windows AMSI provider.
-6. Independent signals are fused conservatively. Only exact trusted hashes can currently authorize quarantine; AMSI can deny execution; similarity, YARA, and heuristics remain reversible/advisory.
-7. Match-rate circuit breakers suppress an external YARA or similarity generation whose observed prevalence exceeds its safety envelope.
-8. ZIP/OOXML, Gzip, OLE/VBA, and active PDF content are inspected within shared expansion and time budgets; embedded high-confidence detections propagate to the outer container.
-9. Protected write, rename, and delete telemetry is correlated per stable process identity. Separate Authenticode trust tiers reduce false positives; audit mode precedes any block-mode rollout.
+6. Authenticated FreshClam CVD/CLD generations feed both a native SHA-256 index and a bounded full-engine ClamAV worker. The service duplicates the already-open file handle into the worker so pathname replacement cannot substitute another object.
+7. Independent signals are fused conservatively. Only Blackshard's trusted exact hashes currently authorize automatic quarantine; ClamAV and AMSI can deny execution; publisher YARA, similarity, and heuristics remain reversible/advisory.
+8. Match-rate circuit breakers suppress an external YARA or similarity generation whose observed prevalence exceeds its safety envelope.
+9. ZIP/OOXML, Gzip, OLE/VBA, and active PDF content are inspected within shared expansion and time budgets; structured candidates must also pass an isolated parser worker health/scan boundary.
+10. Protected write, rename, and delete telemetry is correlated per stable process identity. Separate Authenticode trust tiers reduce false positives; a bounded kernel-side entropy class now participates in write/rename correlation, and audit mode precedes any block-mode rollout.
 
 ## Why the adaptive layer is not called “AI malware conviction”
 
@@ -23,7 +24,7 @@ A future learned PE model must be distributed as signed, versioned data; expose 
 ## External intelligence
 
 - Blackshard's Ed25519-signed online bundle is the only direct client trust path.
-- FreshClam-verified ClamAV SHA-256 databases can be imported as reviewed legacy intelligence. The resident ClamAV engine is not embedded, avoiding a second large always-running scanner and unresolved GPLv2 linking/distribution complexity.
+- The development package pins the official ClamAV runtime by archive SHA-256. Official `freshclam` and `sigtool` verify and atomically activate versioned databases. One `clamd` child remains resident inside the worker job so definitions are compiled once; Blackshard streams bytes from the identity-validated open handle using `INSTREAM` instead of exposing a replaceable pathname.
 - YARA Forge core releases are useful upstream material, not automatic policy. Each included subset needs provenance/license review, YARA-X compilation, policy assignment, match-rate analysis, and clean-corpus qualification.
 - Public multi-engine or sample-upload services are not silently queried. Uploading user files creates privacy, confidentiality, API-license, availability, and attacker-oracle risks.
 

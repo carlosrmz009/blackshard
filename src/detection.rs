@@ -1,16 +1,17 @@
 use crate::amsi::{AmsiScanReport, AmsiScanner};
 use crate::archive::{inspect_gzip, inspect_ole, inspect_zip, ContainerInspection};
-use crate::clamav_worker::{protocol::ScanVerdict, ClamAvWorker};
+use crate::clamav_worker::{protocol::ScanVerdict, ClamAvVersions, ClamAvWorker};
 use crate::definitions::{DefinitionMatchRateCircuitBreaker, DefinitionMatchRateState};
 use crate::engine::{ContentType, ScanEngine, ScanReport, Verdict as StaticVerdict};
 use crate::freshclam::native_index::NativeIndex;
-use crate::rules::{RuleDisposition, RuleEngine, RuleMatch};
+use crate::parser_worker::{protocol::ParseResult, ParserWorker};
+use crate::rules::{RuleDisposition, RuleEnforcementAuthority, RuleEngine, RuleMatch};
 use crate::similarity::{SimilarityEngine, SimilarityMatch};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,9 @@ pub struct DetectionReport {
     /// An AMSI initialization/provider failure is diagnostic only. The primary
     /// engines continue to produce an independent verdict.
     pub amsi_error: Option<String>,
+    /// Full sidecar outcome. Clean, error, and intentionally not-scanned are
+    /// distinct and never inferred from the aggregate verdict.
+    pub clamav_verdict: Option<ScanVerdict>,
     pub elapsed: Duration,
     pub from_cache: bool,
     pub error: Option<String>,
@@ -87,6 +91,7 @@ impl DetectionReport {
             container_inspection: None,
             amsi_report: None,
             amsi_error: None,
+            clamav_verdict: None,
             elapsed,
             from_cache: false,
             error: Some(message.into()),
@@ -116,6 +121,7 @@ impl DetectionReport {
             container_inspection: None,
             amsi_report: None,
             amsi_error: None,
+            clamav_verdict: None,
             elapsed,
             from_cache: false,
             error: None,
@@ -133,8 +139,10 @@ pub struct DetectionEngine {
     amsi_initialization_error: Option<String>,
     external_rule_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
     external_similarity_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
-    native_index: Arc<NativeIndex>,
+    clamav_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
+    native_index: Arc<RwLock<NativeIndex>>,
     clamav_worker: Mutex<Option<ClamAvWorker>>,
+    parser_worker: Mutex<Option<ParserWorker>>,
 }
 
 impl DetectionEngine {
@@ -153,14 +161,56 @@ impl DetectionEngine {
             external_similarity_circuit_breaker: Mutex::new(
                 DefinitionMatchRateCircuitBreaker::default(),
             ),
-            native_index: Arc::new(NativeIndex::new()),
+            clamav_circuit_breaker: Mutex::new(DefinitionMatchRateCircuitBreaker::default()),
+            native_index: shared_native_index(),
             clamav_worker: Mutex::new(ClamAvWorker::new().ok()),
+            parser_worker: Mutex::new(ParserWorker::new().ok()),
         }
     }
 
     pub fn with_similarity(mut self, similarity: SimilarityEngine) -> Self {
         self.similarity = similarity;
         self
+    }
+
+    pub fn with_native_index(mut self, native_index: NativeIndex) -> Self {
+        self.replace_native_index(native_index);
+        self.native_index = shared_native_index();
+        self
+    }
+
+    pub fn replace_native_index(&self, native_index: NativeIndex) {
+        if let Ok(mut active) = self.native_index.write() {
+            *active = native_index;
+        }
+    }
+
+    pub fn reset_clamav_circuit_breaker(&self) {
+        if let Ok(mut breaker) = self.clamav_circuit_breaker.lock() {
+            breaker.reset_for_new_sequence();
+        }
+    }
+
+    pub fn clamav_worker_healthy(&self) -> bool {
+        self.clamav_worker_health().is_ok()
+    }
+
+    pub fn clamav_worker_health(&self) -> Result<ClamAvVersions, String> {
+        self.clamav_worker
+            .lock()
+            .map_err(|_| "ClamAV worker lock is poisoned".to_owned())?
+            .as_mut()
+            .ok_or_else(|| "ClamAV worker is unavailable".to_owned())?
+            .health_check()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn parser_worker_healthy(&self) -> bool {
+        self.parser_worker
+            .lock()
+            .ok()
+            .and_then(|mut worker| worker.as_mut().map(ParserWorker::health_check))
+            .is_some_and(|result| result.is_ok())
     }
 
     pub fn builtin() -> Result<Self, String> {
@@ -265,26 +315,111 @@ impl DetectionEngine {
         let static_report = self.static_engine.scan_sample(&sample, declared_size);
         let static_duration = static_start.elapsed();
 
+        if requires_isolated_parser(static_report.content_type) {
+            let parser_result = self.parser_worker.lock().ok().and_then(|mut worker| {
+                worker
+                    .as_mut()
+                    .map(|worker| worker.scan_handle(file.as_raw_handle() as u64))
+            });
+            match parser_result {
+                Some(Ok(ParseResult::Error(error))) => {
+                    return DetectionReport::error(
+                        format!("isolated parser rejected the candidate: {error}"),
+                        started.elapsed(),
+                    )
+                }
+                Some(Err(error)) => {
+                    return DetectionReport::error(
+                        format!("isolated parser worker is unavailable: {error}"),
+                        started.elapsed(),
+                    )
+                }
+                None => {
+                    return DetectionReport::error(
+                        "isolated parser worker is unavailable",
+                        started.elapsed(),
+                    )
+                }
+                _ => {}
+            }
+        }
+
         let freshclam_start = Instant::now();
         let mut freshclam_threat = None;
         if let Some(sha256_hex) = &static_report.sha256 {
             if let Ok(hash_bytes) = hex::decode(sha256_hex) {
-                freshclam_threat = self
-                    .native_index
-                    .evaluate(&hash_bytes, Some(declared_size))
-                    .map(|s| s.to_owned());
+                freshclam_threat = self.native_index.read().ok().and_then(|index| {
+                    index
+                        .evaluate(&hash_bytes, Some(declared_size))
+                        .map(str::to_owned)
+                });
             }
         }
         let freshclam_duration = freshclam_start.elapsed();
 
         let clamav_start = Instant::now();
         let mut clamav_threat = None;
-        if let Ok(mut worker_lock) = self.clamav_worker.lock() {
-            if let Some(worker) = worker_lock.as_mut() {
-                if let Ok(ScanVerdict::Malicious) = worker.scan_handle(file.as_raw_handle() as u64)
-                {
-                    clamav_threat = Some("ClamAV.Malware".to_owned());
+        let clamav_verdict;
+        let clamav_result = self.clamav_worker.lock().ok().and_then(|mut worker| {
+            worker
+                .as_mut()
+                .map(|worker| worker.scan_handle(file.as_raw_handle() as u64))
+        });
+        match clamav_result {
+            Some(Ok(verdict @ ScanVerdict::Clean { .. })) => {
+                if let Ok(mut breaker) = self.clamav_circuit_breaker.lock() {
+                    let _ = breaker.observe_external_match(false);
                 }
+                clamav_verdict = verdict;
+            }
+            Some(Ok(verdict @ ScanVerdict::Detected { .. })) => {
+                let tripped = self
+                    .clamav_circuit_breaker
+                    .lock()
+                    .map(|mut breaker| {
+                        matches!(
+                            breaker.observe_external_match(true),
+                            DefinitionMatchRateState::Tripped { .. }
+                        )
+                    })
+                    .unwrap_or(true);
+                if tripped {
+                    log::error!(
+                        "ClamAV detection-rate circuit breaker tripped; sidecar enforcement suppressed"
+                    );
+                    clamav_verdict = ScanVerdict::NotScanned {
+                        reason: "ClamAV detection-rate circuit breaker tripped".to_owned(),
+                    };
+                } else {
+                    if let ScanVerdict::Detected { signature, .. } = &verdict {
+                        clamav_threat = Some(signature.clone());
+                    }
+                    clamav_verdict = verdict;
+                }
+            }
+            Some(Ok(verdict @ ScanVerdict::Suspicious)) => {
+                clamav_verdict = verdict;
+                log::warn!("ClamAV returned an unsupported ambiguous verdict");
+            }
+            Some(Ok(verdict @ ScanVerdict::NotScanned { .. })) => {
+                clamav_verdict = verdict;
+            }
+            Some(Ok(verdict @ ScanVerdict::Error(_))) => {
+                let ScanVerdict::Error(error) = &verdict else {
+                    unreachable!()
+                };
+                log::warn!("ClamAV scan failed; other engines remain active: {error}");
+                clamav_verdict = verdict;
+            }
+            Some(Err(error)) => {
+                log::warn!("ClamAV worker communication failed: {error}");
+                clamav_verdict = ScanVerdict::Error(error.to_string());
+            }
+            None => {
+                log::warn!("ClamAV worker is unavailable; other engines remain active");
+                clamav_verdict = ScanVerdict::NotScanned {
+                    reason: "ClamAV worker is unavailable".to_owned(),
+                };
             }
         }
         let clamav_duration = clamav_start.elapsed();
@@ -309,6 +444,7 @@ impl DetectionEngine {
                     container_inspection: None,
                     amsi_report: None,
                     amsi_error: None,
+                    clamav_verdict: Some(clamav_verdict),
                     elapsed: started.elapsed(),
                     from_cache: false,
                     error: Some(error),
@@ -329,7 +465,7 @@ impl DetectionEngine {
         let amsi_duration = amsi_start.elapsed();
 
         log::info!(
-            "EvidenceCascade metrics: Static: {:?}, FreshClam: {:?}, ClamAV: {:?}, YARA: {:?}, ML(Similarity): {:?}, AMSI: {:?}",
+            "EvidenceCascade metrics: Static: {:?}, FreshClam: {:?}, ClamAV: {:?}, YARA: {:?}, Similarity: {:?}, AMSI: {:?}",
             static_duration, freshclam_duration, clamav_duration, yara_duration, ml_duration, amsi_duration
         );
 
@@ -343,7 +479,8 @@ impl DetectionEngine {
             amsi_error,
         };
 
-        let report = cascade.resolve(started.elapsed());
+        let mut report = cascade.resolve(started.elapsed());
+        report.clamav_verdict = Some(clamav_verdict);
         self.with_container_inspection(&sample, report, started)
     }
 
@@ -365,10 +502,11 @@ impl DetectionEngine {
         let mut freshclam_threat = None;
         if let Some(sha256_hex) = &static_report.sha256 {
             if let Ok(hash_bytes) = hex::decode(sha256_hex) {
-                freshclam_threat = self
-                    .native_index
-                    .evaluate(&hash_bytes, Some(bytes.len() as u64))
-                    .map(|s| s.to_owned());
+                freshclam_threat = self.native_index.read().ok().and_then(|index| {
+                    index
+                        .evaluate(&hash_bytes, Some(bytes.len() as u64))
+                        .map(str::to_owned)
+                });
             }
         }
         let freshclam_duration = freshclam_start.elapsed();
@@ -392,7 +530,7 @@ impl DetectionEngine {
                 let amsi_duration = amsi_start.elapsed();
 
                 log::info!(
-                    "EvidenceCascade metrics (leaf): Static: {:?}, FreshClam: {:?}, YARA: {:?}, ML: {:?}, AMSI: {:?}",
+                    "EvidenceCascade metrics (leaf): Static: {:?}, FreshClam: {:?}, YARA: {:?}, Similarity: {:?}, AMSI: {:?}",
                     static_duration, freshclam_duration, yara_duration, ml_duration, amsi_duration
                 );
 
@@ -405,7 +543,11 @@ impl DetectionEngine {
                     amsi_report,
                     amsi_error,
                 };
-                cascade.resolve(started.elapsed())
+                let mut report = cascade.resolve(started.elapsed());
+                report.clamav_verdict = Some(ScanVerdict::NotScanned {
+                    reason: "in-memory leaf scan is handled by native engines".to_owned(),
+                });
+                report
             }
             Err(error) => DetectionReport {
                 verdict: DetectionVerdict::Error,
@@ -423,6 +565,9 @@ impl DetectionEngine {
                 container_inspection: None,
                 amsi_report: None,
                 amsi_error: None,
+                clamav_verdict: Some(ScanVerdict::NotScanned {
+                    reason: "YARA processing failed before sidecar routing".to_owned(),
+                }),
                 elapsed: started.elapsed(),
                 from_cache: false,
                 error: Some(error),
@@ -603,6 +748,21 @@ fn read_bounded(reader: &mut File, limit: usize) -> io::Result<(Vec<u8>, bool)> 
         bytes.truncate(limit);
     }
     Ok((bytes, observed_extra))
+}
+
+fn requires_isolated_parser(content_type: ContentType) -> bool {
+    matches!(
+        content_type,
+        ContentType::Pe32
+            | ContentType::Pe64
+            | ContentType::PeUnknown
+            | ContentType::Pdf
+            | ContentType::Zip
+            | ContentType::Gzip
+            | ContentType::SevenZip
+            | ContentType::Rar
+            | ContentType::OleCompound
+    )
 }
 
 #[cfg(windows)]
@@ -787,7 +947,7 @@ impl EvidenceCascade {
             risk_score = rule.risk_score.max(95);
             confidence = 99;
             threat_name = Some(rule.threat_name.clone());
-            block_eligible = true;
+            block_eligible = rule.enforcement_authority == RuleEnforcementAuthority::ExecutionDeny;
         } else if amsi_policy_block {
             verdict = DetectionVerdict::Suspicious;
             risk_score = 90;
@@ -838,7 +998,7 @@ impl EvidenceCascade {
                 && self.static_report.verdict == StaticVerdict::Clean
             {
                 log::info!(
-                    "ML Model Shadow Mode: hold for deeper analysis. Threat: {:?}",
+                    "Similarity shadow mode: hold for deeper analysis. Threat: {:?}",
                     threat_name
                 );
             }
@@ -861,12 +1021,18 @@ impl EvidenceCascade {
             container_inspection: None,
             amsi_report: self.amsi_report,
             amsi_error: self.amsi_error,
+            clamav_verdict: None,
             elapsed,
             from_cache: false,
             automatic_quarantine_eligible,
             execution_block_eligible: block_eligible,
         }
     }
+}
+
+fn shared_native_index() -> Arc<RwLock<NativeIndex>> {
+    static SHARED: OnceLock<Arc<RwLock<NativeIndex>>> = OnceLock::new();
+    Arc::clone(SHARED.get_or_init(|| Arc::new(RwLock::new(NativeIndex::new()))))
 }
 
 fn shared_system_amsi() -> Result<Arc<AmsiScanner>, String> {

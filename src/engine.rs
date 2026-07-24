@@ -76,7 +76,8 @@ pub enum ContentType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisCompleteness {
     Complete,
-    CompleteHashPartialStructure,
+    /// Only the configured prefix was read. No complete-file digest exists.
+    PrefixOnly,
     PrefixAndTargetedRegions,
     ResourceLimitReached,
     ChangedDuringScan,
@@ -120,8 +121,8 @@ pub struct ScanReport {
     pub entropy: f64,
     pub evidence: Vec<Evidence>,
     pub error: Option<String>,
-    pub ml_features: Option<crate::model::ModelFeatures>,
-    pub ml_score: Option<f32>,
+    pub heuristic_features: Option<crate::model::HeuristicFeatures>,
+    pub heuristic_score: Option<f32>,
 }
 
 impl ScanReport {
@@ -145,8 +146,8 @@ impl ScanReport {
                 description: message.clone(),
             }],
             error: Some(message),
-            ml_features: None,
-            ml_score: None,
+            heuristic_features: None,
+            heuristic_score: None,
         }
     }
 }
@@ -282,7 +283,7 @@ impl std::error::Error for SignatureError {}
 pub struct ScanEngine {
     config: ScanConfig,
     signatures: SignatureDatabase,
-    model: crate::model::ModelManager,
+    model: crate::model::HeuristicManager,
 }
 
 impl ScanEngine {
@@ -291,7 +292,7 @@ impl ScanEngine {
         Ok(Self {
             config,
             signatures,
-            model: crate::model::ModelManager::new(),
+            model: crate::model::HeuristicManager::new(),
         })
     }
 
@@ -378,7 +379,7 @@ impl ScanEngine {
         let completeness = if io_error.is_some() {
             AnalysisCompleteness::ResourceLimitReached
         } else if truncated_prefix {
-            AnalysisCompleteness::CompleteHashPartialStructure
+            AnalysisCompleteness::PrefixOnly
         } else {
             AnalysisCompleteness::Complete
         };
@@ -442,7 +443,7 @@ impl ScanEngine {
         let mut evidence = Vec::new();
         let mut exact_match = false;
 
-        let mut ml_features = crate::model::ModelFeatures {
+        let mut heuristic_features = crate::model::HeuristicFeatures {
             entropy: entropy as f32,
             ..Default::default()
         };
@@ -478,8 +479,13 @@ impl ScanEngine {
 
         match content_type {
             ContentType::Pe32 | ContentType::Pe64 | ContentType::PeUnknown => {
-                ml_features.is_pe = 1.0;
-                analyze_pe(bytes, &mut content_type, &mut evidence, &mut ml_features)
+                heuristic_features.is_pe = 1.0;
+                analyze_pe(
+                    bytes,
+                    &mut content_type,
+                    &mut evidence,
+                    &mut heuristic_features,
+                )
             }
             ContentType::Script(_) => {
                 analyze_script(bytes, self.config.max_script_sample_bytes, &mut evidence)
@@ -523,7 +529,7 @@ impl ScanEngine {
             &evidence,
         );
 
-        let ml_score = self.model.active().evaluate(&ml_features);
+        let heuristic_score = self.model.active().evaluate(&heuristic_features);
 
         ScanReport {
             verdict,
@@ -538,8 +544,8 @@ impl ScanEngine {
             entropy,
             evidence,
             error: None,
-            ml_features: Some(ml_features),
-            ml_score: Some(ml_score),
+            heuristic_features: Some(heuristic_features),
+            heuristic_score: Some(heuristic_score),
         }
     }
 }
@@ -773,7 +779,7 @@ fn analyze_pe(
     bytes: &[u8],
     content_type: &mut ContentType,
     evidence: &mut Vec<Evidence>,
-    features: &mut crate::model::ModelFeatures,
+    features: &mut crate::model::HeuristicFeatures,
 ) {
     let pe = match PE::parse(bytes) {
         Ok(pe) => pe,
