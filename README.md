@@ -37,7 +37,7 @@ blackshard is currently in really early stages of development, so no download is
 
 ### What is blackshard?
 
-blackshard is a lightweight, efficient, and highly adaptive antivirus agent. currently, only a Windows 10/11 version is being developped, but other platforms are coming soon!
+blackshard is a lightweight, efficient, and highly adaptive antivirus agent. currently, only a Windows 10/11 version is being developed, but other platforms are coming soon!
 
 ### How much does blackshard cost?
 
