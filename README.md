@@ -43,9 +43,9 @@ blackshard is a lightweight, efficient, and highly adaptive antivirus agent. cur
 
 well, let's see...
 
-free version - 0$
-premium version - 0$
-enterprise version - 0$
+free version - 0$ /
+premium version - 0$ /
+enterprise version - 0$ /
 ultimate deluxe version - 0$
 
 so yeah, it's free. forever.
