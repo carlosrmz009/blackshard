@@ -2,8 +2,8 @@ use crate::atomic_file;
 use crate::detection::opened_file_id;
 #[cfg(windows)]
 use crate::detection::opened_file_identity;
-use chacha20::cipher::{KeyIvInit, StreamCipher};
-use chacha20::ChaCha20;
+use chacha20poly1305::{XChaCha20Poly1305, KeyInit, aead::stream::{EncryptorBE32, DecryptorBE32}};
+use hkdf::Hkdf;
 use chrono::{DateTime, Utc};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const CONTAINER_MAGIC: &[u8; 8] = b"BSQ\0\0\0\x01\0";
+const CONTAINER_MAGIC_V2: &[u8; 8] = b"BSQ\0\0\0\x02\0";
 const COPY_BUFFER_SIZE: usize = 256 * 1024;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_QUARANTINE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
@@ -40,8 +41,12 @@ pub struct QuarantineRecord {
     pub threat_name: String,
     pub risk_score: u8,
     pub state: IsolationState,
-    key: [u8; 32],
-    nonce: [u8; 12],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce: Option<[u8; 12]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kdf_secret: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,10 +161,17 @@ impl QuarantineStore {
         let id = Uuid::new_v4();
         let payload_path = self.payload_path(id);
         let temporary_payload = self.root.join(format!(".{id}.payload.tmp"));
-        let mut key = [0u8; 32];
-        let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut key);
-        OsRng.fill_bytes(&mut nonce);
+        let mut kdf_secret = [0u8; 32];
+        OsRng.fill_bytes(&mut kdf_secret);
+
+        let hk = Hkdf::<sha2::Sha256>::new(Some(expected_sha256.as_bytes()), &kdf_secret);
+        let mut okm = [0u8; 32];
+        hk.expand(id.as_bytes(), &mut okm).unwrap();
+
+        let mut stream_nonce = [0u8; 19];
+        OsRng.fill_bytes(&mut stream_nonce);
+        
+        let aad = format!("BSQ|V2|{}|{}|{}|{}", original_path.to_string_lossy(), threat_name, expected_sha256, expected_size).into_bytes();
 
         let copy_result = (|| -> io::Result<(String, u64, File)> {
             let input = open_source_for_quarantine(&original_path)?;
@@ -201,30 +213,66 @@ impl QuarantineStore {
                 .open(&temporary_payload)?;
             let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, input);
             let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, output);
-            writer.write_all(CONTAINER_MAGIC)?;
+            writer.write_all(CONTAINER_MAGIC_V2)?;
+            writer.write_all(&stream_nonce)?;
 
-            let mut cipher = ChaCha20::new((&key).into(), (&nonce).into());
+            let aead = XChaCha20Poly1305::new(&okm.into());
+            let mut encryptor = EncryptorBE32::from_aead(aead, &stream_nonce.into());
+
             let mut hasher = Sha256::new();
             let mut size = 0u64;
             let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+            let mut first_chunk = true;
 
-            loop {
-                if size > expected_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "the file grew while it was being quarantined",
-                    ));
+            if expected_size == 0 {
+                let mut chunk_buf = vec![];
+                encryptor.encrypt_last_in_place(aad.as_slice(), &mut chunk_buf).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
+                })?;
+                writer.write_all(&chunk_buf)?;
+            } else {
+                loop {
+                    if size > expected_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the file grew while it was being quarantined",
+                        ));
+                    }
+                    let remaining = expected_size - size;
+                    if remaining == 0 {
+                        break;
+                    }
+                    let read_limit = (remaining as usize).min(buffer.len());
+                    let read = reader.read(&mut buffer[..read_limit])?;
+                    if read == 0 {
+                        break;
+                    }
+                    
+                    let mut chunk_buf = buffer[..read].to_vec();
+                    hasher.update(&chunk_buf);
+                    size += read as u64;
+                    
+                    let chunk_aad = if first_chunk {
+                        first_chunk = false;
+                        aad.as_slice()
+                    } else {
+                        &[]
+                    };
+
+                    let is_last = size == expected_size;
+                    if is_last {
+                        encryptor.encrypt_last_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
+                        })?;
+                        writer.write_all(&chunk_buf)?;
+                        break;
+                    } else {
+                        encryptor.encrypt_next_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
+                        })?;
+                        writer.write_all(&chunk_buf)?;
+                    }
                 }
-                let remaining = expected_size.saturating_sub(size).saturating_add(1);
-                let read_limit = remaining.min(buffer.len() as u64) as usize;
-                let read = reader.read(&mut buffer[..read_limit])?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-                size = size.saturating_add(read as u64);
-                cipher.apply_keystream(&mut buffer[..read]);
-                writer.write_all(&buffer[..read])?;
             }
 
             if size != expected_size {
@@ -269,8 +317,9 @@ impl QuarantineStore {
             threat_name,
             risk_score,
             state: IsolationState::SourceStillPresent,
-            key,
-            nonce,
+            key: None,
+            nonce: None,
+            kdf_secret: Some(kdf_secret),
         };
 
         if let Err(error) = self.write_record(&record) {
@@ -376,36 +425,95 @@ impl QuarantineStore {
             let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, input);
             let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, output);
 
-            let mut magic = [0u8; CONTAINER_MAGIC.len()];
+            let mut magic = [0u8; 8];
             reader.read_exact(&mut magic)?;
-            if &magic != CONTAINER_MAGIC {
+
+            if &magic == CONTAINER_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "legacy unauthenticated quarantine containers are no longer supported for restore",
+                ));
+            } else if &magic != CONTAINER_MAGIC_V2 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid Blackshard quarantine container",
                 ));
             }
 
-            let mut cipher = ChaCha20::new((&record.key).into(), (&record.nonce).into());
+            let kdf_secret = record.kdf_secret.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing KDF secret in metadata")
+            })?;
+
+            let hk = Hkdf::<sha2::Sha256>::new(Some(record.sha256.as_bytes()), &kdf_secret);
+            let mut okm = [0u8; 32];
+            hk.expand(id.as_bytes(), &mut okm).unwrap();
+
+            let mut stream_nonce = [0u8; 19];
+            reader.read_exact(&mut stream_nonce)?;
+
+            let aead = XChaCha20Poly1305::new(&okm.into());
+            let mut decryptor = DecryptorBE32::from_aead(aead, &stream_nonce.into());
+
             let mut hasher = Sha256::new();
-            let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
             let mut restored_size = 0u64;
-            loop {
-                if restored_size > record.size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "quarantine container exceeds its recorded size",
-                    ));
+            
+            let aad = format!("BSQ|V2|{}|{}|{}|{}", record.original_path.to_string_lossy(), record.threat_name, record.sha256, record.size).into_bytes();
+            let mut first_chunk = true;
+
+            if record.size == 0 {
+                let mut chunk_buf = vec![];
+                let mut mac_buf = [0u8; 16];
+                reader.read_exact(&mut mac_buf)?;
+                chunk_buf.extend_from_slice(&mac_buf);
+
+                decryptor.decrypt_last_in_place(aad.as_slice(), &mut chunk_buf).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "container integrity check failed")
+                })?;
+                writer.write_all(&chunk_buf)?;
+            } else {
+                loop {
+                    if restored_size > record.size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "quarantine container exceeds its recorded size",
+                        ));
+                    }
+                    let remaining_plaintext = record.size - restored_size;
+                    if remaining_plaintext == 0 {
+                        break;
+                    }
+                    let chunk_plaintext_limit = (remaining_plaintext as usize).min(COPY_BUFFER_SIZE);
+                    let read_limit = chunk_plaintext_limit + 16;
+                    
+                    let mut chunk_buf = vec![0u8; read_limit];
+                    reader.read_exact(&mut chunk_buf)?;
+
+                    let chunk_aad = if first_chunk {
+                        first_chunk = false;
+                        aad.as_slice()
+                    } else {
+                        &[]
+                    };
+
+                    let is_last = restored_size + (chunk_plaintext_limit as u64) == record.size;
+                    
+                    if is_last {
+                        decryptor.decrypt_last_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "container integrity check failed")
+                        })?;
+                        hasher.update(&chunk_buf);
+                        writer.write_all(&chunk_buf)?;
+                        restored_size += chunk_buf.len() as u64;
+                        break;
+                    } else {
+                        decryptor.decrypt_next_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "container integrity check failed")
+                        })?;
+                        hasher.update(&chunk_buf);
+                        writer.write_all(&chunk_buf)?;
+                        restored_size += chunk_buf.len() as u64;
+                    }
                 }
-                let remaining = record.size.saturating_sub(restored_size).saturating_add(1);
-                let read_limit = remaining.min(buffer.len() as u64) as usize;
-                let read = reader.read(&mut buffer[..read_limit])?;
-                if read == 0 {
-                    break;
-                }
-                cipher.apply_keystream(&mut buffer[..read]);
-                hasher.update(&buffer[..read]);
-                writer.write_all(&buffer[..read])?;
-                restored_size = restored_size.saturating_add(read as u64);
             }
             if restored_size != record.size {
                 return Err(io::Error::new(
@@ -642,8 +750,8 @@ mod tests {
         assert!(!source.exists());
 
         let payload = fs::read(store.payload_path(record.id)).unwrap();
-        assert!(payload.starts_with(CONTAINER_MAGIC));
-        assert_ne!(&payload[CONTAINER_MAGIC.len()..], original.as_slice());
+        assert!(payload.starts_with(CONTAINER_MAGIC_V2));
+        assert_ne!(&payload[CONTAINER_MAGIC_V2.len()..], original.as_slice());
 
         let restored = store.restore(record.id, Some(&source), false).unwrap();
         assert_eq!(restored, source);

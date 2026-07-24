@@ -1,0 +1,22 @@
+[package]
+name = "blackshard-amsi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+blackshard = { path = ".." }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["serde", "v4"] }
+
+[dependencies.windows]
+version = "0.52.0"
+features = [
+    "Win32_System_Com",
+    "Win32_System_Antimalware",
+    "Win32_Foundation",
+    "implement"
+]

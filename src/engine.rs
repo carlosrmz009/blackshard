@@ -73,6 +73,17 @@ pub enum ContentType {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisCompleteness {
+    Complete,
+    CompleteHashPartialStructure,
+    PrefixAndTargetedRegions,
+    ResourceLimitReached,
+    ChangedDuringScan,
+    TimedOut,
+    UnsupportedFormat,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EvidenceSeverity {
     Informational,
@@ -105,9 +116,12 @@ pub struct ScanReport {
     pub file_size: u64,
     pub bytes_scanned: usize,
     pub truncated: bool,
+    pub analysis_completeness: AnalysisCompleteness,
     pub entropy: f64,
     pub evidence: Vec<Evidence>,
     pub error: Option<String>,
+    pub ml_features: Option<crate::model::ModelFeatures>,
+    pub ml_score: Option<f32>,
 }
 
 impl ScanReport {
@@ -122,6 +136,7 @@ impl ScanReport {
             file_size,
             bytes_scanned,
             truncated: false,
+            analysis_completeness: AnalysisCompleteness::ResourceLimitReached,
             entropy: 0.0,
             evidence: vec![Evidence {
                 code: "scan.io_error",
@@ -130,6 +145,8 @@ impl ScanReport {
                 description: message.clone(),
             }],
             error: Some(message),
+            ml_features: None,
+            ml_score: None,
         }
     }
 }
@@ -265,12 +282,13 @@ impl std::error::Error for SignatureError {}
 pub struct ScanEngine {
     config: ScanConfig,
     signatures: SignatureDatabase,
+    model: crate::model::ModelManager,
 }
 
 impl ScanEngine {
     pub fn new(config: ScanConfig, signatures: SignatureDatabase) -> Result<Self, ConfigError> {
         config.validate()?;
-        Ok(Self { config, signatures })
+        Ok(Self { config, signatures, model: crate::model::ModelManager::new() })
     }
 
     pub fn config(&self) -> &ScanConfig {
@@ -299,33 +317,63 @@ impl ScanEngine {
         self.scan_reader(file, declared_size)
     }
 
-    /// Scan a reader with a hard allocation/read bound.
+    /// Scan a reader with streaming analysis.
     pub fn scan_reader<R: Read>(&self, reader: R, declared_size: Option<u64>) -> ScanReport {
-        let read_limit = self.config.max_read_bytes.saturating_add(1) as u64;
-        let mut limited = reader.take(read_limit);
-        let mut bytes = Vec::with_capacity(
+        let mut hasher = Sha256::new();
+        let mut prefix = Vec::with_capacity(
             declared_size
                 .unwrap_or(0)
                 .min(self.config.max_read_bytes as u64) as usize,
         );
-        if let Err(error) = limited.read_to_end(&mut bytes) {
-            return ScanReport::error(
-                format!("could not read candidate: {error}"),
-                declared_size.unwrap_or(bytes.len() as u64),
-                bytes.len(),
-            );
+        let mut buffer = [0u8; 64 * 1024];
+        let mut total_read = 0u64;
+        let mut io_error = None;
+
+        let limit = self.config.max_read_bytes as u64 + 1;
+        let mut bounded_reader = reader.take(limit);
+
+        loop {
+            let n = match bounded_reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) => {
+                    io_error = Some(error);
+                    break;
+                }
+            };
+            hasher.update(&buffer[..n]);
+            
+            if prefix.len() < self.config.max_read_bytes {
+                let needed = self.config.max_read_bytes - prefix.len();
+                let to_copy = n.min(needed);
+                prefix.extend_from_slice(&buffer[..to_copy]);
+            }
+            total_read += n as u64;
         }
 
-        let observed_extra_byte = bytes.len() > self.config.max_read_bytes;
-        if observed_extra_byte {
-            bytes.truncate(self.config.max_read_bytes);
+        if let Some(ref error) = io_error {
+            if prefix.is_empty() {
+                return ScanReport::error(
+                    format!("could not read candidate: {error}"),
+                    declared_size.unwrap_or(total_read),
+                    0,
+                );
+            }
         }
-        let observed_size = bytes.len() as u64 + if observed_extra_byte { 1 } else { 0 };
-        let file_size = declared_size
-            .map(|size| size.max(observed_size))
-            .unwrap_or(observed_size);
-        let truncated = observed_extra_byte || file_size > bytes.len() as u64;
-        self.analyze(&bytes, file_size, truncated)
+
+        let file_size = declared_size.map(|size| size.max(total_read)).unwrap_or(total_read);
+        let truncated_prefix = total_read > self.config.max_read_bytes as u64;
+        let full_digest = if io_error.is_none() && !truncated_prefix { Some(hasher.finalize().into()) } else { None };
+        
+        let completeness = if io_error.is_some() {
+            AnalysisCompleteness::ResourceLimitReached
+        } else if truncated_prefix {
+            AnalysisCompleteness::CompleteHashPartialStructure
+        } else {
+            AnalysisCompleteness::Complete
+        };
+
+        self.analyze_internal(&prefix, file_size, prefix.len(), truncated_prefix, full_digest, completeness)
     }
 
     /// Scan an in-memory candidate. Inputs above the configured read limit are
@@ -342,17 +390,37 @@ impl ScanEngine {
     pub fn scan_sample(&self, bytes: &[u8], declared_size: u64) -> ScanReport {
         let sample = &bytes[..bytes.len().min(self.config.max_read_bytes)];
         let file_size = declared_size.max(bytes.len() as u64);
-        let truncated = bytes.len() > self.config.max_read_bytes || file_size > sample.len() as u64;
-        self.analyze(sample, file_size, truncated)
+        let truncated_prefix = bytes.len() > self.config.max_read_bytes || file_size > bytes.len() as u64;
+        
+        let full_digest = (!truncated_prefix).then(|| sha256(bytes));
+        let completeness = if truncated_prefix {
+            AnalysisCompleteness::PrefixAndTargetedRegions
+        } else {
+            AnalysisCompleteness::Complete
+        };
+        
+        self.analyze_internal(sample, file_size, bytes.len(), truncated_prefix, full_digest, completeness)
     }
 
-    fn analyze(&self, bytes: &[u8], file_size: u64, truncated: bool) -> ScanReport {
+    fn analyze_internal(
+        &self,
+        bytes: &[u8],
+        file_size: u64,
+        bytes_scanned: usize,
+        truncated: bool,
+        full_digest: Option<[u8; 32]>,
+        analysis_completeness: AnalysisCompleteness,
+    ) -> ScanReport {
         let entropy = shannon_entropy(bytes);
         let mut content_type = classify_content(bytes, self.config.max_script_sample_bytes);
-        let full_digest = (!truncated).then(|| sha256(bytes));
         let sha256 = full_digest.as_ref().map(hex_sha256);
         let mut evidence = Vec::new();
         let mut exact_match = false;
+        
+        let mut ml_features = crate::model::ModelFeatures {
+            entropy: entropy as f32,
+            ..Default::default()
+        };
 
         if let Some(digest) = &full_digest {
             if let Some(signature) = self.signatures.lookup(digest) {
@@ -385,7 +453,8 @@ impl ScanEngine {
 
         match content_type {
             ContentType::Pe32 | ContentType::Pe64 | ContentType::PeUnknown => {
-                analyze_pe(bytes, &mut content_type, &mut evidence)
+                ml_features.is_pe = 1.0;
+                analyze_pe(bytes, &mut content_type, &mut evidence, &mut ml_features)
             }
             ContentType::Script(_) => {
                 analyze_script(bytes, self.config.max_script_sample_bytes, &mut evidence)
@@ -429,6 +498,8 @@ impl ScanEngine {
             &evidence,
         );
 
+        let ml_score = self.model.active().evaluate(&ml_features);
+
         ScanReport {
             verdict,
             content_type,
@@ -436,11 +507,14 @@ impl ScanEngine {
             confidence,
             sha256,
             file_size,
-            bytes_scanned: bytes.len(),
+            bytes_scanned,
             truncated,
+            analysis_completeness,
             entropy,
             evidence,
             error: None,
+            ml_features: Some(ml_features),
+            ml_score: Some(ml_score),
         }
     }
 }
@@ -670,7 +744,7 @@ fn identify_script_language(lower: &str) -> Option<ScriptLanguage> {
     None
 }
 
-fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<Evidence>) {
+fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<Evidence>, features: &mut crate::model::ModelFeatures) {
     let pe = match PE::parse(bytes) {
         Ok(pe) => pe,
         Err(error) => {
@@ -690,6 +764,9 @@ fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<E
     } else {
         ContentType::Pe32
     };
+
+    features.section_count = pe.sections.len() as f32;
+    features.import_count = pe.imports.len() as f32;
 
     if pe.sections.is_empty() {
         push_evidence(

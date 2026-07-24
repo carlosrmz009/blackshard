@@ -674,3 +674,62 @@ mod tests {
         assert!(!is_archive_container(Path::new("archive.zip.exe")));
     }
 }
+pub struct ScanQueueManager {
+    high_priority: mpsc::Sender<PathBuf>,
+    low_priority: mpsc::Sender<PathBuf>,
+}
+
+impl ScanQueueManager {
+    pub fn new(
+        worker_count: usize,
+        engine: Arc<DetectionEngine>,
+        _quarantine: Arc<QuarantineStore>,
+        _history: Arc<EventHistory>,
+        _settings: Settings,
+    ) -> Self {
+        let (high_tx, high_rx) = mpsc::channel::<PathBuf>();
+        let (low_tx, low_rx) = mpsc::channel::<PathBuf>();
+        
+        let high_rx = Arc::new(Mutex::new(high_rx));
+        let low_rx = Arc::new(Mutex::new(low_rx));
+
+        for _ in 0..worker_count {
+            let high_rx = Arc::clone(&high_rx);
+            let low_rx = Arc::clone(&low_rx);
+            let engine = Arc::clone(&engine);
+
+            thread::spawn(move || {
+                loop {
+                    let mut path_opt = {
+                        let rx = high_rx.lock().unwrap();
+                        rx.try_recv().ok()
+                    };
+                    
+                    if path_opt.is_none() {
+                        let rx = low_rx.lock().unwrap();
+                        path_opt = rx.try_recv().ok();
+                    }
+                    
+                    if let Some(path) = path_opt {
+                        let _report = engine.scan_path(&path);
+                    } else {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            });
+        }
+        
+        Self {
+            high_priority: high_tx,
+            low_priority: low_tx,
+        }
+    }
+
+    pub fn enqueue_high_priority(&self, path: PathBuf) {
+        let _ = self.high_priority.send(path);
+    }
+
+    pub fn enqueue_low_priority(&self, path: PathBuf) {
+        let _ = self.low_priority.send(path);
+    }
+}

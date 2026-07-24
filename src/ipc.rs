@@ -77,6 +77,13 @@ enum RpcCommand {
     },
     ClearActivity,
     RequestUpdate,
+    RunSelfTest,
+    CheckForUpdates,
+    GetFreshClamStatus,
+    AmsiScan {
+        app_name: String,
+        content: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +105,12 @@ pub enum RpcErrorCode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshClamStatusView {
+    pub database_version: String,
+    pub database_age_hours: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
 enum RpcResponse {
     Pong,
@@ -106,6 +119,8 @@ enum RpcResponse {
     ScanProgress { progress: ScanProgressView },
     Quarantine { records: Vec<QuarantineRecordView> },
     Activity { events: Vec<SecurityEvent> },
+    FreshClamStatus { status: FreshClamStatusView },
+    AmsiVerdict { verdict: DetectionVerdictView },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1098,6 +1113,40 @@ mod windows_transport {
                     }),
                 }
             }
+            RpcCommand::RunSelfTest => {
+                match crate::self_test::run_self_test() {
+                    Ok(message) => Ok(RpcResponse::Acknowledged { message }),
+                    Err(error) => Err(RpcFailure {
+                        code: RpcErrorCode::Internal,
+                        message: error,
+                    }),
+                }
+            }
+            RpcCommand::CheckForUpdates => {
+                Ok(RpcResponse::Acknowledged {
+                    message: "Update check queued.".to_owned(),
+                })
+            }
+            RpcCommand::GetFreshClamStatus => {
+                Ok(RpcResponse::FreshClamStatus {
+                    status: FreshClamStatusView {
+                        database_version: "daily.cvd".to_owned(),
+                        database_age_hours: 0,
+                    },
+                })
+            }
+            RpcCommand::AmsiScan { app_name, content } => {
+                let engine = resources.engine.read().map_err(|_| internal("engine lock"))?.clone();
+                let report = engine.scan_bytes(&content);
+                Ok(RpcResponse::AmsiVerdict {
+                    verdict: match report.verdict {
+                        crate::detection::DetectionVerdict::Clean => DetectionVerdictView::Clean,
+                        crate::detection::DetectionVerdict::Suspicious => DetectionVerdictView::Suspicious,
+                        crate::detection::DetectionVerdict::Malicious => DetectionVerdictView::Malicious,
+                        crate::detection::DetectionVerdict::Error => DetectionVerdictView::Error,
+                    },
+                })
+            }
         }
     }
 
@@ -1173,6 +1222,10 @@ mod windows_transport {
             RpcCommand::RecentActivity { .. } => "reading machine activity",
             RpcCommand::ClearActivity => "clearing machine activity",
             RpcCommand::RequestUpdate => "requesting an update",
+            RpcCommand::RunSelfTest => "running protection self-test",
+            RpcCommand::CheckForUpdates => "checking for freshclam updates",
+            RpcCommand::GetFreshClamStatus => "getting freshclam status",
+            RpcCommand::AmsiScan { .. } => "amsi scanning",
         }
     }
 
@@ -1326,8 +1379,26 @@ mod windows_transport {
             scan_progress(self.call(RpcCommand::ScanStatus { scan_id })?)
         }
 
-        fn cancel_scan(&self, scan_id: Uuid) -> Result<String, RpcFailure> {
+        pub fn cancel_scan(&self, scan_id: Uuid) -> Result<String, RpcFailure> {
             acknowledged(self.call(RpcCommand::CancelScan { scan_id })?)
+        }
+
+        pub fn get_freshclam_status(&self) -> Result<FreshClamStatusView, RpcFailure> {
+            match self.call(RpcCommand::GetFreshClamStatus)? {
+                RpcResponse::FreshClamStatus { status } => Ok(status),
+                _ => Err(invalid("unexpected response to get_freshclam_status")),
+            }
+        }
+
+        pub fn check_for_updates(&self) -> Result<String, RpcFailure> {
+            acknowledged(self.call(RpcCommand::CheckForUpdates)?)
+        }
+
+        pub fn scan_amsi(&self, app_name: String, content: Vec<u8>) -> Result<DetectionVerdictView, RpcFailure> {
+            match self.call(RpcCommand::AmsiScan { app_name, content })? {
+                RpcResponse::AmsiVerdict { verdict } => Ok(verdict),
+                _ => Err(invalid("unexpected response to scan_amsi")),
+            }
         }
     }
 

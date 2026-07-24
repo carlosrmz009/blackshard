@@ -9,6 +9,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use std::os::windows::io::AsRawHandle;
+use crate::freshclam::native_index::NativeIndex;
+use crate::clamav_worker::{ClamAvWorker, protocol::ScanVerdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectionVerdict {
@@ -28,6 +31,7 @@ pub struct DetectionReport {
     pub file_size: u64,
     pub bytes_scanned: usize,
     pub truncated: bool,
+    pub analysis_completeness: crate::engine::AnalysisCompleteness,
     pub static_report: Option<ScanReport>,
     pub rule_matches: Vec<RuleMatch>,
     /// Authenticated family-similarity results. These are advisory and require
@@ -76,6 +80,7 @@ impl DetectionReport {
             file_size: 0,
             bytes_scanned: 0,
             truncated: false,
+            analysis_completeness: crate::engine::AnalysisCompleteness::ResourceLimitReached,
             static_report: None,
             rule_matches: Vec::new(),
             similarity_matches: Vec::new(),
@@ -104,6 +109,7 @@ impl DetectionReport {
             file_size: 0,
             bytes_scanned: 0,
             truncated: false,
+            analysis_completeness: crate::engine::AnalysisCompleteness::Complete,
             static_report: None,
             rule_matches: Vec::new(),
             similarity_matches: Vec::new(),
@@ -127,6 +133,8 @@ pub struct DetectionEngine {
     amsi_initialization_error: Option<String>,
     external_rule_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
     external_similarity_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
+    native_index: Arc<NativeIndex>,
+    clamav_worker: Mutex<Option<ClamAvWorker>>,
 }
 
 impl DetectionEngine {
@@ -145,6 +153,8 @@ impl DetectionEngine {
             external_similarity_circuit_breaker: Mutex::new(
                 DefinitionMatchRateCircuitBreaker::default(),
             ),
+            native_index: Arc::new(NativeIndex::new()),
+            clamav_worker: Mutex::new(ClamAvWorker::new().ok()),
         }
     }
 
@@ -251,7 +261,33 @@ impl DetectionEngine {
         let declared_size = before
             .len()
             .max(sample.len() as u64 + u64::from(observed_extra));
+        let static_start = Instant::now();
         let static_report = self.static_engine.scan_sample(&sample, declared_size);
+        let static_duration = static_start.elapsed();
+        
+        let freshclam_start = Instant::now();
+        let mut freshclam_threat = None;
+        if let Some(sha256_hex) = &static_report.sha256 {
+            if let Ok(hash_bytes) = hex::decode(sha256_hex) {
+                freshclam_threat = self.native_index.evaluate(&hash_bytes, Some(declared_size)).map(|s| s.to_owned());
+            }
+        }
+        let freshclam_duration = freshclam_start.elapsed();
+
+        let clamav_start = Instant::now();
+        let mut clamav_threat = None;
+        if let Ok(mut worker_lock) = self.clamav_worker.lock() {
+            if let Some(worker) = worker_lock.as_mut() {
+                if let Ok(verdict) = worker.scan_handle(file.as_raw_handle() as u64) {
+                    if let ScanVerdict::Malicious = verdict {
+                        clamav_threat = Some("ClamAV.Malware".to_owned());
+                    }
+                }
+            }
+        }
+        let clamav_duration = clamav_start.elapsed();
+
+        let yara_start = Instant::now();
         let rule_matches = match self.rules.scan(&sample) {
             Ok(matches) => self.apply_external_rule_circuit_breaker(matches),
             Err(error) => {
@@ -264,6 +300,7 @@ impl DetectionEngine {
                     file_size: declared_size,
                     bytes_scanned: sample.len(),
                     truncated: static_report.truncated,
+                    analysis_completeness: static_report.analysis_completeness,
                     static_report: Some(static_report),
                     rule_matches: Vec::new(),
                     similarity_matches: Vec::new(),
@@ -278,18 +315,33 @@ impl DetectionEngine {
                 }
             }
         };
+        let yara_duration = yara_start.elapsed();
+
+        let ml_start = Instant::now();
         let similarity_matches =
             self.apply_similarity_circuit_breaker(self.similarity.scan(&sample, declared_size));
-        let (amsi_report, amsi_error) = self.scan_with_amsi(&static_report, &rule_matches, &sample);
+        let ml_duration = ml_start.elapsed();
 
-        let report = combine(
+        let amsi_start = Instant::now();
+        let (amsi_report, amsi_error) = self.scan_with_amsi(&static_report, &rule_matches, &sample);
+        let amsi_duration = amsi_start.elapsed();
+
+        log::info!(
+            "EvidenceCascade metrics: Static: {:?}, FreshClam: {:?}, ClamAV: {:?}, YARA: {:?}, ML(Similarity): {:?}, AMSI: {:?}",
+            static_duration, freshclam_duration, clamav_duration, yara_duration, ml_duration, amsi_duration
+        );
+
+        let cascade = EvidenceCascade {
             static_report,
+            freshclam_threat,
+            clamav_threat,
             rule_matches,
             similarity_matches,
             amsi_report,
             amsi_error,
-            started.elapsed(),
-        );
+        };
+
+        let report = cascade.resolve(started.elapsed());
         self.with_container_inspection(&sample, report, started)
     }
 
@@ -303,23 +355,52 @@ impl DetectionEngine {
     /// container. The archive walker owns the single recursion/resource budget.
     pub(crate) fn scan_leaf_bytes(&self, bytes: &[u8]) -> DetectionReport {
         let started = Instant::now();
+        let static_start = Instant::now();
         let static_report = self.static_engine.scan_bytes(bytes);
-        match self.rules.scan(bytes) {
+        let static_duration = static_start.elapsed();
+
+        let freshclam_start = Instant::now();
+        let mut freshclam_threat = None;
+        if let Some(sha256_hex) = &static_report.sha256 {
+            if let Ok(hash_bytes) = hex::decode(sha256_hex) {
+                freshclam_threat = self.native_index.evaluate(&hash_bytes, Some(bytes.len() as u64)).map(|s| s.to_owned());
+            }
+        }
+        let freshclam_duration = freshclam_start.elapsed();
+
+        let yara_start = Instant::now();
+        let rule_matches_res = self.rules.scan(bytes);
+        let yara_duration = yara_start.elapsed();
+
+        match rule_matches_res {
             Ok(rule_matches) => {
                 let rule_matches = self.apply_external_rule_circuit_breaker(rule_matches);
+                let ml_start = Instant::now();
                 let similarity_matches = self.apply_similarity_circuit_breaker(
                     self.similarity.scan(bytes, bytes.len() as u64),
                 );
+                let ml_duration = ml_start.elapsed();
+
+                let amsi_start = Instant::now();
                 let (amsi_report, amsi_error) =
                     self.scan_with_amsi(&static_report, &rule_matches, bytes);
-                combine(
+                let amsi_duration = amsi_start.elapsed();
+
+                log::info!(
+                    "EvidenceCascade metrics (leaf): Static: {:?}, FreshClam: {:?}, YARA: {:?}, ML: {:?}, AMSI: {:?}",
+                    static_duration, freshclam_duration, yara_duration, ml_duration, amsi_duration
+                );
+
+                let cascade = EvidenceCascade {
                     static_report,
+                    freshclam_threat,
+                    clamav_threat: None,
                     rule_matches,
                     similarity_matches,
                     amsi_report,
                     amsi_error,
-                    started.elapsed(),
-                )
+                };
+                cascade.resolve(started.elapsed())
             }
             Err(error) => DetectionReport {
                 verdict: DetectionVerdict::Error,
@@ -330,6 +411,7 @@ impl DetectionEngine {
                 file_size: bytes.len() as u64,
                 bytes_scanned: bytes.len(),
                 truncated: static_report.truncated,
+                analysis_completeness: static_report.analysis_completeness,
                 static_report: Some(static_report),
                 rule_matches: Vec::new(),
                 similarity_matches: Vec::new(),
@@ -611,141 +693,159 @@ pub(crate) fn opened_file_id(_file: &File) -> io::Result<u64> {
     ))
 }
 
-fn combine(
-    static_report: ScanReport,
-    rule_matches: Vec<RuleMatch>,
-    similarity_matches: Vec<SimilarityMatch>,
-    amsi_report: Option<AmsiScanReport>,
-    amsi_error: Option<String>,
-    elapsed: Duration,
-) -> DetectionReport {
-    let automatic_quarantine_eligible = static_report.verdict == StaticVerdict::Malicious
-        && !static_report.truncated
-        && static_report.sha256.is_some()
-        && static_report
-            .evidence
+pub struct EvidenceCascade {
+    pub static_report: ScanReport,
+    pub freshclam_threat: Option<String>,
+    pub clamav_threat: Option<String>,
+    pub rule_matches: Vec<RuleMatch>,
+    pub similarity_matches: Vec<SimilarityMatch>,
+    pub amsi_report: Option<AmsiScanReport>,
+    pub amsi_error: Option<String>,
+}
+
+impl EvidenceCascade {
+    pub fn resolve(self, elapsed: Duration) -> DetectionReport {
+        let automatic_quarantine_eligible = self.static_report.verdict == StaticVerdict::Malicious
+            && !self.static_report.truncated
+            && self.static_report.sha256.is_some()
+            && self.static_report
+                .evidence
+                .iter()
+                .any(|evidence| evidence.code == "signature.exact_sha256");
+
+        let malicious_rule = self.rule_matches
             .iter()
-            .any(|evidence| evidence.code == "signature.exact_sha256");
-    let malicious_rule = rule_matches
-        .iter()
-        .filter(|item| item.disposition == RuleDisposition::Malicious)
-        .max_by_key(|item| item.risk_score);
-    let suspicious_rule_score = rule_matches
-        .iter()
-        .filter(|item| item.disposition == RuleDisposition::Suspicious)
-        .map(|item| item.risk_score)
-        .max()
-        .unwrap_or(0);
-    let similarity_score = similarity_matches
-        .iter()
-        .map(|matched| {
-            82u8.saturating_add(
-                ((matched.similarity_basis_points.saturating_sub(8_500)) / 125) as u8,
-            )
-            .min(94)
-        })
-        .max()
-        .unwrap_or(0);
+            .filter(|item| item.disposition == RuleDisposition::Malicious)
+            .max_by_key(|item| item.risk_score);
+        let suspicious_rule_score = self.rule_matches
+            .iter()
+            .filter(|item| item.disposition == RuleDisposition::Suspicious)
+            .map(|item| item.risk_score)
+            .max()
+            .unwrap_or(0);
+        let similarity_score = self.similarity_matches
+            .iter()
+            .map(|matched| {
+                82u8.saturating_add(
+                    ((matched.similarity_basis_points.saturating_sub(8_500)) / 125) as u8,
+                )
+                .min(94)
+            })
+            .max()
+            .unwrap_or(0);
 
-    let amsi_provider_detection = amsi_report
-        .as_ref()
-        .is_some_and(AmsiScanReport::is_provider_detection);
-    let amsi_policy_block = amsi_report
-        .as_ref()
-        .is_some_and(AmsiScanReport::should_block_execution);
+        let amsi_provider_detection = self.amsi_report
+            .as_ref()
+            .is_some_and(AmsiScanReport::is_provider_detection);
+        let amsi_policy_block = self.amsi_report
+            .as_ref()
+            .is_some_and(AmsiScanReport::should_block_execution);
 
-    let (verdict, risk_score, confidence, threat_name) = if static_report.verdict
-        == StaticVerdict::Malicious
-    {
-        (
-            DetectionVerdict::Malicious,
-            100,
-            static_report.confidence.max(99),
-            Some("Known.Malware.ExactSignature".to_owned()),
-        )
-    } else if amsi_provider_detection {
-        (
-            DetectionVerdict::Malicious,
-            99,
-            99,
-            Some("AMSI.Provider.MalwareDetected".to_owned()),
-        )
-    } else if let Some(rule) = malicious_rule {
-        (
-            DetectionVerdict::Malicious,
-            rule.risk_score.max(95),
-            99,
-            Some(rule.threat_name.clone()),
-        )
-    } else if amsi_policy_block {
-        (
-            DetectionVerdict::Suspicious,
-            90,
-            99,
-            Some("AMSI.Policy.BlockedByAdministrator".to_owned()),
-        )
-    } else if static_report.verdict == StaticVerdict::Error {
-        (DetectionVerdict::Error, 0, 0, None)
-    } else if static_report.verdict == StaticVerdict::Suspicious
-        || suspicious_rule_score > 0
-        || similarity_score > 0
-    {
-        let independent_bonus =
-            if static_report.verdict == StaticVerdict::Suspicious && suspicious_rule_score > 0 {
-                10
-            } else {
-                0
-            };
-        (
-            DetectionVerdict::Suspicious,
-            static_report
+        let mut block_eligible = automatic_quarantine_eligible || amsi_policy_block;
+        let mut threat_name = None;
+        let mut confidence = self.static_report.confidence;
+        let mut risk_score = self.static_report.risk_score;
+        let mut verdict = DetectionVerdict::Clean;
+
+        if self.static_report.verdict == StaticVerdict::Malicious {
+            verdict = DetectionVerdict::Malicious;
+            risk_score = 100;
+            confidence = confidence.max(99);
+            threat_name = Some("Known.Malware.ExactSignature".to_owned());
+            block_eligible = true;
+        } else if let Some(threat) = self.freshclam_threat {
+            verdict = DetectionVerdict::Malicious;
+            risk_score = 100;
+            confidence = 100;
+            threat_name = Some(threat);
+            block_eligible = true;
+        } else if let Some(threat) = self.clamav_threat {
+            verdict = DetectionVerdict::Malicious;
+            risk_score = 95;
+            confidence = 95;
+            threat_name = Some(threat);
+            block_eligible = true;
+        } else if amsi_provider_detection {
+            verdict = DetectionVerdict::Malicious;
+            risk_score = 99;
+            confidence = 99;
+            threat_name = Some("AMSI.Provider.MalwareDetected".to_owned());
+            block_eligible = true; // AMSI provider detection
+        } else if let Some(rule) = malicious_rule {
+            verdict = DetectionVerdict::Malicious;
+            risk_score = rule.risk_score.max(95);
+            confidence = 99;
+            threat_name = Some(rule.threat_name.clone());
+            block_eligible = true;
+        } else if amsi_policy_block {
+            verdict = DetectionVerdict::Suspicious;
+            risk_score = 90;
+            confidence = 99;
+            threat_name = Some("AMSI.Policy.BlockedByAdministrator".to_owned());
+        } else if self.static_report.verdict == StaticVerdict::Error {
+            verdict = DetectionVerdict::Error;
+            risk_score = 0;
+            confidence = 0;
+            threat_name = None;
+        } else if self.static_report.verdict == StaticVerdict::Suspicious
+            || suspicious_rule_score > 0
+            || similarity_score > 0
+        {
+            let independent_bonus =
+                if self.static_report.verdict == StaticVerdict::Suspicious && suspicious_rule_score > 0 {
+                    10
+                } else {
+                    0
+                };
+
+            verdict = DetectionVerdict::Suspicious;
+            risk_score = self.static_report
                 .risk_score
                 .max(suspicious_rule_score)
                 .max(similarity_score)
                 .saturating_add(independent_bonus)
-                .min(99),
-            static_report.confidence.max(75),
-            rule_matches
+                .min(99);
+            confidence = self.static_report.confidence.max(75);
+
+            threat_name = self.rule_matches
                 .iter()
                 .filter(|item| item.disposition == RuleDisposition::Suspicious)
                 .max_by_key(|item| item.risk_score)
                 .map(|item| item.threat_name.clone())
                 .or_else(|| {
-                    similarity_matches
+                    self.similarity_matches
                         .first()
                         .map(|matched| matched.threat_name.clone())
                 })
-                .or_else(|| Some("Suspicious.StaticAnalysis".to_owned())),
-        )
-    } else {
-        (
-            DetectionVerdict::Clean,
-            static_report.risk_score,
-            static_report.confidence,
-            None,
-        )
-    };
+                .or_else(|| Some("Suspicious.StaticAnalysis".to_owned()));
 
-    DetectionReport {
-        verdict,
-        risk_score,
-        confidence,
-        threat_name,
-        sha256: static_report.sha256.clone(),
-        file_size: static_report.file_size,
-        bytes_scanned: static_report.bytes_scanned,
-        truncated: static_report.truncated,
-        error: static_report.error.clone(),
-        static_report: Some(static_report),
-        rule_matches,
-        similarity_matches,
-        container_inspection: None,
-        amsi_report,
-        amsi_error,
-        elapsed,
-        from_cache: false,
-        automatic_quarantine_eligible,
-        execution_block_eligible: automatic_quarantine_eligible || amsi_policy_block,
+            if similarity_score > 0 && suspicious_rule_score == 0 && self.static_report.verdict == StaticVerdict::Clean {
+                log::info!("ML Model Shadow Mode: hold for deeper analysis. Threat: {:?}", threat_name);
+            }
+        }
+
+        DetectionReport {
+            verdict,
+            risk_score,
+            confidence,
+            threat_name,
+            sha256: self.static_report.sha256.clone(),
+            file_size: self.static_report.file_size,
+            bytes_scanned: self.static_report.bytes_scanned,
+            truncated: self.static_report.truncated,
+            analysis_completeness: self.static_report.analysis_completeness,
+            error: self.static_report.error.clone(),
+            static_report: Some(self.static_report),
+            rule_matches: self.rule_matches,
+            similarity_matches: self.similarity_matches,
+            container_inspection: None,
+            amsi_report: self.amsi_report,
+            amsi_error: self.amsi_error,
+            elapsed,
+            from_cache: false,
+            automatic_quarantine_eligible,
+            execution_block_eligible: block_eligible,
+        }
     }
 }
 
@@ -819,14 +919,16 @@ mod tests {
     #[test]
     fn amsi_provider_detection_blocks_but_never_authorizes_quarantine() {
         let static_report = ScanEngine::default().scan_bytes(b"ordinary script-like bytes");
-        let report = combine(
+        let cascade = EvidenceCascade {
             static_report,
-            Vec::new(),
-            Vec::new(),
-            Some(AmsiScanReport::synthetic(0x8000, 26, false)),
-            None,
-            Duration::ZERO,
-        );
+            freshclam_threat: None,
+            clamav_threat: None,
+            rule_matches: Vec::new(),
+            similarity_matches: Vec::new(),
+            amsi_report: Some(AmsiScanReport::synthetic(0x8000, 26, false)),
+            amsi_error: None,
+        };
+        let report = cascade.resolve(Duration::ZERO);
         assert_eq!(report.verdict, DetectionVerdict::Malicious);
         assert!(report.should_block());
         assert!(!report.should_quarantine());

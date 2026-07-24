@@ -127,7 +127,10 @@ pub struct UiRuntimeState {
     pub desired_real_time_protection: bool,
     pub update_check_requested: bool,
     pub engine_version: String,
+    pub freshclam_version: Option<String>,
+    pub freshclam_age_hours: Option<u64>,
     pub attention: Option<String>,
+    pub readiness: Option<crate::readiness::ReadinessState>,
 }
 
 impl Default for UiRuntimeState {
@@ -148,7 +151,10 @@ impl Default for UiRuntimeState {
             desired_real_time_protection: true,
             update_check_requested: false,
             engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+            freshclam_version: None,
+            freshclam_age_hours: None,
             attention: None,
+            readiness: None,
         }
     }
 }
@@ -877,7 +883,11 @@ impl BlackshardApp {
                 section_title(ui, "PROTECTION LAYERS", "Actual subsystem state");
                 health_row(ui, "Real-time engine", protection_label(&runtime.protection));
                 health_row(ui, "Kernel minifilter", driver_label(&runtime.driver));
-                health_row(ui, "Definitions", definition_label(&runtime.definitions));
+                if let (Some(version), Some(age)) = (&runtime.freshclam_version, runtime.freshclam_age_hours) {
+                    health_row(ui, "FreshClam DB", (format!("v{} ({}h old)", version, age), GREEN));
+                } else {
+                    health_row(ui, "Definitions", definition_label(&runtime.definitions));
+                }
             });
             card(&mut columns[1], |ui| {
                 section_title(ui, "RELEASE ASSURANCE", "Identity and independent evaluation");
@@ -1540,6 +1550,42 @@ impl eframe::App for BlackshardApp {
         self.poll_background_work();
         let runtime = self.runtime_snapshot();
 
+        if should_show_loading_screen(&runtime) {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(BG)
+                        .inner_margin(egui::Margin::same(22.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.spinner();
+                            ui.add_space(16.0);
+                            let status_text = match &runtime.readiness {
+                                Some(crate::readiness::ReadinessState::Starting) => "Starting...",
+                                Some(crate::readiness::ReadinessState::LoadingSettings) => "Loading settings...",
+                                Some(crate::readiness::ReadinessState::LoadingDefinitions) => "Loading definitions...",
+                                Some(crate::readiness::ReadinessState::LoadingFreshClam) => "Loading definitions...",
+                                Some(crate::readiness::ReadinessState::StartingDetectionWorkers) => "Starting detection workers...",
+                                Some(crate::readiness::ReadinessState::ConnectingDriver) => "Connecting to driver...",
+                                Some(crate::readiness::ReadinessState::ValidatingProtocol) => "Validating protocol...",
+                                Some(crate::readiness::ReadinessState::RunningSelfTest) => "Running self test...",
+                                _ => "Starting service...",
+                            };
+                            ui.label(
+                                RichText::new(status_text)
+                                    .family(FontFamily::Monospace)
+                                    .size(16.0)
+                                    .color(MUTED),
+                            );
+                        });
+                    });
+                });
+            ctx.request_repaint_after(Duration::from_millis(150));
+            return;
+        }
+
         egui::TopBottomPanel::top("blackshard_top")
             .exact_height(61.0)
             .frame(
@@ -1598,6 +1644,25 @@ impl eframe::App for BlackshardApp {
         } else {
             Duration::from_secs(1)
         });
+    }
+}
+
+fn should_show_loading_screen(runtime: &UiRuntimeState) -> bool {
+    use crate::readiness::ReadinessState;
+    if let Some(readiness) = &runtime.readiness {
+        matches!(
+            readiness,
+            ReadinessState::Starting
+                | ReadinessState::LoadingSettings
+                | ReadinessState::LoadingDefinitions
+                | ReadinessState::LoadingFreshClam
+                | ReadinessState::StartingDetectionWorkers
+                | ReadinessState::ConnectingDriver
+                | ReadinessState::ValidatingProtocol
+                | ReadinessState::RunningSelfTest
+        )
+    } else {
+        matches!(runtime.protection, ProtectionStatus::Starting)
     }
 }
 

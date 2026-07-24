@@ -1,7 +1,7 @@
 use crate::behavior::{ProcessTrust, RansomwareMonitor};
 use crate::config::Settings;
 use crate::detection::{
-    open_candidate_file, opened_file_id, DetectionEngine, DetectionReport, DetectionVerdict,
+    open_candidate_file, opened_file_identity, DetectionEngine, DetectionReport, DetectionVerdict,
 };
 use crate::history::{EventHistory, EventKind, SecurityEvent};
 use crate::quarantine::{IsolationState, QuarantineRecord, QuarantineStore};
@@ -12,9 +12,14 @@ use std::fs::File;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
+use crate::verdict_cache::{VerdictCache, VerdictCacheKey, CachedVerdict, CacheVerdict, AnalysisCompleteness};
 use std::thread::{self, JoinHandle};
+
+#[path = "connection_supervisor.rs"]
+mod connection_supervisor;
+
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, S_OK,
@@ -32,7 +37,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[link(name = "FltLib")]
 extern "system" {
-    fn FilterConnectCommunicationPort(
+    pub(crate) fn FilterConnectCommunicationPort(
         port_name: *const u16,
         options: u32,
         context: *const c_void,
@@ -41,16 +46,16 @@ extern "system" {
         port: *mut HANDLE,
     ) -> i32;
 
-    fn FilterGetMessage(
+    pub(crate) fn FilterGetMessage(
         port: HANDLE,
         message_buffer: *mut c_void,
         message_buffer_size: u32,
         overlapped: *mut c_void,
     ) -> i32;
 
-    fn FilterReplyMessage(port: HANDLE, reply_buffer: *mut c_void, reply_buffer_size: u32) -> i32;
+    pub(crate) fn FilterReplyMessage(port: HANDLE, reply_buffer: *mut c_void, reply_buffer_size: u32) -> i32;
 
-    fn FilterSendMessage(
+    pub(crate) fn FilterSendMessage(
         port: HANDLE,
         input: *const c_void,
         input_size: u32,
@@ -105,59 +110,59 @@ pub struct DriverHealthCounters {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct FilterMessageHeader {
-    reply_length: u32,
-    message_id: u64,
+pub(crate) struct FilterMessageHeader {
+    pub reply_length: u32,
+    pub message_id: u64,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct FilterReplyHeader {
-    status: i32,
-    message_id: u64,
+pub(crate) struct FilterReplyHeader {
+    pub status: i32,
+    pub message_id: u64,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct BlackshardNotification {
-    magic: u32,
-    version: u16,
-    size: u16,
-    process_id: u32,
-    desired_access: u32,
-    operation: u32,
-    path_length: u32,
-    file_path: [u16; MAX_FILE_PATH_LENGTH],
-    file_id: u64,
-    content_generation: u64,
-    process_start_key: u64,
-    must_enforce: u32,
-    reserved: u32,
+pub(crate) struct BlackshardNotification {
+    pub magic: u32,
+    pub version: u16,
+    pub size: u16,
+    pub process_id: u32,
+    pub desired_access: u32,
+    pub operation: u32,
+    pub path_length: u32,
+    pub file_path: [u16; MAX_FILE_PATH_LENGTH],
+    pub file_id: u64,
+    pub content_generation: u64,
+    pub process_start_key: u64,
+    pub must_enforce: u32,
+    pub reserved: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct BlackshardMessage {
-    header: FilterMessageHeader,
-    notification: BlackshardNotification,
+pub(crate) struct BlackshardMessage {
+    pub header: FilterMessageHeader,
+    pub notification: BlackshardNotification,
 }
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DriverVerdict {
+pub(crate) enum DriverVerdict {
     Allow = 0,
     Block = 1,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct BlackshardReplyMessage {
-    header: FilterReplyHeader,
-    magic: u32,
-    version: u16,
-    size: u16,
-    verdict: DriverVerdict,
-    risk_score: u32,
+pub(crate) struct BlackshardReplyMessage {
+    pub header: FilterReplyHeader,
+    pub magic: u32,
+    pub version: u16,
+    pub size: u16,
+    pub verdict: DriverVerdict,
+    pub risk_score: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +232,8 @@ impl RealtimeProtection {
         history: Arc<EventHistory>,
         settings: Arc<RwLock<Settings>>,
         events: mpsc::SyncSender<RealtimeEvent>,
+        verdict_cache: Arc<RwLock<VerdictCache>>,
+        definition_generation: Arc<AtomicU64>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let port = Arc::new(AtomicIsize::new(0));
@@ -235,7 +242,7 @@ impl RealtimeProtection {
         let worker_port = Arc::clone(&port);
         let worker_counters = Arc::clone(&counters);
         let worker = thread::spawn(move || {
-            connection_loop(
+            connection_supervisor::connection_loop(
                 engine,
                 quarantine,
                 history,
@@ -244,6 +251,8 @@ impl RealtimeProtection {
                 worker_counters,
                 worker_stop,
                 worker_port,
+                verdict_cache,
+                definition_generation,
             )
         });
 
@@ -343,196 +352,13 @@ impl Drop for RealtimeProtection {
 }
 
 #[derive(Clone, Copy)]
-struct WorkItem {
-    port: HANDLE,
-    message: BlackshardMessage,
+pub(crate) struct WorkItem {
+    pub port: HANDLE,
+    pub message: BlackshardMessage,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn connection_loop(
-    engine: SharedDetectionEngine,
-    quarantine: Arc<QuarantineStore>,
-    history: Arc<EventHistory>,
-    settings: Arc<RwLock<Settings>>,
-    events: mpsc::SyncSender<RealtimeEvent>,
-    counters: Arc<Mutex<RealtimeCounters>>,
-    stop: Arc<AtomicBool>,
-    published_port: Arc<AtomicIsize>,
-) {
-    let port_name: Vec<u16> = "\\BlackshardPort\0".encode_utf16().collect();
-    let ransomware_monitor = Arc::new(Mutex::new(RansomwareMonitor::default()));
-    let process_trust_cache = Arc::new(Mutex::new(HashMap::new()));
-    while !stop.load(Ordering::Acquire) {
-        let _ = events.try_send(RealtimeEvent::Connection(ProtectionConnection::Connecting));
-        let mut port_handle: HANDLE = 0;
-        let connect_result = unsafe {
-            FilterConnectCommunicationPort(
-                port_name.as_ptr(),
-                0,
-                ptr::null(),
-                0,
-                ptr::null(),
-                &mut port_handle,
-            )
-        };
-        if connect_result != S_OK {
-            let error_text = hresult_text(connect_result);
-            log::error!("FilterConnectCommunicationPort failed: connect {error_text}");
-            let _ = events.try_send(RealtimeEvent::Connection(
-                ProtectionConnection::Disconnected(format!("connect {error_text}")),
-            ));
-            interruptible_wait(&stop, Duration::from_secs(2));
-            continue;
-        }
-
-        published_port.store(port_handle, Ordering::Release);
-        log::info!("Kernel real-time protection connected via FilterConnectCommunicationPort");
-        let _ = history.append(&SecurityEvent::new(
-            EventKind::ProtectionStarted,
-            "Kernel real-time protection connected",
-        ));
-        let _ = events.try_send(RealtimeEvent::Connection(ProtectionConnection::Connected));
-
-        let worker_count = settings
-            .read()
-            .map(|value| value.worker_count.clamp(1, 8))
-            .unwrap_or(2);
-        let (sender, receiver) = mpsc::sync_channel::<WorkItem>(worker_count * 16);
-        let receiver = Arc::new(Mutex::new(receiver));
-        let mut scan_workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let receiver = Arc::clone(&receiver);
-            let engine = Arc::clone(&engine);
-            let quarantine = Arc::clone(&quarantine);
-            let history = Arc::clone(&history);
-            let settings = Arc::clone(&settings);
-            let events = events.clone();
-            let counters = Arc::clone(&counters);
-            let worker_stop = Arc::clone(&stop);
-            let ransomware_monitor = Arc::clone(&ransomware_monitor);
-            let process_trust_cache = Arc::clone(&process_trust_cache);
-            scan_workers.push(thread::spawn(move || {
-                realtime_worker(
-                    receiver,
-                    engine,
-                    quarantine,
-                    history,
-                    settings,
-                    events,
-                    counters,
-                    worker_stop,
-                    ransomware_monitor,
-                    process_trust_cache,
-                )
-            }));
-        }
-        let disconnect_reason = loop {
-            if stop.load(Ordering::Acquire) {
-                break "real-time protection stopped".to_owned();
-            }
-
-            #[repr(C, align(16))]
-            struct AlignedMessage(BlackshardMessage);
-
-            let mut message = unsafe { mem::zeroed::<AlignedMessage>() };
-            let get_result = unsafe {
-                FilterGetMessage(
-                    port_handle,
-                    &mut message as *mut _ as *mut c_void,
-                    mem::size_of::<BlackshardMessage>() as u32,
-                    ptr::null_mut(),
-                )
-            };
-            if get_result != S_OK {
-                let error_text = hresult_text(get_result);
-                log::error!("FilterGetMessage failed: get {error_text}");
-                break format!("get {error_text}");
-            }
-
-            let message = message.0;
-            if !valid_notification(&message.notification) {
-                let _ = reply(
-                    port_handle,
-                    message.header.message_id,
-                    DriverVerdict::Allow,
-                    0,
-                );
-                continue;
-            }
-
-            let path = notification_path(&message.notification);
-            let item = WorkItem {
-                port: port_handle,
-                message,
-            };
-            match sender.try_send(item) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(item)) => {
-                    let overload_verdict = if item.message.notification.must_enforce != 0 {
-                        DriverVerdict::Block
-                    } else {
-                        DriverVerdict::Allow
-                    };
-                    let accepted = reply(
-                        item.port,
-                        item.message.header.message_id,
-                        overload_verdict,
-                        0,
-                    );
-                    let _ = accepted;
-                    if let Ok(mut value) = counters.lock() {
-                        value.bypassed_due_to_load += 1;
-                    }
-                    let _ = events.try_send(RealtimeEvent::QueueSaturated {
-                        process_id: item.message.notification.process_id,
-                        path,
-                    });
-                }
-                Err(mpsc::TrySendError::Disconnected(item)) => {
-                    let disconnected_verdict = if item.message.notification.must_enforce != 0 {
-                        DriverVerdict::Block
-                    } else {
-                        DriverVerdict::Allow
-                    };
-                    let _ = reply(
-                        item.port,
-                        item.message.header.message_id,
-                        disconnected_verdict,
-                        0,
-                    );
-                    break "real-time scan workers stopped unexpectedly".to_owned();
-                }
-            }
-        };
-
-        drop(sender);
-        for worker in scan_workers {
-            let _ = worker.join();
-        }
-
-        if published_port
-            .compare_exchange(port_handle, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            unsafe { CloseHandle(port_handle) };
-        }
-        let _ = history.append(&SecurityEvent::new(
-            EventKind::ProtectionStopped,
-            disconnect_reason.clone(),
-        ));
-        let _ = events.try_send(RealtimeEvent::Connection(if stop.load(Ordering::Acquire) {
-            ProtectionConnection::Stopped
-        } else {
-            ProtectionConnection::Disconnected(disconnect_reason)
-        }));
-        if !stop.load(Ordering::Acquire) {
-            interruptible_wait(&stop, Duration::from_secs(2));
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn realtime_worker(
+pub(crate) fn realtime_worker(
     receiver: Arc<Mutex<mpsc::Receiver<WorkItem>>>,
     engine: SharedDetectionEngine,
     quarantine: Arc<QuarantineStore>,
@@ -543,6 +369,8 @@ fn realtime_worker(
     stop: Arc<AtomicBool>,
     ransomware_monitor: Arc<Mutex<RansomwareMonitor>>,
     process_trust_cache: Arc<Mutex<HashMap<(u32, u64), ProcessTrust>>>,
+    verdict_cache: Arc<RwLock<VerdictCache>>,
+    definition_generation: Arc<AtomicU64>,
 ) {
     loop {
         let item = {
@@ -611,14 +439,79 @@ fn realtime_worker(
             Arc::clone(&active)
         };
         let report = match candidate {
-            Ok(file) => match opened_file_id(&file) {
-                Ok(file_id) if file_id == notification.file_id => {
-                    active_engine.scan_open_file(&file)
+            Ok(file) => match opened_file_identity(&file) {
+                Ok(identity) if identity.file_id == notification.file_id => {
+                    let key = VerdictCacheKey {
+                        volume_serial: identity.volume_serial_number as u64,
+                        file_id: identity.file_id,
+                        file_size: file.metadata().map(|m| m.len()).unwrap_or(0),
+                        content_generation: notification.content_generation,
+                    };
+                    let current_gen = definition_generation.load(Ordering::Acquire);
+                    
+                    let mut cached_result = None;
+                    if let Ok(mut cache) = verdict_cache.write() {
+                        cached_result = cache.get(&key, current_gen);
+                    }
+
+                    if let Some(cached) = cached_result {
+                        log::info!("Real-time cache hit for {:?}", key);
+                        DetectionReport {
+                            verdict: match cached.verdict {
+                                CacheVerdict::Clean => DetectionVerdict::Clean,
+                                CacheVerdict::Malicious => DetectionVerdict::Malicious,
+                                CacheVerdict::Suspicious => DetectionVerdict::Suspicious,
+                                CacheVerdict::ScanError => DetectionVerdict::Error,
+                            },
+                            risk_score: cached.risk_score as u8,
+                            confidence: 90,
+                            threat_name: cached.threat_name.clone(),
+                            sha256: None,
+                            file_size: key.file_size,
+                            bytes_scanned: 0,
+                            truncated: false,
+                            analysis_completeness: crate::engine::AnalysisCompleteness::Complete,
+                            static_report: None,
+                            rule_matches: Vec::new(),
+                            similarity_matches: Vec::new(),
+                            container_inspection: None,
+                            amsi_report: None,
+                            amsi_error: None,
+                            elapsed: std::time::Duration::ZERO,
+                            from_cache: true,
+                            error: None,
+                            automatic_quarantine_eligible: false, 
+                            execution_block_eligible: cached.verdict == CacheVerdict::Malicious,
+                        }
+                    } else {
+                        log::debug!("Real-time cache miss for {:?}", key);
+                        let scan_result = active_engine.scan_open_file(&file);
+                        
+                        if let Ok(mut cache) = verdict_cache.write() {
+                            cache.insert(key, CachedVerdict {
+                                verdict: match scan_result.verdict {
+                                    DetectionVerdict::Clean => CacheVerdict::Clean,
+                                    DetectionVerdict::Malicious => CacheVerdict::Malicious,
+                                    DetectionVerdict::Suspicious => CacheVerdict::Suspicious,
+                                    DetectionVerdict::Error => CacheVerdict::ScanError,
+                                },
+                                risk_score: scan_result.risk_score as u32,
+                                threat_name: scan_result.threat_name.clone(),
+                                definition_generation: current_gen,
+                                freshclam_generation: 0,
+                                rule_generation: 0,
+                                model_generation: 0,
+                                scanned_at: chrono::Utc::now(),
+                                analysis_completeness: AnalysisCompleteness::Complete,
+                            });
+                        }
+                        scan_result
+                    }
                 }
-                Ok(file_id) => DetectionReport::error(
+                Ok(identity) => DetectionReport::error(
                     format!(
                         "kernel/user file identity mismatch (expected {:016x}, opened {:016x})",
-                        notification.file_id, file_id
+                        notification.file_id, identity.file_id
                     ),
                     Duration::ZERO,
                 ),
@@ -798,6 +691,11 @@ fn handle_protected_modification(
         notification.process_id,
         notification.process_start_key,
     );
+    let action = match notification.operation {
+        OPERATION_PROTECTED_WRITE => Some(crate::behavior::FileAction::Write { entropy: None }),
+        OPERATION_PROTECTED_METADATA => Some(crate::behavior::FileAction::Rename),
+        _ => None,
+    };
     let decision = monitor
         .lock()
         .map(|mut monitor| {
@@ -807,6 +705,7 @@ fn handle_protected_modification(
                 path,
                 process_trust,
                 block_mode,
+                action,
             )
         })
         .unwrap_or_default();
@@ -921,7 +820,7 @@ fn process_image_path(process_id: u32) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf16_lossy(&buffer)))
 }
 
-fn reply(port: HANDLE, message_id: u64, verdict: DriverVerdict, risk_score: u32) -> bool {
+pub(crate) fn reply(port: HANDLE, message_id: u64, verdict: DriverVerdict, risk_score: u32) -> bool {
     let mut reply = BlackshardReplyMessage {
         header: FilterReplyHeader {
             status: 0,
@@ -943,14 +842,14 @@ fn reply(port: HANDLE, message_id: u64, verdict: DriverVerdict, risk_score: u32)
     }
 }
 
-fn notification_path(notification: &BlackshardNotification) -> PathBuf {
+pub(crate) fn notification_path(notification: &BlackshardNotification) -> PathBuf {
     let path_length = (notification.path_length as usize).min(MAX_FILE_PATH_LENGTH - 1);
     PathBuf::from(String::from_utf16_lossy(
         &notification.file_path[..path_length],
     ))
 }
 
-fn valid_notification(notification: &BlackshardNotification) -> bool {
+pub(crate) fn valid_notification(notification: &BlackshardNotification) -> bool {
     notification.magic == BLACKSHARD_PROTOCOL_MAGIC
         && notification.version == BLACKSHARD_PROTOCOL_VERSION
         && notification.size as usize == mem::size_of::<BlackshardNotification>()
@@ -1017,7 +916,7 @@ fn device_path_to_openable_path(path: &Path) -> PathBuf {
     }
 }
 
-fn hresult_text(hr: i32) -> String {
+pub(crate) fn hresult_text(hr: i32) -> String {
     match hr as u32 {
         0x8007_0002 => {
             "kernel communication port not found; the signed minifilter is not loaded".to_owned()
@@ -1029,7 +928,7 @@ fn hresult_text(hr: i32) -> String {
     }
 }
 
-fn interruptible_wait(stop: &AtomicBool, duration: Duration) {
+pub(crate) fn interruptible_wait(stop: &AtomicBool, duration: Duration) {
     let steps = (duration.as_millis() / 100).max(1);
     for _ in 0..steps {
         if stop.load(Ordering::Acquire) {

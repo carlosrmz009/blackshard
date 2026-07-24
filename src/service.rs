@@ -103,6 +103,8 @@ pub struct ServiceHealthSnapshot {
     pub last_error: Option<String>,
     pub definitions: ServiceDefinitionHealth,
     pub counters: ServiceCounters,
+    #[serde(default)]
+    pub readiness: Option<crate::readiness::ReadinessState>,
 }
 
 impl ServiceHealthSnapshot {
@@ -124,6 +126,7 @@ impl ServiceHealthSnapshot {
                 version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
             },
             counters: ServiceCounters::default(),
+            readiness: Some(crate::readiness::ReadinessState::Starting),
         }
     }
 }
@@ -396,6 +399,8 @@ mod windows_service_host {
     where
         F: FnMut(BodyState) -> Result<(), String>,
     {
+        let readiness = crate::readiness::ReadinessMonitor::new();
+        readiness.update_state(crate::readiness::ReadinessState::Starting);
         report_state(BodyState::StartPending)?;
         log::info!("Blackshard service is starting");
 
@@ -403,6 +408,7 @@ mod windows_service_host {
         let started_at = Utc::now();
         let history = Arc::new(EventHistory::default_for_machine());
         let settings_path = Settings::default_machine_path();
+        readiness.update_state(crate::readiness::ReadinessState::LoadingSettings);
         let initial_settings = match Settings::load(&settings_path) {
             Ok(settings) => settings,
             Err(error) => {
@@ -420,35 +426,62 @@ mod windows_service_host {
             .unwrap_or(true);
 
         let mut snapshot = ServiceHealthSnapshot::starting(started_at, real_time_enabled);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
         write_health_best_effort(&health_path, &snapshot, &history);
 
+        readiness.update_state(crate::readiness::ReadinessState::LoadingFreshClam);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
+        write_health_best_effort(&health_path, &snapshot, &history);
+
+        let program_data = std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+            
+        if let Err(e) = crate::freshclam::downloader::download_databases(&program_data) {
+            log::warn!("Initial FreshClam download failed: {:?}", e);
+        }
+        crate::freshclam::scheduler::start_scheduler(program_data.clone());
+
+        readiness.update_state(crate::readiness::ReadinessState::LoadingDefinitions);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
         let engine = match load_detection_engine(&mut snapshot, &history) {
             Ok(engine) => new_shared_detection_engine(engine),
             Err(error) => {
                 let message = format!("Detection engine initialization failed: {error}");
                 log::error!("{message}");
+                readiness.update_state(crate::readiness::ReadinessState::Failed { reason: message.clone() });
                 snapshot.lifecycle = ServiceLifecycle::Stopped;
                 snapshot.connection = ServiceConnection::Stopped;
                 snapshot.updated_at = Utc::now();
                 snapshot.last_error = Some(message.clone());
+                snapshot.readiness = Some(readiness.diagnostics().current_state);
                 write_health_best_effort(&health_path, &snapshot, &history);
                 return Err(message);
             }
         };
+        readiness.update_state(crate::readiness::ReadinessState::StartingDetectionWorkers);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
         let quarantine = Arc::new(QuarantineStore::default_for_machine());
         let (event_sender, event_receiver) = mpsc::sync_channel(REALTIME_EVENT_CHANNEL_CAPACITY);
+        let definition_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let verdict_cache = crate::verdict_cache::VerdictCache::new(100_000);
         let mut protection = RealtimeProtection::start(
             Arc::clone(&engine),
             Arc::clone(&quarantine),
             Arc::clone(&history),
             Arc::clone(&settings),
             event_sender,
+            Arc::clone(&verdict_cache),
+            Arc::clone(&definition_generation),
         );
         let counters = Arc::clone(&protection.counters);
         let (mut update_client, update_receiver) =
             start_definition_updater(&settings, &mut snapshot, &history);
         let mut stable_definitions = snapshot.definitions.clone();
         let (rpc_update_sender, rpc_update_receiver) = mpsc::sync_channel(1);
+        
+        readiness.update_state(crate::readiness::ReadinessState::ValidatingProtocol);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
         let rpc_server = match RpcServer::start(RpcServiceResources::new(
             Arc::clone(&engine),
             Arc::clone(&quarantine),
@@ -464,16 +497,20 @@ mod windows_service_host {
                     client.stop();
                 }
                 protection.stop();
+                readiness.update_state(crate::readiness::ReadinessState::Failed { reason: error.clone() });
                 snapshot.lifecycle = ServiceLifecycle::Stopped;
                 snapshot.connection = ServiceConnection::Stopped;
                 snapshot.updated_at = Utc::now();
                 snapshot.last_error = Some(error.clone());
+                snapshot.readiness = Some(readiness.diagnostics().current_state);
                 write_health_best_effort(&health_path, &snapshot, &history);
                 return Err(error);
             }
         };
         let mut last_manual_update = None::<Instant>;
 
+        readiness.update_state(crate::readiness::ReadinessState::ConnectingDriver);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
         snapshot.lifecycle = ServiceLifecycle::Running;
         snapshot.updated_at = Utc::now();
         snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
@@ -484,11 +521,13 @@ mod windows_service_host {
                 client.stop();
             }
             protection.stop();
+            readiness.update_state(crate::readiness::ReadinessState::Failed { reason: error.clone() });
             snapshot.lifecycle = ServiceLifecycle::Stopped;
             snapshot.connection = ServiceConnection::Stopped;
             snapshot.updated_at = Utc::now();
             snapshot.last_error = Some(error.clone());
             snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
+            snapshot.readiness = Some(readiness.diagnostics().current_state);
             write_health_best_effort(&health_path, &snapshot, &history);
             return Err(error);
         }
@@ -523,6 +562,7 @@ mod windows_service_host {
                         event,
                         &engine,
                         &history,
+                        &definition_generation,
                     );
                 }
             }
@@ -531,12 +571,14 @@ mod windows_service_host {
                 match load_detection_engine(&mut snapshot, &history) {
                     Ok(fresh) => {
                         replace_detection_engine(&engine, fresh);
+                        definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
                         stable_definitions = snapshot.definitions.clone();
                     }
                     Err(error) => {
                         match DetectionEngine::builtin() {
                             Ok(built_in) => {
                                 replace_detection_engine(&engine, built_in);
+                                definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
                                 stable_definitions = ServiceDefinitionHealth::BuiltIn {
                                     version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
                                 };
@@ -595,6 +637,18 @@ mod windows_service_host {
                 .map(|active| active.external_rules_tripped())
                 .unwrap_or(true);
 
+            let is_healthy = snapshot.connection == ServiceConnection::Connected
+                && !snapshot.external_rules_suppressed
+                && snapshot.last_error.is_none();
+            let detail = snapshot.connection_detail.clone().or_else(|| snapshot.last_error.clone());
+            readiness.report_health(is_healthy, detail);
+            
+            let current_readiness = readiness.diagnostics().current_state;
+            if snapshot.readiness.as_ref() != Some(&current_readiness) {
+                snapshot.readiness = Some(current_readiness);
+                changed = true;
+            }
+
             if changed || last_health_write.elapsed() >= HEALTH_WRITE_INTERVAL {
                 snapshot.updated_at = Utc::now();
                 snapshot.counters =
@@ -607,6 +661,8 @@ mod windows_service_host {
             }
         }
 
+        readiness.update_state(crate::readiness::ReadinessState::Stopping);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
         snapshot.lifecycle = ServiceLifecycle::StopPending;
         snapshot.updated_at = Utc::now();
         snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
@@ -619,6 +675,8 @@ mod windows_service_host {
         }
         protection.stop();
 
+        readiness.update_state(crate::readiness::ReadinessState::Stopped);
+        snapshot.readiness = Some(readiness.diagnostics().current_state);
         snapshot.lifecycle = ServiceLifecycle::Stopped;
         snapshot.connection = ServiceConnection::Stopped;
         snapshot.connection_detail = None;
@@ -711,6 +769,7 @@ mod windows_service_host {
         event: UpdateEvent,
         engine: &SharedDetectionEngine,
         history: &EventHistory,
+        definition_generation: &Arc<std::sync::atomic::AtomicU64>,
     ) -> bool {
         match event {
             UpdateEvent::CheckStarted { .. } => {
@@ -721,6 +780,7 @@ mod windows_service_host {
             UpdateEvent::Installed { .. } => match load_detection_engine(snapshot, history) {
                 Ok(updated) => {
                     replace_detection_engine(engine, updated);
+                    definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
                     *stable_definitions = snapshot.definitions.clone();
                 }
                 Err(error) => {
