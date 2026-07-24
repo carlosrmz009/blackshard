@@ -1,5 +1,5 @@
 
-![Logo](https://github.com/carlosrmz009/blackshard-site/blob/main/assets/logo_horizontal.png?raw=true)
+![Logo](<img width="1920" height="540" alt="logo_horizontal" src="https://github.com/user-attachments/assets/723cbe59-ae90-45e1-a24f-edd06ac648d6" />)
 
 open-source adaptive antivirus agent
 
