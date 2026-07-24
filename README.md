@@ -54,7 +54,7 @@ so yeah, it's free. forever.
 
 you can't. not yet. i'm working on it :)
 
-jokes aside, please do not tell chatgpt to help you install it... you could break your computer.
+jokes aside, please do not tell chatgpt to help you install it... IT WON'T WORK, and also you could break your computer :(
 
 ### How does it work?
 
