@@ -632,7 +632,7 @@ dependencies = [
  "walkdir",
  "wgpu",
  "windows-service",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "winrt-notification",
  "yara-x",
  "zip",
