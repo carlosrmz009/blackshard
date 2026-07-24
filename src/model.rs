@@ -1,12 +1,12 @@
 #[derive(Debug, Clone, PartialEq)]
-pub struct ModelFeatures {
+pub struct HeuristicFeatures {
     pub entropy: f32,
     pub section_count: f32,
     pub import_count: f32,
     pub is_pe: f32,
 }
 
-impl Default for ModelFeatures {
+impl Default for HeuristicFeatures {
     fn default() -> Self {
         Self {
             entropy: 0.0,
@@ -18,26 +18,28 @@ impl Default for ModelFeatures {
 }
 
 #[derive(Debug, Clone)]
-pub struct DecisionTreeEnsemble {
+/// Versioned, deterministic static heuristic. This is deliberately not
+/// described as machine learning: it has no trained model artifact or measured
+/// calibration data.
+pub struct StaticHeuristic {
     pub version: u32,
 }
 
-impl Default for DecisionTreeEnsemble {
+impl Default for StaticHeuristic {
     fn default() -> Self {
         Self { version: 1 }
     }
 }
 
-impl DecisionTreeEnsemble {
+impl StaticHeuristic {
     pub fn new(version: u32) -> Self {
         Self { version }
     }
 
     /// Evaluates the extracted features. Returns a float score.
-    pub fn evaluate(&self, features: &ModelFeatures) -> f32 {
+    pub fn evaluate(&self, features: &HeuristicFeatures) -> f32 {
         let mut score = 0.0;
 
-        // Very basic placeholder inference rules
         if features.is_pe > 0.0 {
             if features.entropy > 7.0 {
                 score += 30.0;
@@ -53,26 +55,26 @@ impl DecisionTreeEnsemble {
 }
 
 #[derive(Debug, Clone)]
-pub struct ModelManager {
-    active_model: DecisionTreeEnsemble,
-    previous_model: Option<DecisionTreeEnsemble>,
+pub struct HeuristicManager {
+    active_model: StaticHeuristic,
+    previous_model: Option<StaticHeuristic>,
 }
 
-impl Default for ModelManager {
+impl Default for HeuristicManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ModelManager {
+impl HeuristicManager {
     pub fn new() -> Self {
         Self {
-            active_model: DecisionTreeEnsemble::default(),
+            active_model: StaticHeuristic::default(),
             previous_model: None,
         }
     }
 
-    pub fn update_model(&mut self, new_model: DecisionTreeEnsemble) {
+    pub fn update_model(&mut self, new_model: StaticHeuristic) {
         self.previous_model = Some(self.active_model.clone());
         self.active_model = new_model;
     }
@@ -86,7 +88,7 @@ impl ModelManager {
         }
     }
 
-    pub fn active(&self) -> &DecisionTreeEnsemble {
+    pub fn active(&self) -> &StaticHeuristic {
         &self.active_model
     }
 }

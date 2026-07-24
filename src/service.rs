@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// User-mode protection service. This must remain distinct from the
 /// `blackshard` FILE_SYSTEM_DRIVER service installed by the minifilter INF.
 pub const SERVICE_NAME: &str = "BlackshardProtectionService";
-pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 3;
+pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 4;
 pub const SERVICE_HEALTH_FILE_NAME: &str = "service-health.json";
 pub const UPDATE_REQUEST_FILE_NAME: &str = "update-request";
 
@@ -92,6 +92,10 @@ pub struct ServiceCounters {
     pub required_enforcement_blocks: u64,
     pub driver_queue_overloads: u64,
     pub driver_ready_generation: u64,
+    pub clamav_clean: u64,
+    pub clamav_detected: u64,
+    pub clamav_errors: u64,
+    pub clamav_not_scanned: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +116,10 @@ pub struct ServiceHealthSnapshot {
     pub counters: ServiceCounters,
     #[serde(default)]
     pub readiness: Option<crate::readiness::ReadinessState>,
+    #[serde(default)]
+    pub clamav_engine_version: Option<String>,
+    #[serde(default)]
+    pub clamav_database_version: Option<String>,
 }
 
 impl ServiceHealthSnapshot {
@@ -134,6 +142,8 @@ impl ServiceHealthSnapshot {
             },
             counters: ServiceCounters::default(),
             readiness: Some(crate::readiness::ReadinessState::Starting),
+            clamav_engine_version: None,
+            clamav_database_version: None,
         }
     }
 }
@@ -443,16 +453,35 @@ mod windows_service_host {
         let program_data = std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-
-        if let Err(e) = crate::freshclam::downloader::download_databases(&program_data) {
-            log::warn!("Initial FreshClam download failed: {:?}", e);
-        }
-        crate::freshclam::scheduler::start_scheduler(program_data.clone());
+        let blackshard_data = program_data.join("Blackshard");
+        let mut active_freshclam =
+            match crate::freshclam::downloader::download_databases(&blackshard_data) {
+                Ok(active) => Some(active),
+                Err(error) => {
+                    log::warn!("Initial FreshClam activation failed: {error}");
+                    crate::freshclam::downloader::active_database(&blackshard_data).ok()
+                }
+            };
+        let freshclam_receiver =
+            crate::freshclam::scheduler::start_scheduler(blackshard_data.clone());
 
         readiness.update_state(crate::readiness::ReadinessState::LoadingDefinitions);
         snapshot.readiness = Some(readiness.diagnostics().current_state);
         let engine = match load_detection_engine(&mut snapshot, &history) {
-            Ok(engine) => new_shared_detection_engine(engine),
+            Ok(engine) => {
+                let engine = if let Some(active) = active_freshclam.as_ref() {
+                    match load_freshclam_native_index(active) {
+                        Ok(index) => engine.with_native_index(index),
+                        Err(error) => {
+                            log::warn!("ClamAV native SHA-256 index was not loaded: {error}");
+                            engine
+                        }
+                    }
+                } else {
+                    engine
+                };
+                new_shared_detection_engine(engine)
+            }
             Err(error) => {
                 let message = format!("Detection engine initialization failed: {error}");
                 log::error!("{message}");
@@ -551,6 +580,11 @@ mod windows_service_host {
         let mut runtime_error = None;
         let mut consecutive_health_successes = 0u32;
         let mut consecutive_health_failures = 0u32;
+        let mut self_test_passed = false;
+        let mut last_self_test_attempt = None::<Instant>;
+        let mut last_worker_health_check = None::<Instant>;
+        let mut clamav_worker_healthy = false;
+        let mut parser_worker_healthy = false;
         while !stop_requested.load(Ordering::Acquire) {
             let mut changed = false;
             match event_receiver.recv_timeout(Duration::from_millis(500)) {
@@ -567,6 +601,26 @@ mod windows_service_host {
             }
             while let Ok(event) = event_receiver.try_recv() {
                 changed |= apply_realtime_event(&mut snapshot, event);
+            }
+
+            while let Ok(active) = freshclam_receiver.try_recv() {
+                match load_freshclam_native_index(&active) {
+                    Ok(index) => {
+                        if let Ok(current) = engine.read() {
+                            current.replace_native_index(index);
+                            current.reset_clamav_circuit_breaker();
+                        }
+                        active_freshclam = Some(active);
+                        definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        changed = true;
+                    }
+                    Err(error) => {
+                        snapshot.last_error =
+                            Some(format!("FreshClam index activation failed: {error}"));
+                        append_error(&history, snapshot.last_error.as_deref().unwrap());
+                        changed = true;
+                    }
+                }
             }
 
             if let Some(receiver) = &update_receiver {
@@ -654,6 +708,43 @@ mod windows_service_host {
                 .unwrap_or(true);
 
             let driver_health = protection.driver_health().ok();
+            if last_worker_health_check
+                .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(30))
+            {
+                if let Ok(active) = engine.read() {
+                    match active.clamav_worker_health() {
+                        Ok(versions) => {
+                            clamav_worker_healthy = true;
+                            snapshot.clamav_engine_version = Some(versions.engine_version);
+                            snapshot.clamav_database_version = Some(versions.database_version);
+                        }
+                        Err(_) => {
+                            clamav_worker_healthy = false;
+                            snapshot.clamav_engine_version = None;
+                            snapshot.clamav_database_version = None;
+                        }
+                    }
+                    parser_worker_healthy = active.parser_worker_healthy();
+                }
+                last_worker_health_check = Some(Instant::now());
+            }
+            let worker_preflight =
+                active_freshclam.is_some() && clamav_worker_healthy && parser_worker_healthy;
+            if !self_test_passed
+                && driver_health.is_some()
+                && worker_preflight
+                && last_self_test_attempt
+                    .is_none_or(|attempt| attempt.elapsed() >= Duration::from_secs(30))
+            {
+                last_self_test_attempt = Some(Instant::now());
+                match crate::self_test::run_self_test() {
+                    Ok(message) => {
+                        log::info!("{message}");
+                        self_test_passed = true;
+                    }
+                    Err(error) => log::warn!("End-to-end protection self-test failed: {error}"),
+                }
+            }
             let mut components = crate::readiness::ProtectionComponents {
                 service_operational: snapshot.lifecycle == ServiceLifecycle::Running,
                 settings_loaded: true,
@@ -661,12 +752,11 @@ mod windows_service_host {
                     snapshot.definitions,
                     ServiceDefinitionHealth::Failed { .. }
                 ),
-                // The downloader currently stages CVD files but does not
-                // activate or scan with them. These must stay false until the
-                // FreshClam milestone supplies authenticated activation and a
-                // functioning worker.
-                freshclam_loaded: false,
-                freshclam_generation: 0,
+                freshclam_loaded: active_freshclam.is_some(),
+                freshclam_generation: active_freshclam
+                    .as_ref()
+                    .map(|active| active.generation)
+                    .unwrap_or(0),
                 rule_generation: definition_generation.load(std::sync::atomic::Ordering::Acquire),
                 model_generation: 0,
                 driver_connected: snapshot.connection == ServiceConnection::Connected
@@ -675,14 +765,12 @@ mod windows_service_host {
                 driver_ready_generation: driver_health.as_ref().and_then(|health| {
                     (health.ready_generation != 0).then_some(health.ready_generation)
                 }),
-                clamav_worker_healthy: false,
-                parser_worker_healthy: false,
+                clamav_worker_healthy,
+                parser_worker_healthy,
                 quarantine_available: quarantine.list().is_ok(),
                 history_available: history.recent(1).is_ok(),
                 ipc_available: true,
-                // The existing detector-only probe is not the required
-                // driver-to-service-to-enforcement end-to-end self-test.
-                self_test_passed: false,
+                self_test_passed,
                 consecutive_health_successes,
                 consecutive_health_failures,
             };
@@ -952,6 +1040,20 @@ mod windows_service_host {
         Ok(outcome.engine)
     }
 
+    fn load_freshclam_native_index(
+        active: &crate::freshclam::downloader::ActiveDatabase,
+    ) -> Result<crate::freshclam::native_index::NativeIndex, String> {
+        let mut index = crate::freshclam::native_index::NativeIndex::new();
+        let loaded = index
+            .load_from_directory(&active.unpacked_path)
+            .map_err(|error| error.to_string())?;
+        log::info!(
+            "Loaded {loaded} ClamAV SHA-256 signatures for generation {}",
+            active.generation
+        );
+        Ok(index)
+    }
+
     fn apply_realtime_event(snapshot: &mut ServiceHealthSnapshot, event: RealtimeEvent) -> bool {
         match event {
             RealtimeEvent::Connection(connection) => {
@@ -1009,6 +1111,10 @@ mod windows_service_host {
                 quarantined: value.quarantined,
                 scan_errors: value.scan_errors,
                 bypassed_due_to_load: value.bypassed_due_to_load,
+                clamav_clean: value.clamav_clean,
+                clamav_detected: value.clamav_detected,
+                clamav_errors: value.clamav_errors,
+                clamav_not_scanned: value.clamav_not_scanned,
                 ..ServiceCounters::default()
             },
             Err(_) => {

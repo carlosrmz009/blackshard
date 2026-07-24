@@ -66,6 +66,7 @@ impl ProtectionComponents {
             (self.driver_connected, "minifilter connection"),
             (self.driver_protocol_validated, "driver protocol"),
             (self.clamav_worker_healthy, "ClamAV scanner worker"),
+            (self.parser_worker_healthy, "isolated parser worker"),
             (self.quarantine_available, "quarantine store"),
             (self.history_available, "event history"),
             (self.ipc_available, "local control server"),
@@ -253,7 +254,7 @@ mod tests {
             driver_protocol_validated: true,
             driver_ready_generation: Some(9),
             clamav_worker_healthy: true,
-            parser_worker_healthy: false,
+            parser_worker_healthy: true,
             quarantine_available: true,
             history_available: true,
             ipc_available: true,
@@ -288,6 +289,7 @@ mod tests {
             |components: &mut ProtectionComponents| components.driver_connected = false,
             |components: &mut ProtectionComponents| components.self_test_passed = false,
             |components: &mut ProtectionComponents| components.clamav_worker_healthy = false,
+            |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
         ] {
             let mut components = healthy_components();
             mutate(&mut components);

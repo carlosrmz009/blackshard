@@ -13,6 +13,10 @@
 #define BLACKSHARD_OPERATION_PROTECTED_METADATA 4UL
 #define BLACKSHARD_CONTROL_GET_HEALTH 1UL
 #define BLACKSHARD_CONTROL_SET_READY_GENERATION 2UL
+#define BLACKSHARD_ENTROPY_NOT_MEASURED 0UL
+#define BLACKSHARD_ENTROPY_LOW 1UL
+#define BLACKSHARD_ENTROPY_NORMAL 2UL
+#define BLACKSHARD_ENTROPY_HIGH 3UL
 
 typedef enum _BLACKSHARD_OPERATIONAL_PHASE {
     BlackshardPhaseEarlyBoot = 0,
@@ -252,6 +256,11 @@ BlackshardEvaluateOpenedObject (
     _In_ ULONG MustEnforce,
     _In_ ULONG DesiredAccess,
     _In_ BOOLEAN RestrictToHighRiskName
+    );
+
+ULONG
+BlackshardClassifyWriteEntropy (
+    _Inout_ PFLT_CALLBACK_DATA Data
     );
 
 BLACKSHARD_FAILURE_DECISION
@@ -655,6 +664,7 @@ BlackshardPreWrite (
     LONG previousProcessId;
     BOOLEAN sendTelemetry;
     BOOLEAN block;
+    ULONG writeEntropy;
 
     if (CompletionContext != NULL) {
         *CompletionContext = NULL;
@@ -710,12 +720,13 @@ BlackshardPreWrite (
         KeGetCurrentIrql() == PASSIVE_LEVEL &&
         !KeAreAllApcsDisabled() &&
         IoGetTopLevelIrp() == NULL) {
+        writeEntropy = BlackshardClassifyWriteEntropy(Data);
         block = BlackshardEvaluateOpenedObject(
             Data,
             FltObjects,
             BLACKSHARD_OPERATION_PROTECTED_WRITE,
             FALSE,
-            0,
+            writeEntropy,
             TRUE
             );
         if (block) {
@@ -740,6 +751,60 @@ BlackshardPreWrite (
 
     /* Mark before dispatch: a failed write causes only a conservative rescan. */
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+ULONG
+BlackshardClassifyWriteEntropy (
+    _Inout_ PFLT_CALLBACK_DATA Data
+    )
+{
+    NTSTATUS status;
+    PMDL mdl;
+    PUCHAR bytes;
+    ULONG sampleLength;
+    ULONG index;
+    ULONG uniqueCount;
+    ULONGLONG seen[4];
+
+    if (Data == NULL || Data->Iopb->Parameters.Write.Length < 64) {
+        return BLACKSHARD_ENTROPY_NOT_MEASURED;
+    }
+
+    status = FltLockUserBuffer(Data);
+    if (!NT_SUCCESS(status)) {
+        return BLACKSHARD_ENTROPY_NOT_MEASURED;
+    }
+    mdl = Data->Iopb->Parameters.Write.MdlAddress;
+    if (mdl == NULL) {
+        return BLACKSHARD_ENTROPY_NOT_MEASURED;
+    }
+    bytes = (PUCHAR)MmGetSystemAddressForMdlSafe(
+        mdl,
+        NormalPagePriority | MdlMappingNoExecute
+        );
+    if (bytes == NULL) {
+        return BLACKSHARD_ENTROPY_NOT_MEASURED;
+    }
+
+    sampleLength = min(Data->Iopb->Parameters.Write.Length, 1024UL);
+    RtlZeroMemory(seen, sizeof(seen));
+    uniqueCount = 0;
+    for (index = 0; index < sampleLength; index++) {
+        ULONG bucket = bytes[index] >> 6;
+        ULONGLONG mask = 1ULL << (bytes[index] & 63);
+        if ((seen[bucket] & mask) == 0) {
+            seen[bucket] |= mask;
+            uniqueCount++;
+        }
+    }
+
+    if (uniqueCount <= 64) {
+        return BLACKSHARD_ENTROPY_LOW;
+    }
+    if (sampleLength >= 256 && uniqueCount >= 160) {
+        return BLACKSHARD_ENTROPY_HIGH;
+    }
+    return BLACKSHARD_ENTROPY_NORMAL;
 }
 
 FLT_PREOP_CALLBACK_STATUS

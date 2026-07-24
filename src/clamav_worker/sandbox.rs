@@ -1,13 +1,14 @@
 use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 use std::ptr;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 pub struct SandboxedChild {
     pub child: Child,
@@ -20,6 +21,30 @@ impl Drop for SandboxedChild {
             unsafe {
                 CloseHandle(self.job_handle);
             }
+        }
+    }
+}
+
+impl SandboxedChild {
+    /// Duplicate a service-owned file handle directly into the worker process.
+    /// The worker owns and closes the returned handle value.
+    pub fn duplicate_handle_into_worker(&self, source: HANDLE) -> std::io::Result<u64> {
+        let mut target = 0;
+        let succeeded = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                source,
+                self.child.as_raw_handle() as HANDLE,
+                &mut target,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if succeeded == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(target as u64)
         }
     }
 }
@@ -47,8 +72,12 @@ pub fn spawn_sandboxed_worker() -> std::io::Result<SandboxedChild> {
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
 
-        limit_info.BasicLimitInformation.ActiveProcessLimit = 1; // no child processes
-        limit_info.ProcessMemoryLimit = 512 * 1024 * 1024; // 512 MB memory limit
+        // The protocol worker may launch exactly one official clamscan child.
+        limit_info.BasicLimitInformation.ActiveProcessLimit = 2;
+        // Current ClamAV signature generations exceed 512 MiB when compiled.
+        // This is a per-process ceiling; the service worker remains tiny while
+        // the single resident clamd child may use up to 1536 MiB.
+        limit_info.ProcessMemoryLimit = 1536usize * 1024 * 1024;
 
         let res = SetInformationJobObject(
             job_handle,

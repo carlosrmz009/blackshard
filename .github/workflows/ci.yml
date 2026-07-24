@@ -37,6 +37,7 @@ jobs:
             -DriverPath .\dist\blackshard.sys `
             -AmsiX64Path .\dist\blackshard-amsi-x64.dll `
             -AmsiX86Path .\dist\blackshard-amsi-x86.dll `
+            -ClamRuntimePath .\dist\clamav-runtime.zip `
             -OutputDirectory .\dist
       - name: Verify development artifacts
         shell: pwsh
@@ -47,6 +48,7 @@ jobs:
             "blackshard.sys",
             "blackshard-amsi-x64.dll",
             "blackshard-amsi-x86.dll",
+            "clamav-runtime.zip",
             "BlackshardVmSetup.exe"
           )
           foreach ($file in $required) {
@@ -65,10 +67,10 @@ jobs:
         shell: pwsh
         run: |
           $failed = $false
-          @(Get-ChildItem -Recurse -File | Where-Object Extension -eq '.ps1') | ForEach-Object {
+          @(git ls-files "*.ps1") | ForEach-Object {
             $tokens = $null
             $errors = $null
-            [void][Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $_).Path, [ref]$tokens, [ref]$errors)
             if ($errors.Count) {
               $failed = $true
               $errors | ForEach-Object { Write-Error "$($_.Extent.File): $($_.Message)" }

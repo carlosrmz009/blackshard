@@ -80,6 +80,22 @@ pub enum RuleDisposition {
     Malicious,
 }
 
+/// Origin of a rule match. Provenance is carried into the evidence resolver so
+/// an authenticated publisher bundle cannot silently acquire enforcement
+/// authority merely by labelling a rule "malicious".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleProvenance {
+    EmbeddedTrustedTest,
+    EmbeddedHeuristic,
+    PublisherAuthenticated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleEnforcementAuthority {
+    AlertOnly,
+    ExecutionDeny,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulePolicy {
     pub identifier: String,
@@ -104,6 +120,8 @@ pub struct RuleMatch {
     pub risk_score: u8,
     pub threat_name: String,
     pub description: String,
+    pub provenance: RuleProvenance,
+    pub enforcement_authority: RuleEnforcementAuthority,
 }
 
 #[derive(Clone)]
@@ -176,6 +194,8 @@ impl RuleEngine {
                         "authenticated rule matched without an explicit enforcement policy"
                             .to_owned(),
                 });
+            let provenance = provenance_for(&namespace, &identifier);
+            let enforcement_authority = enforcement_authority_for(&namespace, &identifier);
             matches.push(RuleMatch {
                 identifier,
                 namespace,
@@ -183,9 +203,37 @@ impl RuleEngine {
                 risk_score: policy.risk_score,
                 threat_name: policy.threat_name,
                 description: policy.description,
+                provenance,
+                enforcement_authority,
             });
         }
         Ok(matches)
+    }
+}
+
+fn provenance_for(namespace: &str, identifier: &str) -> RuleProvenance {
+    if namespace != "blackshard_builtin" {
+        RuleProvenance::PublisherAuthenticated
+    } else if matches!(
+        identifier,
+        "Blackshard_EICAR_Test_File" | "Blackshard_Harmless_Self_Test"
+    ) {
+        RuleProvenance::EmbeddedTrustedTest
+    } else {
+        RuleProvenance::EmbeddedHeuristic
+    }
+}
+
+fn enforcement_authority_for(namespace: &str, identifier: &str) -> RuleEnforcementAuthority {
+    if namespace == "blackshard_builtin"
+        && matches!(
+            identifier,
+            "Blackshard_EICAR_Test_File" | "Blackshard_Harmless_Self_Test"
+        )
+    {
+        RuleEnforcementAuthority::ExecutionDeny
+    } else {
+        RuleEnforcementAuthority::AlertOnly
     }
 }
 
@@ -281,6 +329,10 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].disposition, RuleDisposition::Malicious);
         assert_eq!(matches[0].risk_score, 100);
+        assert_eq!(
+            matches[0].enforcement_authority,
+            RuleEnforcementAuthority::ExecutionDeny
+        );
     }
 
     #[test]
@@ -319,5 +371,29 @@ mod tests {
             policies: Vec::new(),
         };
         assert!(RuleEngine::compile(&[bundle]).is_err());
+    }
+
+    #[test]
+    fn authenticated_publisher_rule_is_alert_only_even_when_malicious() {
+        let bundle = RuleBundle {
+            namespace: "publisher".to_owned(),
+            source: "rule external_malicious { condition: true }".to_owned(),
+            policies: vec![RulePolicy {
+                identifier: "external_malicious".to_owned(),
+                disposition: RuleDisposition::Malicious,
+                risk_score: 100,
+                threat_name: "Publisher.Test".to_owned(),
+                description: "test".to_owned(),
+            }],
+        };
+        let matched = RuleEngine::compile(&[bundle]).unwrap().scan(b"x").unwrap();
+        assert_eq!(
+            matched[0].provenance,
+            RuleProvenance::PublisherAuthenticated
+        );
+        assert_eq!(
+            matched[0].enforcement_authority,
+            RuleEnforcementAuthority::AlertOnly
+        );
     }
 }

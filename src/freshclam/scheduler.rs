@@ -1,18 +1,23 @@
 use log::{error, info};
 use rand::Rng;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
 use super::downloader;
 
-pub fn start_scheduler(program_data: PathBuf) {
+pub fn start_scheduler(program_data: PathBuf) -> Receiver<super::downloader::ActiveDatabase> {
+    let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         loop {
             info!("FreshClam updater: starting update cycle.");
 
             match downloader::download_databases(&program_data) {
-                Ok(_) => info!("FreshClam databases updated successfully."),
+                Ok(active) => {
+                    info!("FreshClam databases updated successfully.");
+                    let _ = sender.try_send(active);
+                }
                 Err(e) => error!("FreshClam update failed: {:?}", e),
             }
 
@@ -35,4 +40,5 @@ pub fn start_scheduler(program_data: PathBuf) {
             thread::sleep(sleep_duration);
         }
     });
+    receiver
 }

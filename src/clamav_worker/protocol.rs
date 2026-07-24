@@ -5,13 +5,24 @@ use std::io::{Read, Write};
 pub enum ScanRequest {
     ScanPath(String),
     ScanHandle(u64), // casted from Windows HANDLE
+    HealthCheck,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ScanVerdict {
-    Clean,
+    Clean {
+        engine_version: String,
+        database_version: String,
+    },
     Suspicious,
-    Malicious,
+    Detected {
+        signature: String,
+        engine_version: String,
+        database_version: String,
+    },
+    NotScanned {
+        reason: String,
+    },
     Error(String),
 }
 

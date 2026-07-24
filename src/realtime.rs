@@ -252,6 +252,10 @@ pub struct RealtimeCounters {
     pub quarantined: u64,
     pub scan_errors: u64,
     pub bypassed_due_to_load: u64,
+    pub clamav_clean: u64,
+    pub clamav_detected: u64,
+    pub clamav_errors: u64,
+    pub clamav_not_scanned: u64,
 }
 
 /// Atomically replaceable detector used by the service. Scan workers clone the
@@ -562,24 +566,25 @@ pub(crate) fn realtime_worker(
                                 CacheVerdict::ScanError => DetectionVerdict::Error,
                             },
                             risk_score: cached.risk_score as u8,
-                            confidence: 90,
+                            confidence: cached.confidence,
                             threat_name: cached.threat_name.clone(),
-                            sha256: None,
-                            file_size: key.file_size,
-                            bytes_scanned: 0,
-                            truncated: false,
-                            analysis_completeness: crate::engine::AnalysisCompleteness::Complete,
+                            sha256: cached.sha256.clone(),
+                            file_size: cached.file_size,
+                            bytes_scanned: cached.bytes_scanned,
+                            truncated: cached.truncated,
+                            analysis_completeness: cached.analysis_completeness,
                             static_report: None,
                             rule_matches: Vec::new(),
                             similarity_matches: Vec::new(),
                             container_inspection: None,
                             amsi_report: None,
                             amsi_error: None,
+                            clamav_verdict: cached.clamav_verdict.clone(),
                             elapsed: std::time::Duration::ZERO,
                             from_cache: true,
                             error: None,
-                            automatic_quarantine_eligible: false,
-                            execution_block_eligible: cached.verdict == CacheVerdict::Malicious,
+                            automatic_quarantine_eligible: cached.automatic_quarantine_eligible,
+                            execution_block_eligible: cached.execution_block_eligible,
                         }
                     } else {
                         log::debug!("Real-time cache miss for {:?}", key);
@@ -596,13 +601,22 @@ pub(crate) fn realtime_worker(
                                         DetectionVerdict::Error => CacheVerdict::ScanError,
                                     },
                                     risk_score: scan_result.risk_score as u32,
+                                    confidence: scan_result.confidence,
                                     threat_name: scan_result.threat_name.clone(),
+                                    sha256: scan_result.sha256.clone(),
+                                    file_size: scan_result.file_size,
+                                    bytes_scanned: scan_result.bytes_scanned,
+                                    truncated: scan_result.truncated,
                                     definition_generation: current_gen,
-                                    freshclam_generation: 0,
-                                    rule_generation: 0,
-                                    model_generation: 0,
+                                    freshclam_generation: current_gen,
+                                    rule_generation: current_gen,
+                                    model_generation: current_gen,
                                     scanned_at: chrono::Utc::now(),
-                                    analysis_completeness: AnalysisCompleteness::Complete,
+                                    analysis_completeness: scan_result.analysis_completeness,
+                                    automatic_quarantine_eligible: scan_result
+                                        .automatic_quarantine_eligible,
+                                    execution_block_eligible: scan_result.execution_block_eligible,
+                                    clamav_verdict: scan_result.clamav_verdict.clone(),
                                 },
                             );
                         }
@@ -627,8 +641,16 @@ pub(crate) fn realtime_worker(
             ),
         };
         let driver_verdict = if report.should_block()
-            || (notification.must_enforce != 0 && report.verdict == DetectionVerdict::Error)
-        {
+            || (notification.must_enforce != 0
+                && (report.verdict == DetectionVerdict::Error
+                    || report.analysis_completeness != AnalysisCompleteness::Complete
+                    || report.truncated
+                    || matches!(
+                        report.clamav_verdict,
+                        Some(crate::clamav_worker::protocol::ScanVerdict::Error(_))
+                            | Some(crate::clamav_worker::protocol::ScanVerdict::NotScanned { .. })
+                            | None
+                    ))) {
             DriverVerdict::Block
         } else {
             DriverVerdict::Allow
@@ -717,6 +739,20 @@ pub(crate) fn realtime_worker(
                 DetectionVerdict::Malicious => value.detected += 1,
                 DetectionVerdict::Error => value.scan_errors += 1,
             }
+            match report.clamav_verdict.as_ref() {
+                Some(crate::clamav_worker::protocol::ScanVerdict::Clean { .. }) => {
+                    value.clamav_clean += 1
+                }
+                Some(crate::clamav_worker::protocol::ScanVerdict::Detected { .. }) => {
+                    value.clamav_detected += 1
+                }
+                Some(crate::clamav_worker::protocol::ScanVerdict::Error(_)) => {
+                    value.clamav_errors += 1
+                }
+                Some(crate::clamav_worker::protocol::ScanVerdict::NotScanned { .. })
+                | Some(crate::clamav_worker::protocol::ScanVerdict::Suspicious)
+                | None => value.clamav_not_scanned += 1,
+            }
             if driver_verdict == DriverVerdict::Block && reply_accepted {
                 value.blocked_replies += 1;
             }
@@ -794,7 +830,12 @@ fn handle_protected_modification(
     );
     let action = match notification.operation {
         OPERATION_PROTECTED_WRITE => Some(crate::behavior::FileAction::Write {
-            entropy: crate::behavior::EntropyObservation::NotMeasured,
+            entropy: match notification.desired_access {
+                1 => crate::behavior::EntropyObservation::Low,
+                2 => crate::behavior::EntropyObservation::Normal,
+                3 => crate::behavior::EntropyObservation::High,
+                _ => crate::behavior::EntropyObservation::NotMeasured,
+            },
         }),
         OPERATION_PROTECTED_METADATA => Some(crate::behavior::FileAction::Rename),
         _ => None,

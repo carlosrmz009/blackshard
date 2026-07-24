@@ -5,13 +5,14 @@ use std::io::{Read, Write};
 pub enum ParseRequest {
     ScanPath(String),
     ScanHandle(u64), // casted from Windows HANDLE
+    HealthCheck,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ParseResult {
-    Clean,
-    Suspicious,
-    Malicious,
+    Clean { complete: bool },
+    Suspicious { risk_score: u8, complete: bool },
+    Malicious { threat_name: String, complete: bool },
     Error(String),
 }
 

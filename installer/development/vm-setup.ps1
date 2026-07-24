@@ -169,6 +169,7 @@ function Copy-InstallerPayload {
         "blackshard.sys",
         "blackshard-amsi-x64.dll",
         "blackshard-amsi-x86.dll",
+        "clamav-runtime.zip",
         "install.ps1",
         "uninstall.ps1",
         "verify.ps1",
