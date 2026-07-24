@@ -8,7 +8,7 @@ open-source adaptive antivirus agent
 
 ## License
 
-[GPL v3](https://choosealicense.com/licenses/gpl-3.0/)
+[GPL v3](https://github.com/carlosrmz009/blackshard/blob/main/LICENSE)
 
 
 ## Roadmap
