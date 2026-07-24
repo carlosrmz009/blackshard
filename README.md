@@ -13,6 +13,8 @@ open-source adaptive antivirus agent
 
 ## Roadmap
 
+<img width="1479" height="590" alt="image" src="https://github.com/user-attachments/assets/d48616a4-31f7-4e75-9754-6ea3f2c56010" />
+
 #### Phase I
 
 - windows client
