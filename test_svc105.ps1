@@ -1,5 +1,5 @@
 $svcName = "TestSvc105"
-$exePath = "C:\Program Files\Blackshard\blackshard.exe"
+$exePath = "C:\Program Files\Blackshard\blackshard-service.exe"
 $serviceCommand = "`"$exePath`" --service"
 New-Service -Name $svcName -BinaryPathName "C:\dummy.exe" -StartupType Automatic | Out-Null
 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName" -Name ImagePath -Value $serviceCommand -Type ExpandString

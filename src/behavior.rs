@@ -23,9 +23,17 @@ pub enum ProcessTrust {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EntropyObservation {
+    NotMeasured,
+    Low,
+    Normal,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FileAction {
     Read,
-    Write { entropy: Option<f32> },
+    Write { entropy: EntropyObservation },
     Rename,
     Delete,
     Other,
@@ -55,18 +63,20 @@ impl ProcessAncestry {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     pub fn record_process_create(&mut self, pid: u32, ppid: u32, image_path: String) {
         self.ancestry.insert(pid, ppid);
         self.image_paths.insert(pid, image_path);
     }
-    
+
     pub fn get_chain(&self, mut pid: u32) -> Vec<String> {
         let mut chain = Vec::new();
         while let Some(path) = self.image_paths.get(&pid) {
             chain.push(path.clone());
             if let Some(&ppid) = self.ancestry.get(&pid) {
-                if ppid == pid || ppid == 0 { break; }
+                if ppid == pid || ppid == 0 {
+                    break;
+                }
                 pid = ppid;
             } else {
                 break;
@@ -98,6 +108,16 @@ pub struct RansomwareMonitor {
     ancestry: ProcessAncestry,
 }
 
+struct BehaviorObservation<'a> {
+    process_id: u32,
+    process_start_key: u64,
+    path: &'a Path,
+    trust: ProcessTrust,
+    block_mode: bool,
+    now_millis: u64,
+    action: Option<FileAction>,
+}
+
 impl Default for RansomwareMonitor {
     fn default() -> Self {
         Self {
@@ -111,8 +131,13 @@ impl Default for RansomwareMonitor {
 impl RansomwareMonitor {
     pub fn observe_etw(&mut self, event: EtwEvent) {
         match event {
-            EtwEvent::ProcessCreate { process_id, parent_id, image_path } => {
-                self.ancestry.record_process_create(process_id, parent_id, image_path);
+            EtwEvent::ProcessCreate {
+                process_id,
+                parent_id,
+                image_path,
+            } => {
+                self.ancestry
+                    .record_process_create(process_id, parent_id, image_path);
             }
             EtwEvent::RegistryStartupChange { .. } => {
                 // Not actively used in prevention yet, but satisfies ETW tracking milestone requirements
@@ -130,35 +155,27 @@ impl RansomwareMonitor {
         action: Option<FileAction>,
     ) -> BehaviorDecision {
         let elapsed = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        self.observe_at(
+        self.observe_at(BehaviorObservation {
             process_id,
             process_start_key,
             path,
             trust,
             block_mode,
-            elapsed,
+            now_millis: elapsed,
             action,
-        )
+        })
     }
 
-    fn observe_at(
-        &mut self,
-        process_id: u32,
-        process_start_key: u64,
-        path: &Path,
-        trust: ProcessTrust,
-        block_mode: bool,
-        now_millis: u64,
-        action: Option<FileAction>,
-    ) -> BehaviorDecision {
-        if is_canary_file(path) {
-            return BehaviorDecision {
-                protected_path: true,
-                distinct_files: 1,
-                alert: true,
-                block: block_mode,
-            };
-        }
+    fn observe_at(&mut self, observation: BehaviorObservation<'_>) -> BehaviorDecision {
+        let BehaviorObservation {
+            process_id,
+            process_start_key,
+            path,
+            trust,
+            block_mode,
+            now_millis,
+            action,
+        } = observation;
 
         if !is_protected_document(path) || process_id == 0 || process_start_key == 0 {
             return BehaviorDecision::default();
@@ -192,21 +209,20 @@ impl RansomwareMonitor {
             activity.events.pop_front();
         }
         let fingerprint = path_fingerprint(path);
-        
+
         if let Some(act) = action {
             activity.actions.entry(fingerprint).or_default().push(act);
-            
+
             // Check entropy-change and rename/write patterns
             let seq = activity.actions.get(&fingerprint).unwrap();
             let mut high_entropy_write = false;
             let mut has_rename = false;
             for a in seq {
-                if let FileAction::Write { entropy: Some(e) } = a {
-                    if *e > 7.5 { high_entropy_write = true; }
-                }
-                if let FileAction::Write { entropy: None } = a {
-                    // Implicit high entropy if not measured, to ensure coverage
-                    high_entropy_write = true; 
+                if let FileAction::Write {
+                    entropy: EntropyObservation::High,
+                } = a
+                {
+                    high_entropy_write = true;
                 }
                 if let FileAction::Rename = a {
                     has_rename = true;
@@ -265,14 +281,6 @@ impl RansomwareMonitor {
             now_millis.saturating_sub(activity.last_seen_millis) <= WINDOW_MILLIS * 6
         });
     }
-}
-
-fn is_canary_file(path: &Path) -> bool {
-    let normalized = path.to_string_lossy().to_ascii_lowercase();
-    if !normalized.contains("canary") {
-        return false;
-    }
-    normalized.contains("\\documents\\") || normalized.contains("\\desktop\\")
 }
 
 fn is_protected_document(path: &Path) -> bool {
@@ -355,15 +363,15 @@ mod tests {
         let mut monitor = RansomwareMonitor::default();
         let mut decision = BehaviorDecision::default();
         for index in 0..UNTRUSTED_THRESHOLD {
-            decision = monitor.observe_at(
-                120,
-                9_999,
-                &document(index),
-                ProcessTrust::Untrusted,
-                true,
-                index as u64,
-                None,
-            );
+            decision = monitor.observe_at(BehaviorObservation {
+                process_id: 120,
+                process_start_key: 9_999,
+                path: &document(index),
+                trust: ProcessTrust::Untrusted,
+                block_mode: true,
+                now_millis: index as u64,
+                action: None,
+            });
         }
         assert!(decision.alert);
         assert!(decision.block);
@@ -374,15 +382,15 @@ mod tests {
     fn repeated_writes_to_one_file_do_not_trigger() {
         let mut monitor = RansomwareMonitor::default();
         for index in 0..100 {
-            let decision = monitor.observe_at(
-                120,
-                9_999,
-                &document(1),
-                ProcessTrust::Untrusted,
-                true,
-                index,
-                None,
-            );
+            let decision = monitor.observe_at(BehaviorObservation {
+                process_id: 120,
+                process_start_key: 9_999,
+                path: &document(1),
+                trust: ProcessTrust::Untrusted,
+                block_mode: true,
+                now_millis: index,
+                action: None,
+            });
             assert!(!decision.block);
         }
     }
@@ -391,18 +399,25 @@ mod tests {
     fn stable_process_key_prevents_pid_reuse_correlation() {
         let mut monitor = RansomwareMonitor::default();
         for index in 0..UNTRUSTED_THRESHOLD - 1 {
-            monitor.observe_at(
-                120,
-                1,
-                &document(index),
-                ProcessTrust::Untrusted,
-                true,
-                index as u64,
-                None,
-            );
+            monitor.observe_at(BehaviorObservation {
+                process_id: 120,
+                process_start_key: 1,
+                path: &document(index),
+                trust: ProcessTrust::Untrusted,
+                block_mode: true,
+                now_millis: index as u64,
+                action: None,
+            });
         }
-        let decision =
-            monitor.observe_at(120, 2, &document(999), ProcessTrust::Untrusted, true, 100, None);
+        let decision = monitor.observe_at(BehaviorObservation {
+            process_id: 120,
+            process_start_key: 2,
+            path: &document(999),
+            trust: ProcessTrust::Untrusted,
+            block_mode: true,
+            now_millis: 100,
+            action: None,
+        });
         assert_eq!(decision.distinct_files, 1);
         assert!(!decision.block);
     }
@@ -410,15 +425,61 @@ mod tests {
     #[test]
     fn non_user_or_non_document_paths_are_ignored() {
         let mut monitor = RansomwareMonitor::default();
-        let decision = monitor.observe_at(
-            1,
-            2,
-            Path::new(r"C:\Windows\Temp\sample.bin"),
-            ProcessTrust::Untrusted,
-            true,
-            0,
-            None,
-        );
+        let decision = monitor.observe_at(BehaviorObservation {
+            process_id: 1,
+            process_start_key: 2,
+            path: Path::new(r"C:\Windows\Temp\sample.bin"),
+            trust: ProcessTrust::Untrusted,
+            block_mode: true,
+            now_millis: 0,
+            action: None,
+        });
         assert!(!decision.protected_path);
+    }
+
+    #[test]
+    fn unmeasured_entropy_does_not_count_as_high_entropy() {
+        let mut monitor = RansomwareMonitor::default();
+        let path = document(1);
+        let write = monitor.observe_at(BehaviorObservation {
+            process_id: 120,
+            process_start_key: 9_999,
+            path: &path,
+            trust: ProcessTrust::Untrusted,
+            block_mode: true,
+            now_millis: 1,
+            action: Some(FileAction::Write {
+                entropy: EntropyObservation::NotMeasured,
+            }),
+        });
+        let rename = monitor.observe_at(BehaviorObservation {
+            process_id: 120,
+            process_start_key: 9_999,
+            path: &path,
+            trust: ProcessTrust::Untrusted,
+            block_mode: true,
+            now_millis: 2,
+            action: Some(FileAction::Rename),
+        });
+        assert!(!write.block);
+        assert!(!rename.block);
+    }
+
+    #[test]
+    fn public_canary_like_filename_is_not_trusted_as_a_secret_canary() {
+        let mut monitor = RansomwareMonitor::default();
+        let decision = monitor.observe_at(BehaviorObservation {
+            process_id: 120,
+            process_start_key: 9_999,
+            path: Path::new(r"C:\Users\Alice\Documents\canary-budget.docx"),
+            trust: ProcessTrust::Untrusted,
+            block_mode: true,
+            now_millis: 1,
+            action: Some(FileAction::Write {
+                entropy: EntropyObservation::NotMeasured,
+            }),
+        });
+        assert!(!decision.block);
+        assert!(!decision.alert);
     }
 }

@@ -135,6 +135,7 @@ if ($LASTEXITCODE -ne 0) {
 $libraryDirectory = Join-Path $kitsRoot "Lib\$wdkVersion\km\x64"
 $linkArguments = @(
     "/nologo", "/MACHINE:X64", "/DRIVER", "/SUBSYSTEM:NATIVE", "/ENTRY:DriverEntry",
+    "/NODEFAULTLIB",
     "/LIBPATH:$libraryDirectory",
     "FltMgr.lib", "ntoskrnl.lib", "hal.lib", "BufferOverflowFastFailK.lib",
     $object,

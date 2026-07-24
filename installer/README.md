@@ -12,11 +12,11 @@ The setup executable is a signed WiX Burn bundle containing a signed MSI. The MS
 
 This is deliberately a production **packaging foundation**, not a claim that the current client is already independently validated or production-ready.
 
-The MSI now registers the signed `blackshard.exe --service` entry point as the automatic, LocalSystem, own-process **Blackshard Protection Service**, with SCM name `BlackshardProtectionService`. The distinct name is mandatory because `blackshard` is already the minifilter driver's SCM service name. It stops the user-mode service before upgrade or removal, starts it after installation, removes it on uninstall, restarts it 30 seconds after each of the first two failures, and resets that failure count after one healthy day. A third consecutive failure is left stopped to avoid an endless crash loop. The same signed executable is also the only privileged driver lifecycle helper; the MSI invokes these exact non-interactive modes as deferred, non-impersonating, exit-code-checked actions:
+The MSI registers the signed `blackshard-service.exe --service` entry point as the automatic, LocalSystem, own-process **Blackshard Protection Service**, with SCM name `BlackshardProtectionService`. The distinct name is mandatory because `blackshard` is already the minifilter driver's SCM service name. It stops the user-mode service before upgrade or removal, starts it after installation, removes it on uninstall, restarts it 30 seconds after each of the first two failures, and resets that failure count after one healthy day. A third consecutive failure is left stopped to avoid an endless crash loop. The same signed service executable supplies the privileged driver lifecycle helper modes:
 
 ```text
-blackshard.exe --install-driver <absolute-INF-path>
-blackshard.exe --uninstall-driver <absolute-INF-path>
+blackshard-service.exe --install-driver <absolute-INF-path>
+blackshard-service.exe --uninstall-driver <absolute-INF-path>
 ```
 
 The installer deliberately fails if either mode returns anything except zero. A fresh installation is rolled back by uninstalling the newly added package. If same-package driver removal is rolled back, the MSI reinstalls the package from the still-present staged INF. A major upgrade crosses two MSI package versions, so restoring the old driver package after a late new-product failure is not considered proven until fault-injection tests demonstrate it for every supported upgrade path. The helper implementations must be idempotent, reject every path except a canonical absolute INF path inside the installed `DriverPackage` directory, use Microsoft's supported [`DiInstallDriverW`](https://learn.microsoft.com/en-us/windows/win32/api/newdev/nf-newdev-diinstalldriverw) / [`DiUninstallDriverW`](https://learn.microsoft.com/en-us/windows/win32/api/newdev/nf-newdev-diuninstalldriverw) path without interactive UI, unload the minifilter before removal, and return zero only when the requested operation is complete. DIFx must not be introduced.
@@ -39,21 +39,24 @@ Until those gates are complete, a successfully built package proves that its rel
 
 The GUI stays unelevated. Quick/full/custom scan requests, settings, quarantine operations, activity, and update checks are routed through the local service IPC API. The service authorizes each caller from its impersonated token; machine-wide mutations require an elevated administrator. When needed, the GUI stages a narrowly named, bounded, SHA-256-bound request and asks Windows UAC to run the same signed executable in a restricted helper mode. Production ACLs continue to deny direct ordinary-user writes to service-owned state.
 
-Likewise, a LocalSystem service runs in session 0 and cannot be the user-notification endpoint. The MSI therefore registers `"%ProgramFiles%\Blackshard\blackshard.exe" --notification-agent` under the machine `Run` key. Windows starts one hidden, single-instance broker in every interactive user session at logon; MSI ownership removes that registration on upgrade or uninstall. The broker reads the service-owned detection history and only displays quarantine success/failure notifications. It never performs privileged mutations.
+Likewise, a LocalSystem service runs in session 0 and cannot be the user-notification endpoint. The MSI therefore registers `"%ProgramFiles%\Blackshard\blackshard-service.exe" --notification-agent` under the machine `Run` key. Windows starts one hidden, single-instance broker in every interactive user session at logon; MSI ownership removes that registration on upgrade or uninstall. The broker reads the service-owned detection history and only displays quarantine success/failure notifications. It never performs privileged mutations.
 
-The Start menu shortcut is assigned the exact `Blackshard.Security.Client` AppUserModelID required by `winrt-notification`, following Microsoft's [desktop-toast shortcut requirement](https://learn.microsoft.com/en-us/windows/win32/shell/quickstart-sending-desktop-toast). The broker uses that same identity. Installation does not inject a process into an already-running session, so a user who installs after signing in must sign out and back in (or launch `blackshard.exe --notification-agent` once) before service-originated notifications appear. The registry value is removed immediately during uninstall; a broker already running in a logged-on session can remain alive until Restart Manager closes it or that session signs out, so the broker should also gain an authenticated service-shutdown/uninstall signal before public release.
+The Start menu shortcut is assigned the exact `Blackshard.Security.Client` AppUserModelID required by `winrt-notification`, following Microsoft's [desktop-toast shortcut requirement](https://learn.microsoft.com/en-us/windows/win32/shell/quickstart-sending-desktop-toast). The broker uses that same identity. Installation does not inject a process into an already-running session, so a user who installs after signing in must sign out and back in (or launch `blackshard-service.exe --notification-agent` once) before service-originated notifications appear. The registry value is removed immediately during uninstall; a broker already running in a logged-on session can remain alive until Restart Manager closes it or that session signs out, so the broker should also gain an authenticated service-shutdown/uninstall signal before public release.
 
 ## What the MSI owns
 
-- `%ProgramFiles%\Blackshard\blackshard.exe`
+- `%ProgramFiles%\Blackshard\blackshard-service.exe`
+- `%ProgramFiles%\Blackshard\blackshard-ui.exe`
+- `%ProgramFiles%\Blackshard\blackshard-amsi-x64.dll`
+- `%ProgramFiles%\Blackshard\blackshard-amsi-x86.dll`
 - `%ProgramFiles%\Blackshard\LICENSE.txt`
 - `%ProgramFiles%\Blackshard\DriverPackage\blackshard.inf`
 - `%ProgramFiles%\Blackshard\DriverPackage\blackshard.sys`
 - `%ProgramFiles%\Blackshard\DriverPackage\blackshard.cat`
 - A Start menu shortcut
-- The machine-wide `BlackshardNotificationAgent` logon entry, which starts `blackshard.exe --notification-agent` once per interactive user session and is removed on uninstall
+- The machine-wide `BlackshardNotificationAgent` logon entry, which starts `blackshard-service.exe --notification-agent` once per interactive user session and is removed on uninstall
 - `%ProgramData%\Blackshard` and the `Definitions`, `Quarantine`, `State`, `Logs`, and `Updates\Staging` directories
-- The automatic `BlackshardProtectionService` user-mode service (`blackshard.exe --service`); the separate `blackshard` SCM entry belongs to the minifilter driver
+- The automatic `BlackshardProtectionService` user-mode service (`blackshard-service.exe --service`); the separate `blackshard` SCM entry belongs to the minifilter driver
 - Installation of the validated minifilter package through the signed helper modes
 
 The Start menu shortcut carries `System.AppUserModel.ID=Blackshard.Security.Client`, matching the application constant used for desktop toast notifications.
@@ -66,7 +69,7 @@ The MSI and Burn bundle have stable upgrade codes and support major upgrades, re
 
 ## Required release inputs
 
-1. A release-built x64 `blackshard.exe` compiled with `BLACKSHARD_MINIFILTER_ALTITUDE`, `BLACKSHARD_UPDATE_MANIFEST_URL`, and `BLACKSHARD_DEFINITION_PUBLIC_KEY_HEX` set to the declared production inputs. The packager verifies the binding without installing the driver.
+1. Release-built x64 `blackshard-service.exe` and `blackshard-ui.exe`, plus x64/x86 AMSI provider DLLs. The service must be compiled with `BLACKSHARD_MINIFILTER_ALTITUDE`, `BLACKSHARD_UPDATE_MANIFEST_URL`, and `BLACKSHARD_DEFINITION_PUBLIC_KEY_HEX` set to the declared production inputs. The packager verifies the binding without installing the driver.
 2. A directory containing exactly named `blackshard.inf`, `blackshard.sys`, and `blackshard.cat` production driver files.
 3. A currently valid, publicly trusted Authenticode code-signing certificate with an accessible private key and the Code Signing EKU in either `Cert:\CurrentUser\My` or `Cert:\LocalMachine\My`.
 4. A current Windows SDK and WDK, including x64 `signtool.exe` and `infverif.exe`.
@@ -95,19 +98,19 @@ Run from the repository root:
     -AcceptWixEula
 ```
 
-Optional parameters select a different agent, output directory, timestamp service, SignTool, or InfVerif path. There is intentionally no unsigned-release switch.
+Optional parameters select different service, UI, AMSI-provider, output, timestamp-service, SignTool, or InfVerif paths. There is intentionally no unsigned-release switch.
 
 The altitude, URL, key, thumbprint, and paths shown above are examples. Replace all of them with the reviewed production values; never publish a build using a documentation test key.
 
 The script:
 
 1. Rejects malformed MSI versions and missing inputs.
-2. Confirms the application and driver are x64 PE images and that the application is release-bound to the declared driver altitude, update URL, and definition public key.
+2. Confirms the service, UI, x64 AMSI provider, and driver are x64 PE images; confirms the x86 AMSI provider is an x86 PE image; and verifies that the service is release-bound to the declared driver altitude, update URL, and definition public key.
 3. Validates the code-signing certificate, private key, validity period, Code Signing EKU, trust chain, and online revocation status, and rejects self-signed certificates.
 4. Runs current hardened INF validation.
 5. requires a trusted Microsoft hardware-pipeline signature on the catalog.
 6. Uses SignTool kernel-policy verification to prove that the catalog covers both the SYS and INF.
-7. Copies inputs to an isolated build staging directory and Authenticode-signs the staged application.
+7. Copies inputs to an isolated build staging directory and Authenticode-signs the staged service, UI, and AMSI providers.
 8. Builds an MSI that installs the service, applies hardened ProgramData ACLs, and transactionally invokes the signed driver helper.
 9. Signs the MSI, then builds and signs both the detached Burn engine and final bundle.
 10. Authenticode-verifies every signed release artifact and prints the final SHA-256 hash.

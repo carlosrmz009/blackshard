@@ -36,5 +36,6 @@ pub fn read_message<R: Read, T: for<'a> Deserialize<'a>>(reader: &mut R) -> std:
     }
     let mut data = vec![0; len];
     reader.read_exact(&mut data)?;
-    serde_json::from_slice(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }

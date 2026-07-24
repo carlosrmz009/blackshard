@@ -15,7 +15,7 @@ In particular, this repository does not ship a Microsoft-assigned minifilter alt
 - **Windows antimalware-provider consultation:** scripts, Office content, and YARA-selected samples are submitted through the installed Windows AMSI stack with a strict 4 MiB input bound. An AMSI provider detection can deny executable use, but deliberately cannot authorize Blackshard quarantine.
 - **Static analysis:** bounded PE parsing, executable-section and import anomalies, script behavior combinations, file-type checks, and contextual entropy evidence. High entropy alone contributes no risk because compressed, encrypted, and media files are commonly high entropy.
 - **Adaptive family similarity:** authenticated definition bundles can carry compact 64-element bottom-k fingerprints for related PE families. The linear, fixed-memory pass runs only for PE files that fall within a profile's size band, requires at least 85% similarity, is protected by a match-rate circuit breaker, and is advisory rather than destructive until independently corroborated.
-- **Real-time enforcement:** protocol v5 performs post-create inspection of selected high-risk opens, gates executable section creation, and emits bounded protected-document write, rename, and delete telemetry keyed by the kernel process-start key. User mode opens candidates without following reparse points, checks the live Windows file ID, scans that exact handle without a pathname cache, and the driver tracks writes with a content generation counter.
+- **Real-time enforcement:** protocol v6 performs post-create inspection of selected high-risk opens, gates executable section creation, carries a readiness generation, centralizes enforcement-failure policy, and emits bounded protected-document write, rename, and delete telemetry keyed by the kernel process-start key. User mode opens candidates without following reparse points, checks the live Windows file ID, scans that exact handle without a pathname cache, and the driver tracks writes with a content generation counter.
 - **Archive and document inspection:** ZIP, nested ZIP, OOXML, Gzip, and OLE streams are inspected in memory under shared depth, entry, expansion, compression-ratio, finding, and time budgets. VBA compressed containers are decoded; active PDF JavaScript/launch actions and suspicious Office macro/external-content combinations are detected. Entries are never extracted to disk. RAR and 7z payload expansion is not yet implemented.
 - **Ransomware behavior:** distinct writes, renames, and deletions of user document/media data are correlated per stable process identity in a ten-second window. Authenticode-trusted, unknown, and untrusted writers have separate thresholds. Audit mode is the default; optional block mode denies threshold-crossing modifications but never quarantines the victim documents.
 - **On-demand scans:** quick, full, and custom scans with bounded worker queues, progress, cancellation, exclusions, optional network-drive traversal, and configurable resource use.
@@ -25,7 +25,7 @@ In particular, this repository does not ship a Microsoft-assigned minifilter alt
 - **Desktop client:** a DirectX 12/WGPU UI with dashboard, scan, quarantine, activity, settings, update state, service/filter health, build-signature status, and a harmless end-to-end protection test.
 - **One-file distribution:** the release pipeline emits one signed `BlackshardSetup.exe`. Setup installs the signed application/service and the INF/SYS/CAT driver package; Windows necessarily keeps those installed components separate at runtime.
 
-Blackshard consumes the Windows AMSI API but does **not** register as an AMSI provider. It does not embed the resource-heavy ClamAV engine; the definition publishing tools can instead import reviewed SHA-256 records from FreshClam-verified databases as a legacy-threat layer. Blackshard does not yet self-update application/driver binaries in the background or implement Shardnet/P2P. AMSI coverage therefore depends on providers already installed on Windows and is an additional signal, not an independent Blackshard script engine.
+Blackshard consumes the Windows AMSI API and the development/production packaging now includes separate x64 and x86 Blackshard AMSI provider DLLs. The provider uses a dedicated, schema-restricted local endpoint and cannot issue management commands. This remains pre-release functionality until clean-VM registration, host-compatibility, latency, and bypass tests pass. The repository also contains an experimental FreshClam downloader and worker scaffolding, but it does **not** yet activate a functioning ClamAV scanner; readiness therefore refuses to report full protection on that basis. Blackshard does not yet self-update application/driver binaries in the background or implement Shardnet/P2P.
 
 ## Install Blackshard — regular users
 
@@ -82,7 +82,7 @@ Build the driver:
 
 `build-driver.ps1` prefers an installed WDK. If only the Windows SDK is present, it downloads the pinned official `Microsoft.Windows.WDK.x64` package into ignored `target\wdk-nuget`, verifies its SHA-512, and uses it as a workspace-local build layer. `-NoNuGetFallback` disables that fallback.
 
-The resulting `target\release\blackshard.exe` is a developer artifact unless it was compiled with the production altitude/update trust values and passed the production packager. Building the Rust executable alone does not install the LocalSystem service or minifilter.
+The resulting `target\release\blackshard-service.exe`, `target\release\blackshard-ui.exe`, and AMSI provider DLLs are developer artifacts unless they were compiled with the production altitude/update trust values and passed the production packager. Building the Rust workspace alone does not install the LocalSystem service or minifilter.
 
 ## Community and online definitions
 
@@ -113,7 +113,7 @@ Maintainers can use Cisco Talos ClamAV as a reviewed legacy-hash input without r
     -Version 2026.07.22.1 `
     -PayloadUrl https://updates.blackshard.dev/stable/rules-42.bundle `
     -OutputDirectory C:\definitions\publish `
-    -ValidatorPath .\target\release\blackshard.exe
+    -ValidatorPath .\target\release\blackshard-service.exe
 ```
 
 5. Upload `rules-42.bundle` first and `manifest.json` last. Clients verify product/channel scope, signature, sequence, expiry, size, and SHA-256 before atomic activation. The default four-hour schedule provides six checks per day with jitter.
@@ -237,7 +237,7 @@ Copy the complete `dist` directory to the VM, take a snapshot, then use an eleva
 # Reboot the VM.
 .\install.ps1
 .\verify.ps1 -DevelopmentVm
-.\blackshard.exe
+.\blackshard-ui.exe
 ```
 
 Remove it and restore normal code-integrity state before reusing the VM:

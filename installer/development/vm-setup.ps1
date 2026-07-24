@@ -14,7 +14,7 @@ $stageRoot = Join-Path $env:ProgramData "BlackshardDevelopmentInstaller"
 $logPath = Join-Path $stageRoot "setup.log"
 $successPath = Join-Path $stageRoot "installed.txt"
 $failurePath = Join-Path $stageRoot "failed.txt"
-$installedAgent = Join-Path $env:ProgramFiles "Blackshard\blackshard.exe"
+$installedUi = Join-Path $env:ProgramFiles "Blackshard\blackshard-ui.exe"
 $uninstallRegistryPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BlackshardDevelopment"
 $runOnceRegistryPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
 $startMenuShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Blackshard.lnk"
@@ -164,8 +164,11 @@ function Set-StageAcl {
 function Copy-InstallerPayload {
     Set-StageAcl
     $required = @(
-        "blackshard.exe",
+        "blackshard-service.exe",
+        "blackshard-ui.exe",
         "blackshard.sys",
+        "blackshard-amsi-x64.dll",
+        "blackshard-amsi-x86.dll",
         "install.ps1",
         "uninstall.ps1",
         "verify.ps1",
@@ -206,8 +209,8 @@ function Remove-ResumeTask {
 function Install-ShortcutsAndRegistration {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($startMenuShortcut)
-    $shortcut.TargetPath = $installedAgent
-    $shortcut.WorkingDirectory = Split-Path -Parent $installedAgent
+    $shortcut.TargetPath = $installedUi
+    $shortcut.WorkingDirectory = Split-Path -Parent $installedUi
     $shortcut.Description = "Blackshard antivirus"
     $shortcut.Save()
 
@@ -217,13 +220,16 @@ function Install-ShortcutsAndRegistration {
     New-ItemProperty -Path $uninstallRegistryPath -Name DisplayName -Value "Blackshard Development (VM Only)" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name DisplayVersion -Value "0.1.0-dev" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name Publisher -Value "Blackshard Open Source Project" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $uninstallRegistryPath -Name DisplayIcon -Value $installedAgent -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallRegistryPath -Name DisplayIcon -Value $installedUi -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name UninstallString -Value $uninstallCommand -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name NoModify -Value 1 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name NoRepair -Value 1 -PropertyType DWord -Force | Out-Null
 }
 
 function Install-AllComponents {
+    Set-Content -LiteralPath (Join-Path $stageRoot "development-ipc-policy") `
+        -Value "Disposable VM development policy. Unsigned clients are restricted to this protected installation directory." `
+        -Encoding UTF8 -Force
     Write-Output "BLACKSHARD_UI:STATUS:Trusting the VM development certificate and signing the minifilter."
     & (Join-Path $stageRoot "enable-test-signing.ps1") -SkipBootConfiguration
     Write-Output "BLACKSHARD_UI:STATUS:Installing the kernel minifilter and LocalSystem protection service."
@@ -235,7 +241,7 @@ function Install-AllComponents {
 
     New-Item -Path $runOnceRegistryPath -Force | Out-Null
     New-ItemProperty -Path $runOnceRegistryPath -Name "BlackshardDevelopmentLaunch" `
-        -Value ('"{0}"' -f $installedAgent) -PropertyType String -Force | Out-Null
+        -Value ('"{0}"' -f $installedUi) -PropertyType String -Force | Out-Null
     Set-Content -LiteralPath $successPath `
         -Value ("Installed and verified at {0:o}" -f (Get-Date)) -Encoding UTF8
     Remove-Item -LiteralPath $failurePath -Force -ErrorAction SilentlyContinue

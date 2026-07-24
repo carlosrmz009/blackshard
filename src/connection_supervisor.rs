@@ -3,10 +3,10 @@ use crate::config::Settings;
 use crate::history::{EventHistory, EventKind, SecurityEvent};
 use crate::quarantine::QuarantineStore;
 use crate::realtime::{
-    hresult_text, interruptible_wait, realtime_worker, reply, valid_notification,
-    BlackshardMessage, DriverVerdict, ProtectionConnection, RealtimeCounters, RealtimeEvent,
-    SharedDetectionEngine, WorkItem, FilterConnectCommunicationPort, FilterGetMessage,
-    notification_path,
+    hresult_text, interruptible_wait, notification_path, realtime_worker, reply,
+    valid_notification, BlackshardMessage, DriverVerdict, FilterConnectCommunicationPort,
+    FilterGetMessage, ProtectionConnection, RealtimeCounters, RealtimeEvent, SharedDetectionEngine,
+    WorkItem,
 };
 use crate::verdict_cache::VerdictCache;
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ pub fn connection_loop(
     let port_name: Vec<u16> = "\\BlackshardPort\0".encode_utf16().collect();
     let ransomware_monitor = Arc::new(Mutex::new(RansomwareMonitor::default()));
     let process_trust_cache = Arc::new(Mutex::new(HashMap::new()));
-    
+
     let mut generation_count = 0u64;
     let mut backoff_secs = 2;
 
@@ -42,8 +42,11 @@ pub fn connection_loop(
         generation_count += 1;
         let _ = events.try_send(RealtimeEvent::Connection(ProtectionConnection::Connecting));
         let mut port_handle: HANDLE = 0;
-        
-        log::info!("Attempting connection to driver port (generation {})", generation_count);
+
+        log::info!(
+            "Attempting connection to driver port (generation {})",
+            generation_count
+        );
         let connect_result = unsafe {
             FilterConnectCommunicationPort(
                 port_name.as_ptr(),
@@ -54,14 +57,18 @@ pub fn connection_loop(
                 &mut port_handle,
             )
         };
-        
+
         if connect_result != S_OK {
             let error_text = hresult_text(connect_result);
-            log::error!("FilterConnectCommunicationPort failed: connect {} (HRESULT {:X})", error_text, connect_result);
+            log::error!(
+                "FilterConnectCommunicationPort failed: connect {} (HRESULT {:X})",
+                error_text,
+                connect_result
+            );
             let _ = events.try_send(RealtimeEvent::Connection(
                 ProtectionConnection::Disconnected(format!("connect {error_text}")),
             ));
-            
+
             interruptible_wait(&stop, Duration::from_secs(backoff_secs));
             backoff_secs = (backoff_secs * 2).min(60);
             continue;
@@ -82,7 +89,7 @@ pub fn connection_loop(
             .read()
             .map(|value| value.worker_count.clamp(1, 8))
             .unwrap_or(2);
-        
+
         log::info!("Spawning {} realtime workers", worker_count);
         let (sender, receiver) = mpsc::sync_channel::<WorkItem>(worker_count * 16);
         let receiver = Arc::new(Mutex::new(receiver));
@@ -136,7 +143,11 @@ pub fn connection_loop(
             };
             if get_result != S_OK {
                 let error_text = hresult_text(get_result);
-                log::error!("FilterGetMessage failed: get {} (HRESULT {:X})", error_text, get_result);
+                log::error!(
+                    "FilterGetMessage failed: get {} (HRESULT {:X})",
+                    error_text,
+                    get_result
+                );
                 break format!("get {error_text}");
             }
 

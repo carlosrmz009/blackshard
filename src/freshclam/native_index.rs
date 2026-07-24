@@ -39,7 +39,7 @@ impl NativeIndex {
         for line in reader.lines() {
             let line = line?;
             let line = line.trim();
-            
+
             // Ignore comments and empty lines
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -63,11 +63,7 @@ impl NativeIndex {
                     size_str.parse::<u64>().ok()
                 };
 
-                self.signatures.push(Signature {
-                    hash,
-                    size,
-                    name,
-                });
+                self.signatures.push(Signature { hash, size, name });
             }
         }
 
@@ -87,10 +83,13 @@ impl NativeIndex {
         }
 
         // Binary search for the hash
-        if let Ok(idx) = self.signatures.binary_search_by(|sig| sig.hash.as_slice().cmp(hash)) {
+        if let Ok(idx) = self
+            .signatures
+            .binary_search_by(|sig| sig.hash.as_slice().cmp(hash))
+        {
             // There could be multiple signatures with the same hash but different sizes.
             // We need to check around the found index to see if any match the given size.
-            
+
             // Search backwards
             let mut curr = idx;
             loop {

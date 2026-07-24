@@ -21,8 +21,14 @@
            Text="ProductVersion is required." />
     <Error Condition="'$(StageDir)' == ''"
            Text="StageDir is required." />
-    <Error Condition="!Exists('$(StageDir)\blackshard.exe')"
-           Text="The staged Blackshard executable is missing." />
+    <Error Condition="!Exists('$(StageDir)\blackshard-service.exe')"
+           Text="The staged Blackshard service executable is missing." />
+    <Error Condition="!Exists('$(StageDir)\blackshard-ui.exe')"
+           Text="The staged Blackshard UI executable is missing." />
+    <Error Condition="!Exists('$(StageDir)\blackshard-amsi-x64.dll')"
+           Text="The staged x64 Blackshard AMSI provider is missing." />
+    <Error Condition="!Exists('$(StageDir)\blackshard-amsi-x86.dll')"
+           Text="The staged x86 Blackshard AMSI provider is missing." />
     <Error Condition="!Exists('$(StageDir)\LICENSE.txt')"
            Text="The staged license is missing." />
     <Error Condition="!Exists('$(StageDir)\DriverPackage\blackshard.inf')"

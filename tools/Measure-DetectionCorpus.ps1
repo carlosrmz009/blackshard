@@ -6,7 +6,7 @@ param(
     [string]$CorpusDirectory,
     [Parameter(Mandatory = $true)]
     [string]$ReportPath,
-    [string]$BlackshardPath = (Join-Path $PSScriptRoot '..\target\release\blackshard.exe')
+    [string]$BlackshardPath = (Join-Path $PSScriptRoot '..\target\release\blackshard-service.exe')
 )
 
 Set-StrictMode -Version Latest

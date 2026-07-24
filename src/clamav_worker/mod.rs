@@ -25,9 +25,19 @@ impl ClamAvWorker {
     }
 
     fn send_request(&mut self, req: ScanRequest) -> std::io::Result<ScanVerdict> {
-        let stdin = self.sandbox.child.stdin.as_mut().expect("Failed to get stdin");
+        let stdin = self
+            .sandbox
+            .child
+            .stdin
+            .as_mut()
+            .expect("Failed to get stdin");
         write_message(stdin, &req)?;
-        let stdout = self.sandbox.child.stdout.as_mut().expect("Failed to get stdout");
+        let stdout = self
+            .sandbox
+            .child
+            .stdout
+            .as_mut()
+            .expect("Failed to get stdout");
         read_message(stdout)
     }
 }
@@ -36,10 +46,10 @@ pub fn run_worker_process() -> std::io::Result<()> {
     // The worker logic returning Clean as a placeholder
     let stdin = std::io::stdin();
     let mut stdin_lock = stdin.lock();
-    
+
     let stdout = std::io::stdout();
     let mut stdout_lock = stdout.lock();
-    
+
     loop {
         match read_message::<_, ScanRequest>(&mut stdin_lock) {
             Ok(req) => {
@@ -58,6 +68,6 @@ pub fn run_worker_process() -> std::io::Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }

@@ -17,7 +17,7 @@
           LicenseUrl="https://www.gnu.org/licenses/gpl-3.0.html"
           ShowVersion="yes"
           SuppressOptionsUI="yes"
-          LaunchTarget="[ProgramFiles64Folder]Blackshard\blackshard.exe"
+          LaunchTarget="[ProgramFiles64Folder]Blackshard\blackshard-ui.exe"
           LaunchWorkingFolder="[ProgramFiles64Folder]Blackshard" />
     </BootstrapperApplication>
 

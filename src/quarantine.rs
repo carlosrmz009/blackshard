@@ -2,9 +2,12 @@ use crate::atomic_file;
 use crate::detection::opened_file_id;
 #[cfg(windows)]
 use crate::detection::opened_file_identity;
-use chacha20poly1305::{XChaCha20Poly1305, KeyInit, aead::stream::{EncryptorBE32, DecryptorBE32}};
-use hkdf::Hkdf;
+use chacha20poly1305::{
+    aead::stream::{DecryptorBE32, EncryptorBE32},
+    KeyInit, XChaCha20Poly1305,
+};
 use chrono::{DateTime, Utc};
+use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -170,8 +173,15 @@ impl QuarantineStore {
 
         let mut stream_nonce = [0u8; 19];
         OsRng.fill_bytes(&mut stream_nonce);
-        
-        let aad = format!("BSQ|V2|{}|{}|{}|{}", original_path.to_string_lossy(), threat_name, expected_sha256, expected_size).into_bytes();
+
+        let aad = format!(
+            "BSQ|V2|{}|{}|{}|{}",
+            original_path.to_string_lossy(),
+            threat_name,
+            expected_sha256,
+            expected_size
+        )
+        .into_bytes();
 
         let copy_result = (|| -> io::Result<(String, u64, File)> {
             let input = open_source_for_quarantine(&original_path)?;
@@ -226,9 +236,9 @@ impl QuarantineStore {
 
             if expected_size == 0 {
                 let mut chunk_buf = vec![];
-                encryptor.encrypt_last_in_place(aad.as_slice(), &mut chunk_buf).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
-                })?;
+                encryptor
+                    .encrypt_last_in_place(aad.as_slice(), &mut chunk_buf)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encryption failed"))?;
                 writer.write_all(&chunk_buf)?;
             } else {
                 loop {
@@ -247,11 +257,11 @@ impl QuarantineStore {
                     if read == 0 {
                         break;
                     }
-                    
+
                     let mut chunk_buf = buffer[..read].to_vec();
                     hasher.update(&chunk_buf);
                     size += read as u64;
-                    
+
                     let chunk_aad = if first_chunk {
                         first_chunk = false;
                         aad.as_slice()
@@ -261,15 +271,19 @@ impl QuarantineStore {
 
                     let is_last = size == expected_size;
                     if is_last {
-                        encryptor.encrypt_last_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
-                        })?;
+                        encryptor
+                            .encrypt_last_in_place(chunk_aad, &mut chunk_buf)
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
+                            })?;
                         writer.write_all(&chunk_buf)?;
                         break;
                     } else {
-                        encryptor.encrypt_next_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
-                        })?;
+                        encryptor
+                            .encrypt_next_in_place(chunk_aad, &mut chunk_buf)
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidData, "encryption failed")
+                            })?;
                         writer.write_all(&chunk_buf)?;
                     }
                 }
@@ -456,8 +470,15 @@ impl QuarantineStore {
 
             let mut hasher = Sha256::new();
             let mut restored_size = 0u64;
-            
-            let aad = format!("BSQ|V2|{}|{}|{}|{}", record.original_path.to_string_lossy(), record.threat_name, record.sha256, record.size).into_bytes();
+
+            let aad = format!(
+                "BSQ|V2|{}|{}|{}|{}",
+                record.original_path.to_string_lossy(),
+                record.threat_name,
+                record.sha256,
+                record.size
+            )
+            .into_bytes();
             let mut first_chunk = true;
 
             if record.size == 0 {
@@ -466,9 +487,14 @@ impl QuarantineStore {
                 reader.read_exact(&mut mac_buf)?;
                 chunk_buf.extend_from_slice(&mac_buf);
 
-                decryptor.decrypt_last_in_place(aad.as_slice(), &mut chunk_buf).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "container integrity check failed")
-                })?;
+                decryptor
+                    .decrypt_last_in_place(aad.as_slice(), &mut chunk_buf)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "container integrity check failed",
+                        )
+                    })?;
                 writer.write_all(&chunk_buf)?;
             } else {
                 loop {
@@ -482,9 +508,10 @@ impl QuarantineStore {
                     if remaining_plaintext == 0 {
                         break;
                     }
-                    let chunk_plaintext_limit = (remaining_plaintext as usize).min(COPY_BUFFER_SIZE);
+                    let chunk_plaintext_limit =
+                        (remaining_plaintext as usize).min(COPY_BUFFER_SIZE);
                     let read_limit = chunk_plaintext_limit + 16;
-                    
+
                     let mut chunk_buf = vec![0u8; read_limit];
                     reader.read_exact(&mut chunk_buf)?;
 
@@ -496,19 +523,29 @@ impl QuarantineStore {
                     };
 
                     let is_last = restored_size + (chunk_plaintext_limit as u64) == record.size;
-                    
+
                     if is_last {
-                        decryptor.decrypt_last_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "container integrity check failed")
-                        })?;
+                        decryptor
+                            .decrypt_last_in_place(chunk_aad, &mut chunk_buf)
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "container integrity check failed",
+                                )
+                            })?;
                         hasher.update(&chunk_buf);
                         writer.write_all(&chunk_buf)?;
                         restored_size += chunk_buf.len() as u64;
                         break;
                     } else {
-                        decryptor.decrypt_next_in_place(chunk_aad, &mut chunk_buf).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "container integrity check failed")
-                        })?;
+                        decryptor
+                            .decrypt_next_in_place(chunk_aad, &mut chunk_buf)
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "container integrity check failed",
+                                )
+                            })?;
                         hasher.update(&chunk_buf);
                         writer.write_all(&chunk_buf)?;
                         restored_size += chunk_buf.len() as u64;

@@ -18,7 +18,7 @@ param(
     [string]$FeedBaseUrl,
     [string]$BaseBundlePath,
     [string]$OpenSslPath,
-    [string]$ValidatorPath = (Join-Path $PSScriptRoot '..\target\release\blackshard.exe'),
+    [string]$ValidatorPath = (Join-Path $PSScriptRoot '..\target\release\blackshard-service.exe'),
     [ValidateRange(1, 168)]
     [int]$ExpiryHours = 24,
     [switch]$IncludePua,

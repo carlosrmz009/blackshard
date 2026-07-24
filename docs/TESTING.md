@@ -4,7 +4,7 @@ Blackshard has two deliberately different test environments. Do not move live ma
 
 ## 1. Main development PC: clean functionality and false positives
 
-Do not install the development minifilter on this machine. Keep Microsoft Defender or the existing antivirus enabled and do not enable Windows test-signing mode. Use the freshly built `target\release\blackshard.exe` only for UI inspection and bounded on-demand corpus evaluation; full real-time/service assertions belong in the VM until production signing exists.
+Do not install the development minifilter on this machine. Keep Microsoft Defender or the existing antivirus enabled and do not enable Windows test-signing mode. Use the freshly built `target\release\blackshard-ui.exe` only for UI inspection and `target\release\blackshard-service.exe` for bounded non-service evaluation modes; full real-time/service assertions belong in the VM until production signing exists.
 
 Prepare a representative clean corpus you are legally permitted to scan. Include copies or generated fixtures representing:
 
@@ -73,7 +73,7 @@ The equivalent manual sequence remains available when diagnosing installer or bo
 # Reboot.
 .\install.ps1
 .\verify.ps1 -DevelopmentVm
-.\blackshard.exe
+.\blackshard-ui.exe
 ```
 
 Run tests in increasing risk order:

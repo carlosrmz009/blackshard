@@ -3,7 +3,10 @@
 [CmdletBinding()]
 param(
     [string]$ProductVersion = "0.1.0",
-    [string]$AgentPath,
+    [string]$ServicePath,
+    [string]$UiPath,
+    [string]$AmsiX64Path,
+    [string]$AmsiX86Path,
     [string]$DriverPackageDirectory,
     [string]$AssignedMinifilterAltitude,
     [string]$UpdateManifestUrl,
@@ -23,8 +26,17 @@ $ErrorActionPreference = "Stop"
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 
-if ([string]::IsNullOrWhiteSpace($AgentPath)) {
-    $AgentPath = Join-Path $repositoryRoot "target\release\blackshard.exe"
+if ([string]::IsNullOrWhiteSpace($ServicePath)) {
+    $ServicePath = Join-Path $repositoryRoot "target\release\blackshard-service.exe"
+}
+if ([string]::IsNullOrWhiteSpace($UiPath)) {
+    $UiPath = Join-Path $repositoryRoot "target\release\blackshard-ui.exe"
+}
+if ([string]::IsNullOrWhiteSpace($AmsiX64Path)) {
+    $AmsiX64Path = Join-Path $repositoryRoot "target\release\blackshard_amsi.dll"
+}
+if ([string]::IsNullOrWhiteSpace($AmsiX86Path)) {
+    $AmsiX86Path = Join-Path $repositoryRoot "target\i686-pc-windows-msvc\release\blackshard_amsi.dll"
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -316,6 +328,20 @@ function Assert-X64PeFile {
     }
 }
 
+function Assert-X86PeFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $machine = Get-PeMachine -Path $Path
+    if ($machine -ne 0x014C) {
+        throw "$Description must be an x86 PE image (machine 0x014C); found 0x$($machine.ToString('X4')) in $Path"
+    }
+}
+
 function Assert-CodeSigningCertificate {
     param(
         [Parameter(Mandatory = $true)]
@@ -535,11 +561,17 @@ if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri
     throw "TimestampUrl must be an absolute HTTP or HTTPS URL."
 }
 
-$AgentPath = [System.IO.Path]::GetFullPath($AgentPath)
+$ServicePath = [System.IO.Path]::GetFullPath($ServicePath)
+$UiPath = [System.IO.Path]::GetFullPath($UiPath)
+$AmsiX64Path = [System.IO.Path]::GetFullPath($AmsiX64Path)
+$AmsiX86Path = [System.IO.Path]::GetFullPath($AmsiX86Path)
 $DriverPackageDirectory = [System.IO.Path]::GetFullPath($DriverPackageDirectory)
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
-Assert-FileExists -Path $AgentPath -Description "Release agent"
+Assert-FileExists -Path $ServicePath -Description "Release protection service"
+Assert-FileExists -Path $UiPath -Description "Release desktop UI"
+Assert-FileExists -Path $AmsiX64Path -Description "Release x64 AMSI provider"
+Assert-FileExists -Path $AmsiX86Path -Description "Release x86 AMSI provider"
 if (-not (Test-Path -LiteralPath $DriverPackageDirectory -PathType Container)) {
     throw "DriverPackageDirectory was not found: $DriverPackageDirectory"
 }
@@ -550,9 +582,12 @@ $driverCat = Join-Path $DriverPackageDirectory "blackshard.cat"
 Assert-FileExists -Path $driverInf -Description "Production driver INF"
 Assert-FileExists -Path $driverSys -Description "Production driver binary"
 Assert-FileExists -Path $driverCat -Description "Production driver catalog"
-Assert-X64PeFile -Path $AgentPath -Description "Blackshard agent"
+Assert-X64PeFile -Path $ServicePath -Description "Blackshard protection service"
+Assert-X64PeFile -Path $UiPath -Description "Blackshard desktop UI"
+Assert-X64PeFile -Path $AmsiX64Path -Description "Blackshard x64 AMSI provider"
+Assert-X86PeFile -Path $AmsiX86Path -Description "Blackshard x86 AMSI provider"
 Assert-X64PeFile -Path $driverSys -Description "Blackshard driver"
-Invoke-GuiValidationTool -FilePath $AgentPath -ArgumentList @(
+Invoke-GuiValidationTool -FilePath $ServicePath -ArgumentList @(
     "--validate-release-configuration",
     $driverInf,
     $UpdateManifestUrl,
@@ -589,14 +624,23 @@ New-Item -ItemType Directory -Path $msiOutputDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $bundleOutputDirectory -Force | Out-Null
 
 try {
-    $stagedAgent = Join-Path $stageDirectory "blackshard.exe"
-    Copy-Item -LiteralPath $AgentPath -Destination $stagedAgent
+    $stagedService = Join-Path $stageDirectory "blackshard-service.exe"
+    $stagedUi = Join-Path $stageDirectory "blackshard-ui.exe"
+    $stagedAmsiX64 = Join-Path $stageDirectory "blackshard-amsi-x64.dll"
+    $stagedAmsiX86 = Join-Path $stageDirectory "blackshard-amsi-x86.dll"
+    Copy-Item -LiteralPath $ServicePath -Destination $stagedService
+    Copy-Item -LiteralPath $UiPath -Destination $stagedUi
+    Copy-Item -LiteralPath $AmsiX64Path -Destination $stagedAmsiX64
+    Copy-Item -LiteralPath $AmsiX86Path -Destination $stagedAmsiX86
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination (Join-Path $stageDirectory "LICENSE.txt")
     Copy-Item -LiteralPath $driverInf -Destination (Join-Path $stagedDriverDirectory "blackshard.inf")
     Copy-Item -LiteralPath $driverSys -Destination (Join-Path $stagedDriverDirectory "blackshard.sys")
     Copy-Item -LiteralPath $driverCat -Destination (Join-Path $stagedDriverDirectory "blackshard.cat")
 
-    Invoke-AuthenticodeSign -Path $stagedAgent -Description "Blackshard Windows Client" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedService -Description "Blackshard Protection Service" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedUi -Description "Blackshard Windows Client" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedAmsiX64 -Description "Blackshard AMSI Provider x64" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedAmsiX86 -Description "Blackshard AMSI Provider x86" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
 
     $buildEngine = Resolve-MsBuildEngine
     $certificateStoreArguments = "/s My"

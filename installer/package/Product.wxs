@@ -51,11 +51,11 @@
       <Directory Id="PROGRAMMENUBLACKSHARDFOLDER" Name="Blackshard" />
     </StandardDirectory>
 
-    <Component Id="AgentExecutableComponent" Directory="INSTALLFOLDER" Guid="*">
+    <Component Id="ServiceExecutableComponent" Directory="INSTALLFOLDER" Guid="*">
       <File
-          Id="BlackshardExecutable"
-          Source="$(var.StageDir)\blackshard.exe"
-          Name="blackshard.exe"
+          Id="BlackshardServiceExecutable"
+          Source="$(var.StageDir)\blackshard-service.exe"
+          Name="blackshard-service.exe"
           KeyPath="yes" />
       <ServiceInstall
           Id="BlackshardProtectionServiceInstall"
@@ -83,6 +83,62 @@
           Stop="both"
           Remove="uninstall"
           Wait="yes" />
+    </Component>
+
+    <Component Id="UiExecutableComponent" Directory="INSTALLFOLDER" Guid="*">
+      <File
+          Id="BlackshardUiExecutable"
+          Source="$(var.StageDir)\blackshard-ui.exe"
+          Name="blackshard-ui.exe"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="AmsiX64Component" Directory="INSTALLFOLDER" Guid="*" Bitness="always64">
+      <File
+          Id="BlackshardAmsiX64"
+          Source="$(var.StageDir)\blackshard-amsi-x64.dll"
+          Name="blackshard-amsi-x64.dll" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\CLSID\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}\InprocServer32"
+          Value="[#BlackshardAmsiX64]"
+          Type="string" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\CLSID\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}\InprocServer32"
+          Name="ThreadingModel"
+          Value="Both"
+          Type="string" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\AMSI\Providers\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
+          Value="Blackshard AMSI Provider"
+          Type="string"
+          KeyPath="yes" />
+    </Component>
+
+    <Component Id="AmsiX86Component" Directory="INSTALLFOLDER" Guid="*" Bitness="always32">
+      <File
+          Id="BlackshardAmsiX86"
+          Source="$(var.StageDir)\blackshard-amsi-x86.dll"
+          Name="blackshard-amsi-x86.dll" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\CLSID\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}\InprocServer32"
+          Value="[#BlackshardAmsiX86]"
+          Type="string" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\CLSID\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}\InprocServer32"
+          Name="ThreadingModel"
+          Value="Both"
+          Type="string" />
+      <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\AMSI\Providers\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
+          Value="Blackshard AMSI Provider"
+          Type="string"
+          KeyPath="yes" />
     </Component>
 
     <Component Id="LicenseComponent" Directory="INSTALLFOLDER" Guid="*">
@@ -173,7 +229,7 @@
           Id="BlackshardStartMenuShortcut"
           Name="Blackshard"
           Description="Open the Blackshard Windows client"
-          Target="[#BlackshardExecutable]"
+          Target="[#BlackshardUiExecutable]"
           WorkingDirectory="INSTALLFOLDER">
         <!-- Must match notifications::APP_USER_MODEL_ID exactly. -->
         <ShortcutProperty
@@ -201,12 +257,15 @@
           Key="Software\Microsoft\Windows\CurrentVersion\Run"
           Name="BlackshardNotificationAgent"
           Type="string"
-          Value="&quot;[#BlackshardExecutable]&quot; --notification-agent"
+          Value="&quot;[#BlackshardServiceExecutable]&quot; --notification-agent"
           KeyPath="yes" />
     </Component>
 
     <Feature Id="Complete" Title="Blackshard" Level="1">
-      <ComponentRef Id="AgentExecutableComponent" />
+      <ComponentRef Id="ServiceExecutableComponent" />
+      <ComponentRef Id="UiExecutableComponent" />
+      <ComponentRef Id="AmsiX64Component" />
+      <ComponentRef Id="AmsiX86Component" />
       <ComponentRef Id="LicenseComponent" />
       <ComponentRef Id="DriverInfComponent" />
       <ComponentRef Id="DriverBinaryComponent" />
@@ -230,7 +289,7 @@
     -->
     <CustomAction
         Id="RollbackBlackshardDriverInstall"
-        FileRef="BlackshardExecutable"
+        FileRef="BlackshardServiceExecutable"
         ExeCommand="--uninstall-driver &quot;[#BlackshardDriverInf]&quot;"
         Execute="rollback"
         Impersonate="no"
@@ -238,7 +297,7 @@
         HideTarget="yes" />
     <CustomAction
         Id="InstallBlackshardDriverPackage"
-        FileRef="BlackshardExecutable"
+        FileRef="BlackshardServiceExecutable"
         ExeCommand="--install-driver &quot;[#BlackshardDriverInf]&quot;"
         Execute="deferred"
         Impersonate="no"
@@ -246,7 +305,7 @@
         HideTarget="yes" />
     <CustomAction
         Id="RollbackBlackshardDriverUninstall"
-        FileRef="BlackshardExecutable"
+        FileRef="BlackshardServiceExecutable"
         ExeCommand="--install-driver &quot;[#BlackshardDriverInf]&quot;"
         Execute="rollback"
         Impersonate="no"
@@ -254,7 +313,7 @@
         HideTarget="yes" />
     <CustomAction
         Id="UninstallBlackshardDriverPackage"
-        FileRef="BlackshardExecutable"
+        FileRef="BlackshardServiceExecutable"
         ExeCommand="--uninstall-driver &quot;[#BlackshardDriverInf]&quot;"
         Execute="deferred"
         Impersonate="no"

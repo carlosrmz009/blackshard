@@ -11,10 +11,18 @@ $ErrorActionPreference = "Stop"
 $driverName = "blackshard"
 $protectionServiceName = "BlackshardProtectionService"
 $sourceDriver = Join-Path $PSScriptRoot "blackshard.sys"
-$sourceAgent = Join-Path $PSScriptRoot "blackshard.exe"
+$sourceService = Join-Path $PSScriptRoot "blackshard-service.exe"
+$sourceUi = Join-Path $PSScriptRoot "blackshard-ui.exe"
+$sourceAmsiX64 = Join-Path $PSScriptRoot "blackshard-amsi-x64.dll"
+$sourceAmsiX86 = Join-Path $PSScriptRoot "blackshard-amsi-x86.dll"
 $destinationDriver = Join-Path $env:SystemRoot "System32\drivers\blackshard.sys"
 $agentDirectory = Join-Path $env:ProgramFiles "Blackshard"
-$destinationAgent = Join-Path $agentDirectory "blackshard.exe"
+$destinationService = Join-Path $agentDirectory "blackshard-service.exe"
+$destinationUi = Join-Path $agentDirectory "blackshard-ui.exe"
+$destinationAmsiX64 = Join-Path $agentDirectory "blackshard-amsi-x64.dll"
+$destinationAmsiX86 = Join-Path $agentDirectory "blackshard-amsi-x86.dll"
+$dataDirectory = Join-Path $env:ProgramData "Blackshard"
+$amsiClsid = "{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
 $serviceRegistryPath = "HKLM:\System\CurrentControlSet\Services\$driverName"
 
 function Test-BlackshardFilterLoaded {
@@ -60,6 +68,11 @@ function Remove-BlackshardInstallation {
     & sc.exe stop $protectionServiceName 2>$null | Out-Host
     & sc.exe delete $protectionServiceName 2>$null | Out-Host
 
+    foreach ($registryView in @("32", "64")) {
+        & reg.exe delete "HKLM\Software\Microsoft\AMSI\Providers\$amsiClsid" /f "/reg:$registryView" 2>$null | Out-Null
+        & reg.exe delete "HKLM\Software\Classes\CLSID\$amsiClsid" /f "/reg:$registryView" 2>$null | Out-Null
+    }
+
     if (Test-BlackshardFilterLoaded) {
         Write-Host "[*] Unloading Blackshard minifilter..." -ForegroundColor Cyan
         & fltmc.exe unload $driverName | Out-Host
@@ -72,8 +85,15 @@ function Remove-BlackshardInstallation {
     if (Test-Path -LiteralPath $destinationDriver) {
         Remove-Item -LiteralPath $destinationDriver -Force
     }
-    if (Test-Path -LiteralPath $destinationAgent -PathType Leaf) {
-        Remove-Item -LiteralPath $destinationAgent -Force
+    foreach ($installedFile in @(
+        $destinationService,
+        $destinationUi,
+        $destinationAmsiX64,
+        $destinationAmsiX86
+    )) {
+        if (Test-Path -LiteralPath $installedFile -PathType Leaf) {
+            Remove-Item -LiteralPath $installedFile -Force
+        }
     }
     if (Test-Path -LiteralPath $agentDirectory -PathType Container) {
         $remaining = @(Get-ChildItem -LiteralPath $agentDirectory -Force)
@@ -97,8 +117,15 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 if (-not (Test-Path -LiteralPath $sourceDriver)) {
     throw "blackshard.sys was not found beside install.ps1. Run deploy.ps1 after building the driver."
 }
-if (-not (Test-Path -LiteralPath $sourceAgent -PathType Leaf)) {
-    throw "blackshard.exe was not found beside install.ps1. Run deploy.ps1 before copying dist to the VM."
+foreach ($sourceArtifact in @(
+    @{ Path = $sourceService; Name = "blackshard-service.exe" },
+    @{ Path = $sourceUi; Name = "blackshard-ui.exe" },
+    @{ Path = $sourceAmsiX64; Name = "blackshard-amsi-x64.dll" },
+    @{ Path = $sourceAmsiX86; Name = "blackshard-amsi-x86.dll" }
+)) {
+    if (-not (Test-Path -LiteralPath $sourceArtifact.Path -PathType Leaf)) {
+        throw "$($sourceArtifact.Name) was not found beside install.ps1. Run deploy.ps1 before copying dist to the VM."
+    }
 }
 
 $signature = Get-AuthenticodeSignature -LiteralPath $sourceDriver
@@ -115,16 +142,60 @@ if ($signature.Status -ne "Valid") {
     Write-Warning "Installing an untrusted driver in test mode. Never do this on a production system."
 }
 
-$agentSignature = Get-AuthenticodeSignature -LiteralPath $sourceAgent
-if ($agentSignature.Status -ne "Valid") {
-    Write-Warning "The development agent is not Authenticode-signed. Use it only in this disposable VM."
+foreach ($sourceExecutable in @($sourceService, $sourceUi)) {
+    $executableSignature = Get-AuthenticodeSignature -LiteralPath $sourceExecutable
+    if ($executableSignature.Status -ne "Valid") {
+        Write-Warning "$([IO.Path]::GetFileName($sourceExecutable)) is not Authenticode-signed. Use it only in this disposable VM."
+    }
 }
 
 & sc.exe stop $protectionServiceName 2>$null | Out-Host
 & sc.exe delete $protectionServiceName 2>$null | Out-Host
 Start-Sleep -Seconds 1
 New-Item -ItemType Directory -Path $agentDirectory -Force | Out-Null
-Copy-Item -LiteralPath $sourceAgent -Destination $destinationAgent -Force
+Copy-Item -LiteralPath $sourceService -Destination $destinationService -Force
+Copy-Item -LiteralPath $sourceUi -Destination $destinationUi -Force
+Copy-Item -LiteralPath $sourceAmsiX64 -Destination $destinationAmsiX64 -Force
+Copy-Item -LiteralPath $sourceAmsiX86 -Destination $destinationAmsiX86 -Force
+
+& icacls.exe $agentDirectory "/inheritance:r" `
+    "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `
+    "/grant:r" "*S-1-5-32-544:(OI)(CI)(F)" `
+    "/grant:r" "*S-1-5-32-545:(OI)(CI)(RX)" | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply the protected Program Files ACL."
+}
+
+New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
+& icacls.exe $dataDirectory "/inheritance:r" `
+    "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `
+    "/grant:r" "*S-1-5-32-544:(OI)(CI)(F)" `
+    "/grant:r" "*S-1-5-32-545:(OI)(CI)(RX)" | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply the protected ProgramData ACL."
+}
+foreach ($privateDirectoryName in @("ClamAV", "Keys", "Quarantine", "State", "Updates")) {
+    $privateDirectory = Join-Path $dataDirectory $privateDirectoryName
+    New-Item -ItemType Directory -Path $privateDirectory -Force | Out-Null
+    & icacls.exe $privateDirectory "/inheritance:r" `
+        "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `
+        "/grant:r" "*S-1-5-32-544:(OI)(CI)(F)" | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not protect $privateDirectory."
+    }
+}
+
+foreach ($provider in @(
+    @{ View = "64"; Path = $destinationAmsiX64 },
+    @{ View = "32"; Path = $destinationAmsiX86 }
+)) {
+    & reg.exe add "HKLM\Software\Classes\CLSID\$amsiClsid\InprocServer32" /ve /t REG_SZ /d $provider.Path /f "/reg:$($provider.View)" | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Could not register the $($provider.View)-bit AMSI COM server." }
+    & reg.exe add "HKLM\Software\Classes\CLSID\$amsiClsid\InprocServer32" /v ThreadingModel /t REG_SZ /d Both /f "/reg:$($provider.View)" | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Could not configure the $($provider.View)-bit AMSI COM server." }
+    & reg.exe add "HKLM\Software\Microsoft\AMSI\Providers\$amsiClsid" /ve /t REG_SZ /d "Blackshard AMSI Provider" /f "/reg:$($provider.View)" | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Could not register the $($provider.View)-bit AMSI provider." }
+}
 
 if (Test-BlackshardFilterLoaded) {
     & fltmc.exe unload $driverName | Out-Host
@@ -225,11 +296,11 @@ if (-not (Test-BlackshardFilterLoaded)) {
 Write-Host "[*] Installing Blackshard protection service..." -ForegroundColor Cyan
 $null = New-Service `
     -Name $protectionServiceName `
-    -BinaryPathName $destinationAgent `
+    -BinaryPathName $destinationService `
     -StartupType Automatic `
     -Description "Blackshard real-time protection and quarantine service"
 
-$serviceCommand = "`"$destinationAgent`" --service"
+$serviceCommand = "`"$destinationService`" --service"
 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$protectionServiceName" -Name ImagePath -Value $serviceCommand -Type ExpandString
 
 & sc.exe failure $protectionServiceName "reset= 86400" "actions= restart/30000/restart/30000/none/0" | Out-Host

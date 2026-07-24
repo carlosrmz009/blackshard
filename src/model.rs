@@ -36,7 +36,7 @@ impl DecisionTreeEnsemble {
     /// Evaluates the extracted features. Returns a float score.
     pub fn evaluate(&self, features: &ModelFeatures) -> f32 {
         let mut score = 0.0;
-        
+
         // Very basic placeholder inference rules
         if features.is_pe > 0.0 {
             if features.entropy > 7.0 {

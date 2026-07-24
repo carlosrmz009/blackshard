@@ -18,11 +18,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          targets: i686-pc-windows-msvc
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo test --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --release
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace --release
       - name: Build minifilter and development distribution
         shell: pwsh
         run: .\deploy.ps1
@@ -30,9 +32,28 @@ jobs:
         shell: pwsh
         run: |
           .\installer\build-development-vm-installer.ps1 `
-            -AgentPath .\dist\blackshard.exe `
+            -ServicePath .\dist\blackshard-service.exe `
+            -UiPath .\dist\blackshard-ui.exe `
             -DriverPath .\dist\blackshard.sys `
+            -AmsiX64Path .\dist\blackshard-amsi-x64.dll `
+            -AmsiX86Path .\dist\blackshard-amsi-x86.dll `
             -OutputDirectory .\dist
+      - name: Verify development artifacts
+        shell: pwsh
+        run: |
+          $required = @(
+            "blackshard-service.exe",
+            "blackshard-ui.exe",
+            "blackshard.sys",
+            "blackshard-amsi-x64.dll",
+            "blackshard-amsi-x86.dll",
+            "BlackshardVmSetup.exe"
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path ".\dist" $file) -PathType Leaf)) {
+              throw "Missing release artifact: $file"
+            }
+          }
       - name: Upload development test package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

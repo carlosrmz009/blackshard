@@ -35,8 +35,20 @@ struct BlackshardMessage {
 }
 
 fn main() {
-    println!("BlackshardNotification size: {}", mem::size_of::<BlackshardNotification>());
-    println!("FilterMessageHeader size: {}", mem::size_of::<FilterMessageHeader>());
-    println!("BlackshardMessage size: {}", mem::size_of::<BlackshardMessage>());
-    println!("BlackshardMessage alignment: {}", mem::align_of::<BlackshardMessage>());
+    println!(
+        "BlackshardNotification size: {}",
+        mem::size_of::<BlackshardNotification>()
+    );
+    println!(
+        "FilterMessageHeader size: {}",
+        mem::size_of::<FilterMessageHeader>()
+    );
+    println!(
+        "BlackshardMessage size: {}",
+        mem::size_of::<BlackshardMessage>()
+    );
+    println!(
+        "BlackshardMessage alignment: {}",
+        mem::align_of::<BlackshardMessage>()
+    );
 }

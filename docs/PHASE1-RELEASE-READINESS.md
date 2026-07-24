@@ -14,7 +14,8 @@ Installation creates multiple components because Windows cannot run a file-syste
 BlackshardSetup.exe
   -> blackshard                      kernel FILE_SYSTEM_DRIVER
   -> BlackshardProtectionService     LocalSystem user-mode service
-  -> blackshard.exe                  GUI, service entry point, helper modes, notification broker
+  -> blackshard-service.exe          service, worker, driver-helper, and notification modes
+  -> blackshard-ui.exe               interactive desktop UI and narrow elevated helper
   -> %ProgramData%\Blackshard        definitions, settings, history, state, quarantine
 ```
 
@@ -30,12 +31,12 @@ There is no P2P/Shardnet component in Phase 1.
 - Bounded static analysis for PE structure, executable/import/section anomalies, suspicious script behavior combinations, content classification, and contextual entropy.
 - Entropy alone never escalates a file to suspicious or malicious.
 - Exact trusted signature matches authorize automatic blocking and quarantine. A positive result from an installed Windows AMSI provider can deny executable use but never authorizes Blackshard quarantine. YARA and heuristic findings are recorded for review; they are not automatically destructive.
-- Bounded AMSI-consumer scanning for scripts, Office content, and YARA-selected samples. Provider input is capped at 4 MiB; Blackshard does not register its own AMSI provider.
+- Bounded AMSI-consumer scanning for scripts, Office content, and YARA-selected samples. Separate x64/x86 Blackshard AMSI provider DLLs and registration are packaged; their dedicated endpoint uses a separate protocol, DACL, bounded chunks, and a scan-only schema. Clean-VM host compatibility and bypass testing remain release gates.
 - A 64 MiB per-file analysis ceiling. A file larger than the ceiling is marked truncated and cannot qualify for exact-signature automatic action because its complete SHA-256 was not obtained.
 - No pathname/metadata clean-verdict cache in the enforcement path.
-- Minifilter protocol v5 with fixed-size/versioned messages, normalized paths, live file IDs, stable process-start keys, stream content-generation tracking, bounded 1.5-second scan waits, 100-millisecond behavior-telemetry waits, post-create inspection for selected high-risk opens, executable-section creation gating, and protected-document write/rename/delete telemetry.
+- Minifilter protocol v6 with fixed-size/versioned messages, normalized paths, live file IDs, stable process-start keys, stream content-generation tracking, an explicit readiness generation, centralized failure decisions and counters, bounded 1.5-second scan waits, 100-millisecond behavior-telemetry waits, post-create inspection for selected high-risk opens, executable-section creation gating, and protected-document write/rename/delete telemetry.
 - User mode scans an opened non-reparse-point candidate, validates its Windows file ID against the kernel notification, reads that exact handle, and checks for mutation during analysis.
-- Executable mapping fails closed on analysis/identity errors or a write generation race. General read/open inspection still has explicit fail-open paths for service absence, timeout, unsupported object resolution, high IRQL, overload, and overlong names; counters expose those bypasses.
+- Once a validated ready generation is armed, unknown executable mapping blocks on service absence, timeout, malformed/protocol-mismatched replies, object/path resolution failures, unsupported IRQL, overlong paths, and content races. Before readiness, the current boot-policy branch remains an explicitly counted audit allow; narrowing that branch to validated boot-critical and cached objects is still required.
 
 ### Service and user experience
 
@@ -64,7 +65,7 @@ There is no P2P/Shardnet component in Phase 1.
 
 - A hosted production definition feed, production manifest URL, production Ed25519 key, offline signing ceremony, key rotation/revocation mechanism, emergency rollback playbook, or feed service-level objective.
 - A background updater for the application, driver, MSI, or Burn bundle. The current online updater handles definitions only.
-- A Blackshard Windows AMSI provider. The client consumes the Windows AMSI API, so that layer depends on providers already installed on the machine.
+- Production qualification of the packaged Blackshard AMSI provider across supported 32-bit and 64-bit hosts.
 - RAR/7z/ISO payload expansion, executable unpacking/emulation, behavioral sandboxing, cloud detonation/reputation, memory scanning, boot-sector scanning, email/web proxying, exploit prevention, process termination/suspension, or ransomware rollback.
 - A bundled ClamAV resident engine. The maintainer importer can ingest reviewed SHA-256 records from FreshClam-verified data, but no upstream content is automatically trusted or shipped by this repository.
 - A production-grade reputation backend, telemetry pipeline, or sample-submission workflow.
@@ -158,7 +159,8 @@ sc.exe query BlackshardProtectionService
 fltmc.exe filters | Select-String blackshard
 fltmc.exe instances -f blackshard
 Get-Content -Raw "$env:ProgramData\Blackshard\service-health.json" | ConvertFrom-Json
-Get-AuthenticodeSignature "$env:ProgramFiles\Blackshard\blackshard.exe" | Format-List
+Get-AuthenticodeSignature "$env:ProgramFiles\Blackshard\blackshard-service.exe" | Format-List
+Get-AuthenticodeSignature "$env:ProgramFiles\Blackshard\blackshard-ui.exe" | Format-List
 ```
 
 Disposable-VM legacy development checks:

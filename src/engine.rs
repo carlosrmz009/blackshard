@@ -288,7 +288,11 @@ pub struct ScanEngine {
 impl ScanEngine {
     pub fn new(config: ScanConfig, signatures: SignatureDatabase) -> Result<Self, ConfigError> {
         config.validate()?;
-        Ok(Self { config, signatures, model: crate::model::ModelManager::new() })
+        Ok(Self {
+            config,
+            signatures,
+            model: crate::model::ModelManager::new(),
+        })
     }
 
     pub fn config(&self) -> &ScanConfig {
@@ -342,7 +346,7 @@ impl ScanEngine {
                 }
             };
             hasher.update(&buffer[..n]);
-            
+
             if prefix.len() < self.config.max_read_bytes {
                 let needed = self.config.max_read_bytes - prefix.len();
                 let to_copy = n.min(needed);
@@ -361,10 +365,16 @@ impl ScanEngine {
             }
         }
 
-        let file_size = declared_size.map(|size| size.max(total_read)).unwrap_or(total_read);
+        let file_size = declared_size
+            .map(|size| size.max(total_read))
+            .unwrap_or(total_read);
         let truncated_prefix = total_read > self.config.max_read_bytes as u64;
-        let full_digest = if io_error.is_none() && !truncated_prefix { Some(hasher.finalize().into()) } else { None };
-        
+        let full_digest = if io_error.is_none() && !truncated_prefix {
+            Some(hasher.finalize().into())
+        } else {
+            None
+        };
+
         let completeness = if io_error.is_some() {
             AnalysisCompleteness::ResourceLimitReached
         } else if truncated_prefix {
@@ -373,7 +383,14 @@ impl ScanEngine {
             AnalysisCompleteness::Complete
         };
 
-        self.analyze_internal(&prefix, file_size, prefix.len(), truncated_prefix, full_digest, completeness)
+        self.analyze_internal(
+            &prefix,
+            file_size,
+            prefix.len(),
+            truncated_prefix,
+            full_digest,
+            completeness,
+        )
     }
 
     /// Scan an in-memory candidate. Inputs above the configured read limit are
@@ -390,16 +407,24 @@ impl ScanEngine {
     pub fn scan_sample(&self, bytes: &[u8], declared_size: u64) -> ScanReport {
         let sample = &bytes[..bytes.len().min(self.config.max_read_bytes)];
         let file_size = declared_size.max(bytes.len() as u64);
-        let truncated_prefix = bytes.len() > self.config.max_read_bytes || file_size > bytes.len() as u64;
-        
+        let truncated_prefix =
+            bytes.len() > self.config.max_read_bytes || file_size > bytes.len() as u64;
+
         let full_digest = (!truncated_prefix).then(|| sha256(bytes));
         let completeness = if truncated_prefix {
             AnalysisCompleteness::PrefixAndTargetedRegions
         } else {
             AnalysisCompleteness::Complete
         };
-        
-        self.analyze_internal(sample, file_size, bytes.len(), truncated_prefix, full_digest, completeness)
+
+        self.analyze_internal(
+            sample,
+            file_size,
+            bytes.len(),
+            truncated_prefix,
+            full_digest,
+            completeness,
+        )
     }
 
     fn analyze_internal(
@@ -416,7 +441,7 @@ impl ScanEngine {
         let sha256 = full_digest.as_ref().map(hex_sha256);
         let mut evidence = Vec::new();
         let mut exact_match = false;
-        
+
         let mut ml_features = crate::model::ModelFeatures {
             entropy: entropy as f32,
             ..Default::default()
@@ -744,7 +769,12 @@ fn identify_script_language(lower: &str) -> Option<ScriptLanguage> {
     None
 }
 
-fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<Evidence>, features: &mut crate::model::ModelFeatures) {
+fn analyze_pe(
+    bytes: &[u8],
+    content_type: &mut ContentType,
+    evidence: &mut Vec<Evidence>,
+    features: &mut crate::model::ModelFeatures,
+) {
     let pe = match PE::parse(bytes) {
         Ok(pe) => pe,
         Err(error) => {

@@ -1,9 +1,15 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [string]$AgentPath,
+    [string]$ServicePath,
+    [Parameter(Mandatory)]
+    [string]$UiPath,
     [Parameter(Mandatory)]
     [string]$DriverPath,
+    [Parameter(Mandatory)]
+    [string]$AmsiX64Path,
+    [Parameter(Mandatory)]
+    [string]$AmsiX86Path,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\target\development-installer")
 )
 
@@ -23,8 +29,11 @@ function Resolve-RequiredFile([string]$Path, [string]$Description) {
 
 $iexpress = Join-Path $env:SystemRoot "System32\iexpress.exe"
 $iexpress = Resolve-RequiredFile $iexpress "Windows IExpress"
-$AgentPath = Resolve-RequiredFile $AgentPath "Blackshard agent"
+$ServicePath = Resolve-RequiredFile $ServicePath "Blackshard protection service"
+$UiPath = Resolve-RequiredFile $UiPath "Blackshard desktop UI"
 $DriverPath = Resolve-RequiredFile $DriverPath "Blackshard development driver"
+$AmsiX64Path = Resolve-RequiredFile $AmsiX64Path "Blackshard x64 AMSI provider"
+$AmsiX86Path = Resolve-RequiredFile $AmsiX86Path "Blackshard x86 AMSI provider"
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
@@ -91,8 +100,11 @@ if ($compiler.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $uiExecutable -Pat
 
 $payload = [ordered]@{
     "BlackshardSetupUi.exe" = $uiExecutable
-    "blackshard.exe" = $AgentPath
+    "blackshard-service.exe" = $ServicePath
+    "blackshard-ui.exe" = $UiPath
     "blackshard.sys" = $DriverPath
+    "blackshard-amsi-x64.dll" = $AmsiX64Path
+    "blackshard-amsi-x86.dll" = $AmsiX86Path
     "install.ps1" = (Join-Path $PSScriptRoot "..\install.ps1")
     "uninstall.ps1" = (Join-Path $PSScriptRoot "..\uninstall.ps1")
     "verify.ps1" = (Join-Path $PSScriptRoot "..\verify.ps1")

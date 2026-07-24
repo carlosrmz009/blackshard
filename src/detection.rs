@@ -1,17 +1,17 @@
 use crate::amsi::{AmsiScanReport, AmsiScanner};
 use crate::archive::{inspect_gzip, inspect_ole, inspect_zip, ContainerInspection};
+use crate::clamav_worker::{protocol::ScanVerdict, ClamAvWorker};
 use crate::definitions::{DefinitionMatchRateCircuitBreaker, DefinitionMatchRateState};
 use crate::engine::{ContentType, ScanEngine, ScanReport, Verdict as StaticVerdict};
+use crate::freshclam::native_index::NativeIndex;
 use crate::rules::{RuleDisposition, RuleEngine, RuleMatch};
 use crate::similarity::{SimilarityEngine, SimilarityMatch};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::os::windows::io::AsRawHandle;
-use crate::freshclam::native_index::NativeIndex;
-use crate::clamav_worker::{ClamAvWorker, protocol::ScanVerdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectionVerdict {
@@ -264,12 +264,15 @@ impl DetectionEngine {
         let static_start = Instant::now();
         let static_report = self.static_engine.scan_sample(&sample, declared_size);
         let static_duration = static_start.elapsed();
-        
+
         let freshclam_start = Instant::now();
         let mut freshclam_threat = None;
         if let Some(sha256_hex) = &static_report.sha256 {
             if let Ok(hash_bytes) = hex::decode(sha256_hex) {
-                freshclam_threat = self.native_index.evaluate(&hash_bytes, Some(declared_size)).map(|s| s.to_owned());
+                freshclam_threat = self
+                    .native_index
+                    .evaluate(&hash_bytes, Some(declared_size))
+                    .map(|s| s.to_owned());
             }
         }
         let freshclam_duration = freshclam_start.elapsed();
@@ -278,10 +281,9 @@ impl DetectionEngine {
         let mut clamav_threat = None;
         if let Ok(mut worker_lock) = self.clamav_worker.lock() {
             if let Some(worker) = worker_lock.as_mut() {
-                if let Ok(verdict) = worker.scan_handle(file.as_raw_handle() as u64) {
-                    if let ScanVerdict::Malicious = verdict {
-                        clamav_threat = Some("ClamAV.Malware".to_owned());
-                    }
+                if let Ok(ScanVerdict::Malicious) = worker.scan_handle(file.as_raw_handle() as u64)
+                {
+                    clamav_threat = Some("ClamAV.Malware".to_owned());
                 }
             }
         }
@@ -363,7 +365,10 @@ impl DetectionEngine {
         let mut freshclam_threat = None;
         if let Some(sha256_hex) = &static_report.sha256 {
             if let Ok(hash_bytes) = hex::decode(sha256_hex) {
-                freshclam_threat = self.native_index.evaluate(&hash_bytes, Some(bytes.len() as u64)).map(|s| s.to_owned());
+                freshclam_threat = self
+                    .native_index
+                    .evaluate(&hash_bytes, Some(bytes.len() as u64))
+                    .map(|s| s.to_owned());
             }
         }
         let freshclam_duration = freshclam_start.elapsed();
@@ -708,22 +713,26 @@ impl EvidenceCascade {
         let automatic_quarantine_eligible = self.static_report.verdict == StaticVerdict::Malicious
             && !self.static_report.truncated
             && self.static_report.sha256.is_some()
-            && self.static_report
+            && self
+                .static_report
                 .evidence
                 .iter()
                 .any(|evidence| evidence.code == "signature.exact_sha256");
 
-        let malicious_rule = self.rule_matches
+        let malicious_rule = self
+            .rule_matches
             .iter()
             .filter(|item| item.disposition == RuleDisposition::Malicious)
             .max_by_key(|item| item.risk_score);
-        let suspicious_rule_score = self.rule_matches
+        let suspicious_rule_score = self
+            .rule_matches
             .iter()
             .filter(|item| item.disposition == RuleDisposition::Suspicious)
             .map(|item| item.risk_score)
             .max()
             .unwrap_or(0);
-        let similarity_score = self.similarity_matches
+        let similarity_score = self
+            .similarity_matches
             .iter()
             .map(|matched| {
                 82u8.saturating_add(
@@ -734,10 +743,12 @@ impl EvidenceCascade {
             .max()
             .unwrap_or(0);
 
-        let amsi_provider_detection = self.amsi_report
+        let amsi_provider_detection = self
+            .amsi_report
             .as_ref()
             .is_some_and(AmsiScanReport::is_provider_detection);
-        let amsi_policy_block = self.amsi_report
+        let amsi_policy_block = self
+            .amsi_report
             .as_ref()
             .is_some_and(AmsiScanReport::should_block_execution);
 
@@ -791,15 +802,17 @@ impl EvidenceCascade {
             || suspicious_rule_score > 0
             || similarity_score > 0
         {
-            let independent_bonus =
-                if self.static_report.verdict == StaticVerdict::Suspicious && suspicious_rule_score > 0 {
-                    10
-                } else {
-                    0
-                };
+            let independent_bonus = if self.static_report.verdict == StaticVerdict::Suspicious
+                && suspicious_rule_score > 0
+            {
+                10
+            } else {
+                0
+            };
 
             verdict = DetectionVerdict::Suspicious;
-            risk_score = self.static_report
+            risk_score = self
+                .static_report
                 .risk_score
                 .max(suspicious_rule_score)
                 .max(similarity_score)
@@ -807,7 +820,8 @@ impl EvidenceCascade {
                 .min(99);
             confidence = self.static_report.confidence.max(75);
 
-            threat_name = self.rule_matches
+            threat_name = self
+                .rule_matches
                 .iter()
                 .filter(|item| item.disposition == RuleDisposition::Suspicious)
                 .max_by_key(|item| item.risk_score)
@@ -819,8 +833,14 @@ impl EvidenceCascade {
                 })
                 .or_else(|| Some("Suspicious.StaticAnalysis".to_owned()));
 
-            if similarity_score > 0 && suspicious_rule_score == 0 && self.static_report.verdict == StaticVerdict::Clean {
-                log::info!("ML Model Shadow Mode: hold for deeper analysis. Threat: {:?}", threat_name);
+            if similarity_score > 0
+                && suspicious_rule_score == 0
+                && self.static_report.verdict == StaticVerdict::Clean
+            {
+                log::info!(
+                    "ML Model Shadow Mode: hold for deeper analysis. Threat: {:?}",
+                    threat_name
+                );
             }
         }
 

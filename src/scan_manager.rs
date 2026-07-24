@@ -595,23 +595,76 @@ fn lock_progress(progress: &Arc<Mutex<ScanProgress>>) -> std::sync::MutexGuard<'
     progress.lock().expect("scan progress lock was poisoned")
 }
 
+pub struct ScanQueueManager {
+    high_priority: mpsc::Sender<PathBuf>,
+    low_priority: mpsc::Sender<PathBuf>,
+}
+
+impl ScanQueueManager {
+    pub fn new(
+        worker_count: usize,
+        engine: Arc<DetectionEngine>,
+        _quarantine: Arc<QuarantineStore>,
+        _history: Arc<EventHistory>,
+        _settings: Settings,
+    ) -> Self {
+        let (high_tx, high_rx) = mpsc::channel::<PathBuf>();
+        let (low_tx, low_rx) = mpsc::channel::<PathBuf>();
+
+        let high_rx = Arc::new(Mutex::new(high_rx));
+        let low_rx = Arc::new(Mutex::new(low_rx));
+
+        for _ in 0..worker_count {
+            let high_rx = Arc::clone(&high_rx);
+            let low_rx = Arc::clone(&low_rx);
+            let engine = Arc::clone(&engine);
+
+            thread::spawn(move || loop {
+                let mut path_opt = {
+                    let rx = high_rx.lock().unwrap();
+                    rx.try_recv().ok()
+                };
+
+                if path_opt.is_none() {
+                    let rx = low_rx.lock().unwrap();
+                    path_opt = rx.try_recv().ok();
+                }
+
+                if let Some(path) = path_opt {
+                    let _report = engine.scan_path(&path);
+                } else {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+
+        Self {
+            high_priority: high_tx,
+            low_priority: low_tx,
+        }
+    }
+
+    pub fn enqueue_high_priority(&self, path: PathBuf) {
+        let _ = self.high_priority.send(path);
+    }
+
+    pub fn enqueue_low_priority(&self, path: PathBuf) {
+        let _ = self.low_priority.send(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::history::EventHistory;
 
     #[test]
-    fn custom_scan_detects_and_quarantines_eicar() {
+    fn custom_scan_detects_and_quarantines_inert_blackshard_test_object() {
         let temporary = tempfile::tempdir().unwrap();
         let target = temporary.path().join("targets");
         fs::create_dir_all(&target).unwrap();
-        let eicar_path = target.join("eicar.com");
-        let eicar = [
-            "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-",
-            "ANTIVIRUS-TEST-FILE!$H+H*",
-        ]
-        .concat();
-        fs::write(&eicar_path, eicar).unwrap();
+        let test_path = target.join("blackshard-inert-test.com");
+        fs::write(&test_path, crate::self_test::PAYLOAD).unwrap();
         fs::write(target.join("clean.txt"), b"ordinary text").unwrap();
 
         let engine = Arc::new(DetectionEngine::builtin().unwrap());
@@ -637,7 +690,7 @@ mod tests {
         assert_eq!(progress.scanned_files, 2);
         assert_eq!(progress.malicious_files, 1);
         assert_eq!(progress.quarantined_files, 1);
-        assert!(!eicar_path.exists());
+        assert!(!test_path.exists());
     }
 
     #[test]
@@ -672,64 +725,5 @@ mod tests {
         assert!(is_archive_container(Path::new("backup.tar")));
         assert!(!is_archive_container(Path::new("program.exe")));
         assert!(!is_archive_container(Path::new("archive.zip.exe")));
-    }
-}
-pub struct ScanQueueManager {
-    high_priority: mpsc::Sender<PathBuf>,
-    low_priority: mpsc::Sender<PathBuf>,
-}
-
-impl ScanQueueManager {
-    pub fn new(
-        worker_count: usize,
-        engine: Arc<DetectionEngine>,
-        _quarantine: Arc<QuarantineStore>,
-        _history: Arc<EventHistory>,
-        _settings: Settings,
-    ) -> Self {
-        let (high_tx, high_rx) = mpsc::channel::<PathBuf>();
-        let (low_tx, low_rx) = mpsc::channel::<PathBuf>();
-        
-        let high_rx = Arc::new(Mutex::new(high_rx));
-        let low_rx = Arc::new(Mutex::new(low_rx));
-
-        for _ in 0..worker_count {
-            let high_rx = Arc::clone(&high_rx);
-            let low_rx = Arc::clone(&low_rx);
-            let engine = Arc::clone(&engine);
-
-            thread::spawn(move || {
-                loop {
-                    let mut path_opt = {
-                        let rx = high_rx.lock().unwrap();
-                        rx.try_recv().ok()
-                    };
-                    
-                    if path_opt.is_none() {
-                        let rx = low_rx.lock().unwrap();
-                        path_opt = rx.try_recv().ok();
-                    }
-                    
-                    if let Some(path) = path_opt {
-                        let _report = engine.scan_path(&path);
-                    } else {
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                }
-            });
-        }
-        
-        Self {
-            high_priority: high_tx,
-            low_priority: low_tx,
-        }
-    }
-
-    pub fn enqueue_high_priority(&self, path: PathBuf) {
-        let _ = self.high_priority.send(path);
-    }
-
-    pub fn enqueue_low_priority(&self, path: PathBuf) {
-        let _ = self.low_priority.send(path);
     }
 }

@@ -1564,13 +1564,27 @@ impl eframe::App for BlackshardApp {
                             ui.add_space(16.0);
                             let status_text = match &runtime.readiness {
                                 Some(crate::readiness::ReadinessState::Starting) => "Starting...",
-                                Some(crate::readiness::ReadinessState::LoadingSettings) => "Loading settings...",
-                                Some(crate::readiness::ReadinessState::LoadingDefinitions) => "Loading definitions...",
-                                Some(crate::readiness::ReadinessState::LoadingFreshClam) => "Loading definitions...",
-                                Some(crate::readiness::ReadinessState::StartingDetectionWorkers) => "Starting detection workers...",
-                                Some(crate::readiness::ReadinessState::ConnectingDriver) => "Connecting to driver...",
-                                Some(crate::readiness::ReadinessState::ValidatingProtocol) => "Validating protocol...",
-                                Some(crate::readiness::ReadinessState::RunningSelfTest) => "Running self test...",
+                                Some(crate::readiness::ReadinessState::LoadingSettings) => {
+                                    "Loading settings..."
+                                }
+                                Some(crate::readiness::ReadinessState::LoadingDefinitions) => {
+                                    "Loading definitions..."
+                                }
+                                Some(crate::readiness::ReadinessState::LoadingFreshClam) => {
+                                    "Loading definitions..."
+                                }
+                                Some(
+                                    crate::readiness::ReadinessState::StartingDetectionWorkers,
+                                ) => "Starting detection workers...",
+                                Some(crate::readiness::ReadinessState::ConnectingDriver) => {
+                                    "Connecting to driver..."
+                                }
+                                Some(crate::readiness::ReadinessState::ValidatingProtocol) => {
+                                    "Validating protocol..."
+                                }
+                                Some(crate::readiness::ReadinessState::RunningSelfTest) => {
+                                    "Running self test..."
+                                }
                                 _ => "Starting service...",
                             };
                             ui.label(

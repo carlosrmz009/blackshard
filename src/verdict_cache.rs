@@ -55,7 +55,8 @@ impl VerdictCache {
     ) -> Option<CachedVerdict> {
         if let Some(cached) = self.entries.get(key) {
             let age = Utc::now().signed_duration_since(cached.scanned_at);
-            if age.num_hours() < 24 && cached.definition_generation == current_definition_generation {
+            if age.num_hours() < 24 && cached.definition_generation == current_definition_generation
+            {
                 // Update LRU position
                 if let Some(pos) = self.lru.iter().position(|k| k == key) {
                     let k = self.lru.remove(pos).unwrap();

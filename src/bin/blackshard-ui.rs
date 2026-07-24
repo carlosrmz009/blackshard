@@ -1,34 +1,4 @@
-// Blackshard is intentionally a single binary with service, GUI, installer-helper,
-// and test-only subsystem entry points. Some public subsystem APIs are dormant in
-// any one build mode, so retain them while keeping every other warning fatal.
-#![allow(dead_code)]
 use blackshard::*;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 use blackshard::ipc::IpcClient;
 use blackshard::service::{
@@ -50,23 +20,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-const SERVICE_ARGUMENT: &str = "--service";
-const SERVICE_CONSOLE_ARGUMENT: &str = "--service-console";
 const SELF_TEST_ARGUMENT: &str = "--blackshard-self-test-open";
-const INSTALL_DRIVER_ARGUMENT: &str = "--install-driver";
-const UNINSTALL_DRIVER_ARGUMENT: &str = "--uninstall-driver";
-const NOTIFICATION_AGENT_ARGUMENT: &str = "--notification-agent";
 const VALIDATE_RELEASE_CONFIGURATION_ARGUMENT: &str = "--validate-release-configuration";
 const VERIFY_DEFINITION_UPDATE_ARGUMENT: &str = "--verify-definition-update";
 const EVALUATE_CORPUS_ARGUMENT: &str = "--evaluate-corpus";
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTH_STALE_AFTER_SECONDS: i64 = 10;
-const SELF_TEST_PAYLOAD: &[u8] =
-    b"BLACKSHARD-HARMLESS-SELF-TEST-V2\nThis file contains no executable code.\n";
-
-fn requested_mode() -> Option<String> {
-    std::env::args().nth(1)
-}
 
 fn self_test_probe_exit_code() -> Option<i32> {
     let mut arguments = std::env::args_os();
@@ -374,43 +333,6 @@ fn read_validation_file(path: &std::path::Path, maximum: u64) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-fn run_service_mode() -> Result<(), Box<dyn Error>> {
-    service::run_service_dispatcher()?;
-    Ok(())
-}
-
-fn run_service_console_mode() -> Result<(), Box<dyn Error>> {
-    use std::sync::atomic::AtomicBool;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    service::run_service_console(stop).map_err(Into::into)
-}
-
-fn driver_change_exit_code(install: bool) -> i32 {
-    let mut arguments = std::env::args_os();
-    arguments.next();
-    arguments.next();
-    let Some(inf_path) = arguments.next() else {
-        return 2;
-    };
-    if arguments.next().is_some() {
-        return 2;
-    }
-
-    let result = if install {
-        driver_installer::install_driver(std::path::Path::new(&inf_path))
-    } else {
-        driver_installer::uninstall_driver(std::path::Path::new(&inf_path))
-    };
-    match result {
-        Ok(driver_installer::DriverChange::Complete) => 0,
-        Ok(driver_installer::DriverChange::RebootRequired) => {
-            driver_installer::REBOOT_REQUIRED_EXIT_CODE
-        }
-        Err(_error) => 1,
-    }
-}
-
 fn apply_service_health(runtime: &SharedUiState, health: ServiceHealthSnapshot) {
     let mut state = match runtime.lock() {
         Ok(state) => state,
@@ -511,7 +433,10 @@ fn apply_service_health(runtime: &SharedUiState, health: ServiceHealthSnapshot) 
                     .to_owned(),
             )
         }
-        ServiceLifecycle::Running if health.connection == ServiceConnection::Connected => {
+        ServiceLifecycle::Running
+            if health.connection == ServiceConnection::Connected
+                && matches!(health.readiness, Some(readiness::ReadinessState::Ready)) =>
+        {
             ProtectionStatus::Active
         }
         ServiceLifecycle::Running => ProtectionStatus::Degraded(
@@ -610,7 +535,7 @@ fn run_harmless_protection_test() -> Result<String, String> {
         "blackshard-harmless-test-{}.com",
         std::process::id()
     ));
-    fs::write(&path, SELF_TEST_PAYLOAD)
+    fs::write(&path, self_test::PAYLOAD)
         .map_err(|error| format!("could not create the harmless test file: {error}"))?;
 
     let result = std::env::current_exe()
@@ -733,6 +658,7 @@ mod tests {
             updated_at: now,
             last_detection_at: None,
             last_error: None,
+            readiness: Some(readiness::ReadinessState::Ready),
             definitions: ServiceDefinitionHealth::BuiltIn {
                 version: "embedded-test".to_owned(),
             },
@@ -762,6 +688,7 @@ mod tests {
             updated_at: now,
             last_detection_at: None,
             last_error: None,
+            readiness: Some(readiness::ReadinessState::Ready),
             definitions: ServiceDefinitionHealth::BuiltIn {
                 version: "embedded-test".to_owned(),
             },
@@ -788,9 +715,9 @@ mod tests {
     fn self_test_probe_argument_is_stable() {
         assert_eq!(SELF_TEST_ARGUMENT, "--blackshard-self-test-open");
         assert!(Path::new(SELF_TEST_ARGUMENT).file_name().is_some());
-        assert_eq!(SELF_TEST_PAYLOAD.len(), 72);
+        assert_eq!(self_test::PAYLOAD.len(), 72);
         assert_eq!(
-            hex::encode(sha2::Sha256::digest(SELF_TEST_PAYLOAD)),
+            hex::encode(sha2::Sha256::digest(self_test::PAYLOAD)),
             engine::BLACKSHARD_SELF_TEST_SHA256
         );
     }

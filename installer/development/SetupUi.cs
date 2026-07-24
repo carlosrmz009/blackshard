@@ -313,7 +313,7 @@ namespace BlackshardDevelopmentSetup
             progress.Style = ProgressBarStyle.Blocks;
             progress.Value = 0;
 
-            if (exitCode == 0 && (installComplete || File.Exists(@"C:\Program Files\Blackshard\blackshard.exe")) && !rebootPending)
+            if (exitCode == 0 && (installComplete || File.Exists(@"C:\Program Files\Blackshard\blackshard-ui.exe")) && !rebootPending)
             {
                 SetStatus("PROTECTION ONLINE", "Installation and verification completed. Open Blackshard to begin testing.", Accent);
                 openButton.Enabled = true;
@@ -359,13 +359,13 @@ namespace BlackshardDevelopmentSetup
 
         private void OpenBlackshard(object sender, EventArgs eventArgs)
         {
-            const string agent = @"C:\Program Files\Blackshard\blackshard.exe";
-            if (!File.Exists(agent))
+            const string ui = @"C:\Program Files\Blackshard\blackshard-ui.exe";
+            if (!File.Exists(ui))
             {
                 MessageBox.Show("The installed Blackshard executable was not found.", "Blackshard VM Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
-            Process.Start(new ProcessStartInfo("explorer.exe", "\"" + agent + "\"") { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo("explorer.exe", "\"" + ui + "\"") { UseShellExecute = true });
         }
 
         private void OnFormClosing(object sender, FormClosingEventArgs eventArgs)

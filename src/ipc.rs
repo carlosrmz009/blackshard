@@ -21,8 +21,14 @@ use std::thread::{self, JoinHandle};
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
+pub const AMSI_IPC_PROTOCOL_VERSION: u32 = 1;
 pub const PIPE_NAME: &str = r"\\.\pipe\BlackshardProtection-v1";
+pub const AMSI_PIPE_NAME: &str = r"\\.\pipe\BlackshardAmsi-v1";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_AMSI_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AMSI_REQUEST_BYTES: usize = MAX_AMSI_CONTENT_BYTES + 16 * 1024;
+const MAX_AMSI_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_AMSI_CHUNKS: usize = MAX_AMSI_CONTENT_BYTES / MAX_AMSI_CHUNK_BYTES;
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_CUSTOM_SCAN_ROOTS: usize = 16;
 const MAX_QUARANTINE_RESULTS: usize = 256;
@@ -45,6 +51,34 @@ struct ResponseEnvelope {
     version: u32,
     request_id: Uuid,
     result: RpcResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AmsiRequestEnvelope {
+    version: u32,
+    request_id: Uuid,
+    session_id: Uuid,
+    application_name: String,
+    content_name: String,
+    content_type: String,
+    chunks: Vec<Vec<u8>>,
+    finalize: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AmsiResponseEnvelope {
+    version: u32,
+    request_id: Uuid,
+    result: AmsiResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum AmsiResult {
+    Verdict { verdict: DetectionVerdictView },
+    Error { code: RpcErrorCode, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,10 +114,40 @@ enum RpcCommand {
     RunSelfTest,
     CheckForUpdates,
     GetFreshClamStatus,
-    AmsiScan {
-        app_name: String,
-        content: Vec<u8>,
-    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustedClientComponent {
+    DesktopUi,
+    ElevatedHelper,
+    NotificationAgent,
+    AmsiHost,
+    Unknown,
+}
+
+fn component_allows_command(component: TrustedClientComponent, command: &RpcCommand) -> bool {
+    use RpcCommand::*;
+    match component {
+        TrustedClientComponent::DesktopUi => matches!(
+            command,
+            Ping | GetSettings
+                | StartScan { .. }
+                | ScanStatus { .. }
+                | CancelScan { .. }
+                | ListQuarantine
+                | RecentActivity { .. }
+                | RequestUpdate
+                | RunSelfTest
+                | CheckForUpdates
+                | GetFreshClamStatus
+        ),
+        TrustedClientComponent::ElevatedHelper => true,
+        TrustedClientComponent::NotificationAgent => {
+            matches!(command, Ping | RecentActivity { .. })
+        }
+        TrustedClientComponent::AmsiHost => false,
+        TrustedClientComponent::Unknown => false,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +184,6 @@ enum RpcResponse {
     Quarantine { records: Vec<QuarantineRecordView> },
     Activity { events: Vec<SecurityEvent> },
     FreshClamStatus { status: FreshClamStatusView },
-    AmsiVerdict { verdict: DetectionVerdictView },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -418,7 +481,8 @@ mod windows_transport {
 
     const IO_TIMEOUT: Duration = Duration::from_secs(3);
     const PIPE_DEFAULT_TIMEOUT_MS: u32 = 3_000;
-    const SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+    const MANAGEMENT_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+    const AMSI_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
 
     #[derive(Clone)]
     pub struct RpcServiceResources {
@@ -442,6 +506,7 @@ mod windows_transport {
     struct CallerContext {
         sid: Vec<u8>,
         elevated_admin: bool,
+        component: TrustedClientComponent,
     }
 
     impl RpcServiceResources {
@@ -513,38 +578,88 @@ mod windows_transport {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum Endpoint {
+        Management,
+        Amsi,
+    }
+
+    impl Endpoint {
+        fn pipe_name(self) -> &'static str {
+            match self {
+                Self::Management => PIPE_NAME,
+                Self::Amsi => AMSI_PIPE_NAME,
+            }
+        }
+
+        fn max_request_bytes(self) -> usize {
+            match self {
+                Self::Management => MAX_REQUEST_BYTES,
+                Self::Amsi => MAX_AMSI_REQUEST_BYTES,
+            }
+        }
+    }
+
     pub struct RpcServer {
         stop: Arc<AtomicBool>,
-        worker: Option<JoinHandle<()>>,
+        workers: Vec<JoinHandle<()>>,
     }
 
     impl RpcServer {
         pub fn start(resources: RpcServiceResources) -> Result<Self, String> {
             let stop = Arc::new(AtomicBool::new(false));
-            let worker_stop = Arc::clone(&stop);
-            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
-            let worker = thread::Builder::new()
-                .name("blackshard-local-rpc".to_owned())
-                .spawn(move || server_loop(resources, worker_stop, ready_sender))
-                .map_err(|error| format!("could not start local control server: {error}"))?;
-            match ready_receiver.recv_timeout(IO_TIMEOUT) {
-                Ok(Ok(())) => Ok(Self {
-                    stop,
-                    worker: Some(worker),
-                }),
-                Ok(Err(error)) => {
-                    let _ = worker.join();
-                    Err(error)
-                }
-                Err(error) => {
-                    stop.store(true, Ordering::Release);
-                    wake_listener();
-                    let _ = worker.join();
-                    Err(format!(
-                        "local control server did not initialize in time: {error}"
-                    ))
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(2);
+            let mut workers = Vec::with_capacity(2);
+            for (name, endpoint) in [
+                ("blackshard-local-rpc", Endpoint::Management),
+                ("blackshard-amsi-rpc", Endpoint::Amsi),
+            ] {
+                let worker_resources = resources.clone();
+                let worker_stop = Arc::clone(&stop);
+                let worker_ready = ready_sender.clone();
+                match thread::Builder::new().name(name.to_owned()).spawn(move || {
+                    server_loop(worker_resources, worker_stop, worker_ready, endpoint)
+                }) {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        stop.store(true, Ordering::Release);
+                        wake_listener(PIPE_NAME);
+                        wake_listener(AMSI_PIPE_NAME);
+                        for worker in workers {
+                            let _ = worker.join();
+                        }
+                        return Err(format!("could not start {name}: {error}"));
+                    }
                 }
             }
+            drop(ready_sender);
+
+            for _ in 0..2 {
+                match ready_receiver.recv_timeout(IO_TIMEOUT) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        stop.store(true, Ordering::Release);
+                        wake_listener(PIPE_NAME);
+                        wake_listener(AMSI_PIPE_NAME);
+                        for worker in workers {
+                            let _ = worker.join();
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        stop.store(true, Ordering::Release);
+                        wake_listener(PIPE_NAME);
+                        wake_listener(AMSI_PIPE_NAME);
+                        for worker in workers {
+                            let _ = worker.join();
+                        }
+                        return Err(format!(
+                            "local control servers did not initialize in time: {error}"
+                        ));
+                    }
+                }
+            }
+            Ok(Self { stop, workers })
         }
 
         pub fn stop(mut self) {
@@ -555,8 +670,9 @@ mod windows_transport {
             self.stop.store(true, Ordering::Release);
             // Wake a listener blocked in ConnectNamedPipe. The request is not
             // processed after the stop bit is observed.
-            wake_listener();
-            if let Some(worker) = self.worker.take() {
+            wake_listener(PIPE_NAME);
+            wake_listener(AMSI_PIPE_NAME);
+            for worker in self.workers.drain(..) {
                 let _ = worker.join();
             }
         }
@@ -572,18 +688,22 @@ mod windows_transport {
         resources: RpcServiceResources,
         stop: Arc<AtomicBool>,
         ready: SyncSender<Result<(), String>>,
+        endpoint: Endpoint,
     ) {
         let mut first = true;
         while !stop.load(Ordering::Acquire) {
             let pipe = loop {
-                match create_server_pipe() {
+                match create_server_pipe(endpoint) {
                     Ok(pipe) => break pipe,
                     Err(error) => {
                         if error.raw_os_error() == Some(5) {
                             thread::sleep(Duration::from_millis(10));
                             continue;
                         }
-                        let detail = format!("could not create protected local pipe: {error}");
+                        let detail = format!(
+                            "could not create protected {:?} local pipe: {error}",
+                            endpoint
+                        );
                         if first {
                             let _ = ready.send(Err(detail));
                         } else {
@@ -637,10 +757,37 @@ mod windows_transport {
                 continue;
             }
 
-            let response = match authorize_client(pipe.raw()) {
+            let handled = match authorize_client(pipe.raw(), endpoint) {
                 Ok(caller) => {
-                    log::info!("IPC client connected and authorized: process {:?}", caller.sid);
-                    process_one_request(pipe.raw(), &resources, &caller)
+                    log::info!(
+                        "IPC client connected and authorized: component {:?}, SID {:?}",
+                        caller.component,
+                        caller.sid
+                    );
+                    match endpoint {
+                        Endpoint::Management => {
+                            process_one_request(pipe.raw(), &resources, &caller).and_then(
+                                |envelope| {
+                                    write_json_frame(pipe.raw(), &envelope, MAX_RESPONSE_BYTES)
+                                        .map_err(|error| {
+                                            RpcFailure::transport(format!(
+                                                "could not write management response: {error}"
+                                            ))
+                                        })
+                                },
+                            )
+                        }
+                        Endpoint::Amsi => process_one_amsi_request(pipe.raw(), &resources, &caller)
+                            .and_then(|envelope| {
+                                write_json_frame(pipe.raw(), &envelope, MAX_RESPONSE_BYTES).map_err(
+                                    |error| {
+                                        RpcFailure::transport(format!(
+                                            "could not write AMSI response: {error}"
+                                        ))
+                                    },
+                                )
+                            }),
+                    }
                 }
                 Err(error) => {
                     log::error!("IPC client authentication failed: {error}");
@@ -650,8 +797,7 @@ mod windows_transport {
                     })
                 }
             };
-            if let Ok(envelope) = response {
-                let _ = write_json_frame(pipe.raw(), &envelope, MAX_RESPONSE_BYTES);
+            if handled.is_ok() {
                 // Wait for the authenticated client to read the response and disconnect.
                 // This prevents the OS from discarding unread pipe data, without
                 // the infinite hang risk of FlushFileBuffers.
@@ -665,9 +811,12 @@ mod windows_transport {
         }
     }
 
-    fn create_server_pipe() -> io::Result<OwnedHandle> {
+    fn create_server_pipe(endpoint: Endpoint) -> io::Result<OwnedHandle> {
         let mut descriptor = null_mut();
-        let sddl = wide(SDDL);
+        let sddl = wide(match endpoint {
+            Endpoint::Management => MANAGEMENT_SDDL,
+            Endpoint::Amsi => AMSI_SDDL,
+        });
         let converted = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -685,7 +834,7 @@ mod windows_transport {
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
         };
-        let name = wide(PIPE_NAME);
+        let name = wide(endpoint.pipe_name());
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
@@ -693,7 +842,7 @@ mod windows_transport {
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 MAX_RESPONSE_BYTES as u32,
-                MAX_REQUEST_BYTES as u32,
+                endpoint.max_request_bytes() as u32,
                 PIPE_DEFAULT_TIMEOUT_MS,
                 &attributes,
             )
@@ -701,8 +850,8 @@ mod windows_transport {
         OwnedHandle::new(handle)
     }
 
-    fn authorize_client(pipe: HANDLE) -> io::Result<CallerContext> {
-        let caller = authenticate_pipe_token(pipe)?;
+    fn authorize_client(pipe: HANDLE, endpoint: Endpoint) -> io::Result<CallerContext> {
+        let mut caller = authenticate_pipe_token(pipe)?;
 
         let mut process_id = 0u32;
         if unsafe { GetNamedPipeClientProcessId(pipe, &mut process_id) } == 0 || process_id == 0 {
@@ -720,11 +869,25 @@ mod windows_transport {
         }
         image.truncate(length as usize);
         let client_path = PathBuf::from(OsString::from_wide(&image));
+        if matches!(endpoint, Endpoint::Amsi) {
+            let client_path = fs::canonicalize(client_path)?;
+            let metadata = fs::symlink_metadata(client_path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the AMSI host identity is not a regular executable",
+                ));
+            }
+            caller.component = TrustedClientComponent::AmsiHost;
+            return Ok(caller);
+        }
         let service_path = std::env::current_exe()?;
-        if !same_product_image(&client_path, &service_path) {
+        caller.component =
+            classify_installed_component(&client_path, &service_path, caller.elevated_admin)?;
+        if caller.component == TrustedClientComponent::Unknown {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the caller is not the installed Blackshard executable",
+                "the caller is not an authorized installed Blackshard component",
             ));
         }
         Ok(caller)
@@ -853,16 +1016,77 @@ mod windows_transport {
         Ok(CallerContext {
             sid,
             elevated_admin: administrator_member != 0 && elevation.TokenIsElevated != 0,
+            component: TrustedClientComponent::Unknown,
         })
     }
 
-    fn same_product_image(client: &Path, service: &Path) -> bool {
-        let canonical_client = fs::canonicalize(client).unwrap_or_else(|_| client.to_path_buf());
-        let canonical_service = fs::canonicalize(service).unwrap_or_else(|_| service.to_path_buf());
-        canonical_client
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&canonical_service.as_os_str().to_string_lossy())
+    fn classify_installed_component(
+        client: &Path,
+        service: &Path,
+        elevated_admin: bool,
+    ) -> io::Result<TrustedClientComponent> {
+        let canonical_client = fs::canonicalize(client)?;
+        let canonical_service = fs::canonicalize(service)?;
+        for path in [&canonical_client, &canonical_service] {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "component identity is not a regular file",
+                ));
+            }
+        }
+
+        let service_name = canonical_service
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if !service_name.eq_ignore_ascii_case("blackshard-service.exe")
+            || canonical_client.parent() != canonical_service.parent()
+        {
+            return Ok(TrustedClientComponent::Unknown);
+        }
+
+        let component = match canonical_client
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+        {
+            name if name.eq_ignore_ascii_case("blackshard-ui.exe") && elevated_admin => {
+                TrustedClientComponent::ElevatedHelper
+            }
+            name if name.eq_ignore_ascii_case("blackshard-ui.exe") => {
+                TrustedClientComponent::DesktopUi
+            }
+            name if name.eq_ignore_ascii_case("blackshard-service.exe") => {
+                TrustedClientComponent::NotificationAgent
+            }
+            _ => TrustedClientComponent::Unknown,
+        };
+        if component == TrustedClientComponent::Unknown || development_ipc_policy_enabled() {
+            return Ok(component);
+        }
+
+        if !crate::trust::verify_file(&canonical_service).is_trusted()
+            || !crate::trust::verify_file(&canonical_client).is_trusted()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "production IPC components require valid Authenticode signatures",
+            ));
+        }
+        Ok(component)
+    }
+
+    fn development_ipc_policy_enabled() -> bool {
+        let Some(program_data) = std::env::var_os("PROGRAMDATA").map(PathBuf::from) else {
+            return false;
+        };
+        let marker = program_data
+            .join("BlackshardDevelopmentInstaller")
+            .join("development-ipc-policy");
+        fs::symlink_metadata(marker)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
     }
 
     fn process_one_request(
@@ -902,11 +1126,111 @@ mod windows_transport {
         })
     }
 
+    fn process_one_amsi_request(
+        pipe: HANDLE,
+        resources: &RpcServiceResources,
+        caller: &CallerContext,
+    ) -> Result<AmsiResponseEnvelope, RpcFailure> {
+        if caller.component != TrustedClientComponent::AmsiHost {
+            return Err(RpcFailure {
+                code: RpcErrorCode::AccessDenied,
+                message: "only authenticated AMSI hosts may use this endpoint".to_owned(),
+            });
+        }
+        let bytes = read_frame(pipe, MAX_AMSI_REQUEST_BYTES, IO_TIMEOUT).map_err(|error| {
+            RpcFailure::transport(format!("could not read AMSI request: {error}"))
+        })?;
+        let request: AmsiRequestEnvelope =
+            serde_json::from_slice(&bytes).map_err(|error| RpcFailure {
+                code: RpcErrorCode::InvalidRequest,
+                message: format!("invalid AMSI request document: {error}"),
+            })?;
+        let request_id = request.request_id;
+        let result = validate_and_scan_amsi(request, resources);
+        Ok(AmsiResponseEnvelope {
+            version: AMSI_IPC_PROTOCOL_VERSION,
+            request_id,
+            result: match result {
+                Ok(verdict) => AmsiResult::Verdict { verdict },
+                Err(error) => AmsiResult::Error {
+                    code: error.code,
+                    message: truncate_message(error.message),
+                },
+            },
+        })
+    }
+
+    fn validate_and_scan_amsi(
+        request: AmsiRequestEnvelope,
+        resources: &RpcServiceResources,
+    ) -> Result<DetectionVerdictView, RpcFailure> {
+        if request.version != AMSI_IPC_PROTOCOL_VERSION {
+            return Err(invalid(format!(
+                "unsupported AMSI protocol version {} (expected {})",
+                request.version, AMSI_IPC_PROTOCOL_VERSION
+            )));
+        }
+        if !request.finalize {
+            return Err(invalid("AMSI requests must explicitly finalize the scan"));
+        }
+        if request.chunks.len() > MAX_AMSI_CHUNKS
+            || request
+                .chunks
+                .iter()
+                .any(|chunk| chunk.len() > MAX_AMSI_CHUNK_BYTES)
+        {
+            return Err(invalid("AMSI content chunk bounds were exceeded"));
+        }
+        for value in [
+            &request.application_name,
+            &request.content_name,
+            &request.content_type,
+        ] {
+            if value.chars().count() > MAX_WIRE_TEXT_CHARS {
+                return Err(invalid("AMSI metadata is too long"));
+            }
+        }
+        let total = request
+            .chunks
+            .iter()
+            .try_fold(0usize, |total, chunk| total.checked_add(chunk.len()))
+            .filter(|total| *total <= MAX_AMSI_CONTENT_BYTES)
+            .ok_or_else(|| invalid("AMSI content exceeds the bounded scan limit"))?;
+        let mut content = Vec::with_capacity(total);
+        for chunk in request.chunks {
+            content.extend_from_slice(&chunk);
+        }
+        let engine = resources
+            .engine
+            .read()
+            .map_err(|_| internal("engine lock"))?
+            .clone();
+        let report = engine.scan_bytes(&content);
+        Ok(match report.verdict {
+            crate::detection::DetectionVerdict::Clean => DetectionVerdictView::Clean,
+            crate::detection::DetectionVerdict::Suspicious => DetectionVerdictView::Suspicious,
+            crate::detection::DetectionVerdict::Malicious => DetectionVerdictView::Malicious,
+            crate::detection::DetectionVerdict::Error => DetectionVerdictView::Error,
+        })
+    }
+
     fn dispatch(
         command: RpcCommand,
         resources: &RpcServiceResources,
         caller: &CallerContext,
     ) -> Result<RpcResponse, RpcFailure> {
+        if !component_allows_command(caller.component, &command) {
+            let message = format!(
+                "{} is not authorized for component {:?}",
+                command_name(&command),
+                caller.component
+            );
+            append_rpc_access_denied(&resources.history, &message);
+            return Err(RpcFailure {
+                code: RpcErrorCode::AccessDenied,
+                message,
+            });
+        }
         if requires_elevated_admin(&command) && !caller.elevated_admin {
             let command_name = command_name(&command);
             let message = format!("{command_name} requires an elevated administrator session");
@@ -1113,40 +1437,22 @@ mod windows_transport {
                     }),
                 }
             }
-            RpcCommand::RunSelfTest => {
-                match crate::self_test::run_self_test() {
-                    Ok(message) => Ok(RpcResponse::Acknowledged { message }),
-                    Err(error) => Err(RpcFailure {
-                        code: RpcErrorCode::Internal,
-                        message: error,
-                    }),
-                }
-            }
-            RpcCommand::CheckForUpdates => {
-                Ok(RpcResponse::Acknowledged {
-                    message: "Update check queued.".to_owned(),
-                })
-            }
-            RpcCommand::GetFreshClamStatus => {
-                Ok(RpcResponse::FreshClamStatus {
-                    status: FreshClamStatusView {
-                        database_version: "daily.cvd".to_owned(),
-                        database_age_hours: 0,
-                    },
-                })
-            }
-            RpcCommand::AmsiScan { app_name, content } => {
-                let engine = resources.engine.read().map_err(|_| internal("engine lock"))?.clone();
-                let report = engine.scan_bytes(&content);
-                Ok(RpcResponse::AmsiVerdict {
-                    verdict: match report.verdict {
-                        crate::detection::DetectionVerdict::Clean => DetectionVerdictView::Clean,
-                        crate::detection::DetectionVerdict::Suspicious => DetectionVerdictView::Suspicious,
-                        crate::detection::DetectionVerdict::Malicious => DetectionVerdictView::Malicious,
-                        crate::detection::DetectionVerdict::Error => DetectionVerdictView::Error,
-                    },
-                })
-            }
+            RpcCommand::RunSelfTest => match crate::self_test::run_self_test() {
+                Ok(message) => Ok(RpcResponse::Acknowledged { message }),
+                Err(error) => Err(RpcFailure {
+                    code: RpcErrorCode::Internal,
+                    message: error,
+                }),
+            },
+            RpcCommand::CheckForUpdates => Ok(RpcResponse::Acknowledged {
+                message: "Update check queued.".to_owned(),
+            }),
+            RpcCommand::GetFreshClamStatus => Ok(RpcResponse::FreshClamStatus {
+                status: FreshClamStatusView {
+                    database_version: "daily.cvd".to_owned(),
+                    database_age_hours: 0,
+                },
+            }),
         }
     }
 
@@ -1225,7 +1531,6 @@ mod windows_transport {
             RpcCommand::RunSelfTest => "running protection self-test",
             RpcCommand::CheckForUpdates => "checking for freshclam updates",
             RpcCommand::GetFreshClamStatus => "getting freshclam status",
-            RpcCommand::AmsiScan { .. } => "amsi scanning",
         }
     }
 
@@ -1293,36 +1598,7 @@ mod windows_transport {
 
     impl IpcClient {
         fn call(&self, command: RpcCommand) -> Result<RpcResponse, RpcFailure> {
-            let request_id = Uuid::new_v4();
-            let request = RequestEnvelope {
-                version: IPC_PROTOCOL_VERSION,
-                request_id,
-                command,
-            };
-            let pipe = connect_client().map_err(|error| {
-                RpcFailure::transport(format!("protection service is unavailable: {error}"))
-            })?;
-            write_json_frame(pipe.raw(), &request, MAX_REQUEST_BYTES).map_err(|error| {
-                RpcFailure::transport(format!("could not send service request: {error}"))
-            })?;
-            let bytes =
-                read_frame(pipe.raw(), MAX_RESPONSE_BYTES, IO_TIMEOUT).map_err(|error| {
-                    RpcFailure::transport(format!("could not read service response: {error}"))
-                })?;
-            let response: ResponseEnvelope =
-                serde_json::from_slice(&bytes).map_err(|error| RpcFailure {
-                    code: RpcErrorCode::Internal,
-                    message: format!("invalid service response: {error}"),
-                })?;
-            if response.version != IPC_PROTOCOL_VERSION || response.request_id != request_id {
-                return Err(RpcFailure::transport(
-                    "the service response did not match this request",
-                ));
-            }
-            match response.result {
-                RpcResult::Success { response } => Ok(response),
-                RpcResult::Error { code, message } => Err(RpcFailure { code, message }),
-            }
+            call_endpoint(command, PIPE_NAME, MAX_REQUEST_BYTES)
         }
 
         pub fn get_settings(&self) -> Result<Settings, RpcFailure> {
@@ -1393,17 +1669,100 @@ mod windows_transport {
         pub fn check_for_updates(&self) -> Result<String, RpcFailure> {
             acknowledged(self.call(RpcCommand::CheckForUpdates)?)
         }
+    }
 
-        pub fn scan_amsi(&self, app_name: String, content: Vec<u8>) -> Result<DetectionVerdictView, RpcFailure> {
-            match self.call(RpcCommand::AmsiScan { app_name, content })? {
-                RpcResponse::AmsiVerdict { verdict } => Ok(verdict),
-                _ => Err(invalid("unexpected response to scan_amsi")),
+    #[derive(Debug, Clone, Default)]
+    pub struct AmsiIpcClient;
+
+    impl AmsiIpcClient {
+        pub fn scan(
+            &self,
+            app_name: String,
+            content_name: String,
+            content: Vec<u8>,
+        ) -> Result<DetectionVerdictView, RpcFailure> {
+            if content.len() > MAX_AMSI_CONTENT_BYTES {
+                return Err(invalid("AMSI content exceeds the bounded scan limit"));
+            }
+            let request_id = Uuid::new_v4();
+            let request = AmsiRequestEnvelope {
+                version: AMSI_IPC_PROTOCOL_VERSION,
+                request_id,
+                session_id: Uuid::new_v4(),
+                application_name: app_name,
+                content_name,
+                content_type: "application/octet-stream".to_owned(),
+                chunks: content
+                    .chunks(MAX_AMSI_CHUNK_BYTES)
+                    .map(<[u8]>::to_vec)
+                    .collect(),
+                finalize: true,
+            };
+            let pipe = connect_client(AMSI_PIPE_NAME).map_err(|error| {
+                RpcFailure::transport(format!("AMSI scan service is unavailable: {error}"))
+            })?;
+            write_json_frame(pipe.raw(), &request, MAX_AMSI_REQUEST_BYTES).map_err(|error| {
+                RpcFailure::transport(format!("could not send AMSI scan request: {error}"))
+            })?;
+            let bytes =
+                read_frame(pipe.raw(), MAX_RESPONSE_BYTES, IO_TIMEOUT).map_err(|error| {
+                    RpcFailure::transport(format!("could not read AMSI scan response: {error}"))
+                })?;
+            let response: AmsiResponseEnvelope =
+                serde_json::from_slice(&bytes).map_err(|error| RpcFailure {
+                    code: RpcErrorCode::Internal,
+                    message: format!("invalid AMSI service response: {error}"),
+                })?;
+            if response.version != AMSI_IPC_PROTOCOL_VERSION || response.request_id != request_id {
+                return Err(RpcFailure::transport(
+                    "the AMSI service response did not match this request",
+                ));
+            }
+            match response.result {
+                AmsiResult::Verdict { verdict } => Ok(verdict),
+                AmsiResult::Error { code, message } => Err(RpcFailure { code, message }),
             }
         }
     }
 
-    fn connect_client() -> io::Result<OwnedHandle> {
-        let name = wide(PIPE_NAME);
+    fn call_endpoint(
+        command: RpcCommand,
+        pipe_name: &str,
+        max_request_bytes: usize,
+    ) -> Result<RpcResponse, RpcFailure> {
+        let request_id = Uuid::new_v4();
+        let request = RequestEnvelope {
+            version: IPC_PROTOCOL_VERSION,
+            request_id,
+            command,
+        };
+        let pipe = connect_client(pipe_name).map_err(|error| {
+            RpcFailure::transport(format!("protection service is unavailable: {error}"))
+        })?;
+        write_json_frame(pipe.raw(), &request, max_request_bytes).map_err(|error| {
+            RpcFailure::transport(format!("could not send service request: {error}"))
+        })?;
+        let bytes = read_frame(pipe.raw(), MAX_RESPONSE_BYTES, IO_TIMEOUT).map_err(|error| {
+            RpcFailure::transport(format!("could not read service response: {error}"))
+        })?;
+        let response: ResponseEnvelope =
+            serde_json::from_slice(&bytes).map_err(|error| RpcFailure {
+                code: RpcErrorCode::Internal,
+                message: format!("invalid service response: {error}"),
+            })?;
+        if response.version != IPC_PROTOCOL_VERSION || response.request_id != request_id {
+            return Err(RpcFailure::transport(
+                "the service response did not match this request",
+            ));
+        }
+        match response.result {
+            RpcResult::Success { response } => Ok(response),
+            RpcResult::Error { code, message } => Err(RpcFailure { code, message }),
+        }
+    }
+
+    fn connect_client(pipe_name: &str) -> io::Result<OwnedHandle> {
+        let name = wide(pipe_name);
         let deadline = Instant::now() + Duration::from_millis(PIPE_DEFAULT_TIMEOUT_MS as u64);
         loop {
             if unsafe { WaitNamedPipeW(name.as_ptr(), 500) } != 0 {
@@ -1422,12 +1781,14 @@ mod windows_transport {
                     return OwnedHandle::new(handle);
                 }
                 let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(231) { // ERROR_PIPE_BUSY
+                if err.raw_os_error() != Some(231) {
+                    // ERROR_PIPE_BUSY
                     return Err(err);
                 }
             } else {
                 let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(2) { // ERROR_FILE_NOT_FOUND
+                if err.raw_os_error() != Some(2) {
+                    // ERROR_FILE_NOT_FOUND
                     return Err(err);
                 }
             }
@@ -1438,8 +1799,8 @@ mod windows_transport {
         }
     }
 
-    fn wake_listener() {
-        let _ = connect_client();
+    fn wake_listener(pipe_name: &str) {
+        let _ = connect_client(pipe_name);
     }
 
     fn quick_scan_roots() -> Vec<String> {
@@ -1726,7 +2087,9 @@ mod windows_transport {
 }
 
 #[cfg(windows)]
-pub use windows_transport::{IpcClient, RpcServer, RpcServiceResources, ServiceScanJob};
+pub use windows_transport::{
+    AmsiIpcClient, IpcClient, RpcServer, RpcServiceResources, ServiceScanJob,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1748,6 +2111,32 @@ mod tests {
             Uuid::new_v4()
         );
         assert!(serde_json::from_str::<RequestEnvelope>(&invalid).is_err());
+    }
+
+    #[test]
+    fn amsi_protocol_is_structurally_separate_from_management_commands() {
+        let management = RequestEnvelope {
+            version: IPC_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            command: RpcCommand::SaveSettings {
+                settings: Settings::default(),
+            },
+        };
+        let encoded = serde_json::to_vec(&management).unwrap();
+        assert!(serde_json::from_slice::<AmsiRequestEnvelope>(&encoded).is_err());
+
+        let amsi = AmsiRequestEnvelope {
+            version: AMSI_IPC_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            application_name: "PowerShell".to_owned(),
+            content_name: "script.ps1".to_owned(),
+            content_type: "text/powershell".to_owned(),
+            chunks: vec![b"Write-Output 'safe'".to_vec()],
+            finalize: true,
+        };
+        let encoded = serde_json::to_vec(&amsi).unwrap();
+        assert!(serde_json::from_slice::<RequestEnvelope>(&encoded).is_err());
     }
 
     #[test]
@@ -1796,5 +2185,45 @@ mod tests {
             roots: vec![r"C:\Users\Example\Downloads".to_owned()],
         }));
         assert!(!requires_elevated_admin(&RpcCommand::RequestUpdate));
+    }
+
+    #[test]
+    fn component_command_matrix_separates_ui_notification_and_amsi_authority() {
+        let read_activity = RpcCommand::RecentActivity { limit: 10 };
+        let save = RpcCommand::SaveSettings {
+            settings: Settings::default(),
+        };
+
+        assert!(component_allows_command(
+            TrustedClientComponent::DesktopUi,
+            &read_activity
+        ));
+        assert!(!component_allows_command(
+            TrustedClientComponent::DesktopUi,
+            &save
+        ));
+        assert!(component_allows_command(
+            TrustedClientComponent::ElevatedHelper,
+            &save
+        ));
+        assert!(component_allows_command(
+            TrustedClientComponent::NotificationAgent,
+            &read_activity
+        ));
+        assert!(!component_allows_command(
+            TrustedClientComponent::NotificationAgent,
+            &RpcCommand::StartScan {
+                kind: ScanRequestKind::Full,
+                roots: Vec::new(),
+            }
+        ));
+        assert!(!component_allows_command(
+            TrustedClientComponent::AmsiHost,
+            &RpcCommand::Ping
+        ));
+        assert!(!component_allows_command(
+            TrustedClientComponent::Unknown,
+            &RpcCommand::Ping
+        ));
     }
 }

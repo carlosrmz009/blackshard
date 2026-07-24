@@ -1,40 +1,4 @@
-// Blackshard is intentionally a single binary with service, GUI, installer-helper,
-// and test-only subsystem entry points. Some public subsystem APIs are dormant in
-// any one build mode, so retain them while keeping every other warning fatal.
-#![allow(dead_code)]
 use blackshard::*;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-use blackshard::ipc::IpcClient;
-use blackshard::service::{
-    default_service_health_path, read_service_health, ServiceConnection, ServiceDefinitionHealth,
-    ServiceHealthSnapshot, ServiceLifecycle, SERVICE_HEALTH_SCHEMA_VERSION,
-};
 
 use chrono::Utc;
 
@@ -43,8 +7,6 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 const SERVICE_ARGUMENT: &str = "--service";
 const SERVICE_CONSOLE_ARGUMENT: &str = "--service-console";
@@ -52,13 +14,11 @@ const SELF_TEST_ARGUMENT: &str = "--blackshard-self-test-open";
 const INSTALL_DRIVER_ARGUMENT: &str = "--install-driver";
 const UNINSTALL_DRIVER_ARGUMENT: &str = "--uninstall-driver";
 const NOTIFICATION_AGENT_ARGUMENT: &str = "--notification-agent";
+const CLAMAV_WORKER_ARGUMENT: &str = "--clamav-worker";
+const PARSER_WORKER_ARGUMENT: &str = "--parser-worker";
 const VALIDATE_RELEASE_CONFIGURATION_ARGUMENT: &str = "--validate-release-configuration";
 const VERIFY_DEFINITION_UPDATE_ARGUMENT: &str = "--verify-definition-update";
 const EVALUATE_CORPUS_ARGUMENT: &str = "--evaluate-corpus";
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const HEALTH_STALE_AFTER_SECONDS: i64 = 10;
-const SELF_TEST_PAYLOAD: &[u8] =
-    b"BLACKSHARD-HARMLESS-SELF-TEST-V2\nThis file contains no executable code.\n";
 
 fn requested_mode() -> Option<String> {
     std::env::args().nth(1)
@@ -434,6 +394,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(INSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(true)),
         Some(UNINSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(false)),
         Some(NOTIFICATION_AGENT_ARGUMENT) => notification_agent::run().map_err(Into::into),
+        Some(CLAMAV_WORKER_ARGUMENT) => clamav_worker::run_worker_process().map_err(Into::into),
+        Some(PARSER_WORKER_ARGUMENT) => parser_worker::run_worker_process().map_err(Into::into),
         _ => Err("UI mode is not supported in this build".into()),
     }
 }
@@ -448,9 +410,9 @@ mod tests {
     fn self_test_probe_argument_is_stable() {
         assert_eq!(SELF_TEST_ARGUMENT, "--blackshard-self-test-open");
         assert!(Path::new(SELF_TEST_ARGUMENT).file_name().is_some());
-        assert_eq!(SELF_TEST_PAYLOAD.len(), 72);
+        assert_eq!(self_test::PAYLOAD.len(), 72);
         assert_eq!(
-            hex::encode(sha2::Sha256::digest(SELF_TEST_PAYLOAD)),
+            hex::encode(sha2::Sha256::digest(self_test::PAYLOAD)),
             engine::BLACKSHARD_SELF_TEST_SHA256
         );
     }

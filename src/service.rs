@@ -85,6 +85,13 @@ pub struct ServiceCounters {
     pub dirty_writes: u64,
     pub enforcement_bypasses: u64,
     pub content_race_blocks: u64,
+    pub path_resolution_failures: u64,
+    pub driver_protocol_mismatches: u64,
+    pub driver_cache_allows: u64,
+    pub driver_boot_policy_allows: u64,
+    pub required_enforcement_blocks: u64,
+    pub driver_queue_overloads: u64,
+    pub driver_ready_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -436,7 +443,7 @@ mod windows_service_host {
         let program_data = std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-            
+
         if let Err(e) = crate::freshclam::downloader::download_databases(&program_data) {
             log::warn!("Initial FreshClam download failed: {:?}", e);
         }
@@ -449,7 +456,9 @@ mod windows_service_host {
             Err(error) => {
                 let message = format!("Detection engine initialization failed: {error}");
                 log::error!("{message}");
-                readiness.update_state(crate::readiness::ReadinessState::Failed { reason: message.clone() });
+                readiness.update_state(crate::readiness::ReadinessState::Failed {
+                    reason: message.clone(),
+                });
                 snapshot.lifecycle = ServiceLifecycle::Stopped;
                 snapshot.connection = ServiceConnection::Stopped;
                 snapshot.updated_at = Utc::now();
@@ -479,7 +488,7 @@ mod windows_service_host {
             start_definition_updater(&settings, &mut snapshot, &history);
         let mut stable_definitions = snapshot.definitions.clone();
         let (rpc_update_sender, rpc_update_receiver) = mpsc::sync_channel(1);
-        
+
         readiness.update_state(crate::readiness::ReadinessState::ValidatingProtocol);
         snapshot.readiness = Some(readiness.diagnostics().current_state);
         let rpc_server = match RpcServer::start(RpcServiceResources::new(
@@ -497,7 +506,9 @@ mod windows_service_host {
                     client.stop();
                 }
                 protection.stop();
-                readiness.update_state(crate::readiness::ReadinessState::Failed { reason: error.clone() });
+                readiness.update_state(crate::readiness::ReadinessState::Failed {
+                    reason: error.clone(),
+                });
                 snapshot.lifecycle = ServiceLifecycle::Stopped;
                 snapshot.connection = ServiceConnection::Stopped;
                 snapshot.updated_at = Utc::now();
@@ -521,7 +532,9 @@ mod windows_service_host {
                 client.stop();
             }
             protection.stop();
-            readiness.update_state(crate::readiness::ReadinessState::Failed { reason: error.clone() });
+            readiness.update_state(crate::readiness::ReadinessState::Failed {
+                reason: error.clone(),
+            });
             snapshot.lifecycle = ServiceLifecycle::Stopped;
             snapshot.connection = ServiceConnection::Stopped;
             snapshot.updated_at = Utc::now();
@@ -536,6 +549,8 @@ mod windows_service_host {
         let mut last_settings_check = Instant::now();
         let mut observed_settings_stamp = settings_stamp;
         let mut runtime_error = None;
+        let mut consecutive_health_successes = 0u32;
+        let mut consecutive_health_failures = 0u32;
         while !stop_requested.load(Ordering::Acquire) {
             let mut changed = false;
             match event_receiver.recv_timeout(Duration::from_millis(500)) {
@@ -578,7 +593,8 @@ mod windows_service_host {
                         match DetectionEngine::builtin() {
                             Ok(built_in) => {
                                 replace_detection_engine(&engine, built_in);
-                                definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                definition_generation
+                                    .fetch_add(1, std::sync::atomic::Ordering::Release);
                                 stable_definitions = ServiceDefinitionHealth::BuiltIn {
                                     version: format!("embedded-{}", env!("CARGO_PKG_VERSION")),
                                 };
@@ -637,12 +653,63 @@ mod windows_service_host {
                 .map(|active| active.external_rules_tripped())
                 .unwrap_or(true);
 
-            let is_healthy = snapshot.connection == ServiceConnection::Connected
+            let driver_health = protection.driver_health().ok();
+            let mut components = crate::readiness::ProtectionComponents {
+                service_operational: snapshot.lifecycle == ServiceLifecycle::Running,
+                settings_loaded: true,
+                native_definitions_loaded: !matches!(
+                    snapshot.definitions,
+                    ServiceDefinitionHealth::Failed { .. }
+                ),
+                // The downloader currently stages CVD files but does not
+                // activate or scan with them. These must stay false until the
+                // FreshClam milestone supplies authenticated activation and a
+                // functioning worker.
+                freshclam_loaded: false,
+                freshclam_generation: 0,
+                rule_generation: definition_generation.load(std::sync::atomic::Ordering::Acquire),
+                model_generation: 0,
+                driver_connected: snapshot.connection == ServiceConnection::Connected
+                    && driver_health.is_some(),
+                driver_protocol_validated: driver_health.is_some(),
+                driver_ready_generation: driver_health.as_ref().and_then(|health| {
+                    (health.ready_generation != 0).then_some(health.ready_generation)
+                }),
+                clamav_worker_healthy: false,
+                parser_worker_healthy: false,
+                quarantine_available: quarantine.list().is_ok(),
+                history_available: history.recent(1).is_ok(),
+                ipc_available: true,
+                // The existing detector-only probe is not the required
+                // driver-to-service-to-enforcement end-to-end self-test.
+                self_test_passed: false,
+                consecutive_health_successes,
+                consecutive_health_failures,
+            };
+            let preflight_healthy = components.mandatory_failures().is_empty()
                 && !snapshot.external_rules_suppressed
                 && snapshot.last_error.is_none();
-            let detail = snapshot.connection_detail.clone().or_else(|| snapshot.last_error.clone());
-            readiness.report_health(is_healthy, detail);
-            
+            if preflight_healthy {
+                consecutive_health_failures = 0;
+                consecutive_health_successes = consecutive_health_successes.saturating_add(1);
+            } else {
+                consecutive_health_successes = 0;
+                consecutive_health_failures = consecutive_health_failures.saturating_add(1);
+            }
+            components.consecutive_health_successes = consecutive_health_successes;
+            components.consecutive_health_failures = consecutive_health_failures;
+
+            if preflight_healthy
+                && consecutive_health_successes >= 3
+                && components.driver_ready_generation.is_none()
+            {
+                let generation = definition_generation.load(std::sync::atomic::Ordering::Acquire);
+                if protection.set_ready_generation(generation).is_ok() {
+                    components.driver_ready_generation = Some(generation);
+                }
+            }
+            readiness.report_components(&components);
+
             let current_readiness = readiness.diagnostics().current_state;
             if snapshot.readiness.as_ref() != Some(&current_readiness) {
                 snapshot.readiness = Some(current_readiness);
@@ -961,6 +1028,13 @@ mod windows_service_host {
             snapshot.dirty_writes = driver.dirty_writes;
             snapshot.enforcement_bypasses = driver.enforcement_bypasses;
             snapshot.content_race_blocks = driver.content_race_blocks;
+            snapshot.path_resolution_failures = driver.path_resolution_failures;
+            snapshot.driver_protocol_mismatches = driver.protocol_mismatches;
+            snapshot.driver_cache_allows = driver.cache_allows;
+            snapshot.driver_boot_policy_allows = driver.boot_policy_allows;
+            snapshot.required_enforcement_blocks = driver.required_enforcement_blocks;
+            snapshot.driver_queue_overloads = driver.queue_overloads;
+            snapshot.driver_ready_generation = driver.ready_generation;
         }
         snapshot
     }

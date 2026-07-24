@@ -29,7 +29,7 @@ $memoryIntegrity = try {
     $value = Get-ItemPropertyValue -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name Enabled
     [bool]$value
 } catch { $null }
-$binary = Join-Path $PSScriptRoot '..\target\release\blackshard.exe'
+$binary = Join-Path $PSScriptRoot '..\target\release\blackshard-service.exe'
 $signature = if (Test-Path -LiteralPath $binary -PathType Leaf) {
     $status = Get-AuthenticodeSignature -LiteralPath $binary
     $subject = if ($null -ne $status.SignerCertificate) { [string]$status.SignerCertificate.Subject } else { $null }

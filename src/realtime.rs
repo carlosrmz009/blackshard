@@ -6,6 +6,9 @@ use crate::detection::{
 use crate::history::{EventHistory, EventKind, SecurityEvent};
 use crate::quarantine::{IsolationState, QuarantineRecord, QuarantineStore};
 use crate::trust;
+use crate::verdict_cache::{
+    AnalysisCompleteness, CacheVerdict, CachedVerdict, VerdictCache, VerdictCacheKey,
+};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
@@ -14,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
-use crate::verdict_cache::{VerdictCache, VerdictCacheKey, CachedVerdict, CacheVerdict, AnalysisCompleteness};
 use std::thread::{self, JoinHandle};
 
 #[path = "connection_supervisor.rs"]
@@ -29,7 +31,9 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
-const BLACKSHARD_PROTOCOL_VERSION: u16 = 5;
+const BLACKSHARD_PROTOCOL_VERSION: u16 = 6;
+const CONTROL_GET_HEALTH: u32 = 1;
+const CONTROL_SET_READY_GENERATION: u32 = 2;
 const OPERATION_PROTECTED_WRITE: u32 = 3;
 const OPERATION_PROTECTED_METADATA: u32 = 4;
 const MAX_FILE_PATH_LENGTH: usize = 1024;
@@ -53,7 +57,11 @@ extern "system" {
         overlapped: *mut c_void,
     ) -> i32;
 
-    pub(crate) fn FilterReplyMessage(port: HANDLE, reply_buffer: *mut c_void, reply_buffer_size: u32) -> i32;
+    pub(crate) fn FilterReplyMessage(
+        port: HANDLE,
+        reply_buffer: *mut c_void,
+        reply_buffer_size: u32,
+    ) -> i32;
 
     pub(crate) fn FilterSendMessage(
         port: HANDLE,
@@ -72,6 +80,7 @@ struct DriverControlRequest {
     version: u16,
     size: u16,
     command: u32,
+    generation: u64,
 }
 
 #[repr(C)]
@@ -91,6 +100,41 @@ struct DriverHealthReply {
     dirty_writes: u64,
     enforcement_bypasses: u64,
     content_race_blocks: u64,
+    path_resolution_failures: u64,
+    protocol_mismatches: u64,
+    cache_allows: u64,
+    boot_policy_allows: u64,
+    required_enforcement_blocks: u64,
+    queue_overloads: u64,
+    ready_generation: u64,
+    operational_phase: u32,
+    reserved: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DriverOperationalPhase {
+    #[default]
+    EarlyBoot,
+    Starting,
+    Ready,
+    Recovering,
+    Stopping,
+    SafeMode,
+    Unknown(u32),
+}
+
+impl From<u32> for DriverOperationalPhase {
+    fn from(value: u32) -> Self {
+        match value {
+            0 => Self::EarlyBoot,
+            1 => Self::Starting,
+            2 => Self::Ready,
+            3 => Self::Recovering,
+            4 => Self::Stopping,
+            5 => Self::SafeMode,
+            value => Self::Unknown(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -106,6 +150,14 @@ pub struct DriverHealthCounters {
     pub dirty_writes: u64,
     pub enforcement_bypasses: u64,
     pub content_race_blocks: u64,
+    pub path_resolution_failures: u64,
+    pub protocol_mismatches: u64,
+    pub cache_allows: u64,
+    pub boot_policy_allows: u64,
+    pub required_enforcement_blocks: u64,
+    pub queue_overloads: u64,
+    pub ready_generation: u64,
+    pub operational_phase: DriverOperationalPhase,
 }
 
 #[repr(C)]
@@ -304,7 +356,8 @@ impl RealtimeProtection {
             magic: BLACKSHARD_PROTOCOL_MAGIC,
             version: BLACKSHARD_PROTOCOL_VERSION,
             size: mem::size_of::<DriverControlRequest>() as u16,
-            command: 1,
+            command: CONTROL_GET_HEALTH,
+            generation: 0,
         };
         let mut reply = unsafe { mem::zeroed::<DriverHealthReply>() };
         let mut returned = 0u32;
@@ -341,7 +394,52 @@ impl RealtimeProtection {
             dirty_writes: reply.dirty_writes,
             enforcement_bypasses: reply.enforcement_bypasses,
             content_race_blocks: reply.content_race_blocks,
+            path_resolution_failures: reply.path_resolution_failures,
+            protocol_mismatches: reply.protocol_mismatches,
+            cache_allows: reply.cache_allows,
+            boot_policy_allows: reply.boot_policy_allows,
+            required_enforcement_blocks: reply.required_enforcement_blocks,
+            queue_overloads: reply.queue_overloads,
+            ready_generation: reply.ready_generation,
+            operational_phase: reply.operational_phase.into(),
         })
+    }
+
+    /// Arms fail-closed executable-map enforcement for one fully validated
+    /// service generation. Callers must derive readiness before invoking this.
+    pub fn set_ready_generation(&self, generation: u64) -> Result<(), String> {
+        if generation == 0 {
+            return Err("driver readiness generation zero is reserved".to_owned());
+        }
+        let port = self.port.load(Ordering::Acquire);
+        if port == 0 {
+            return Err("the kernel communication port is not connected".to_owned());
+        }
+        let request = DriverControlRequest {
+            magic: BLACKSHARD_PROTOCOL_MAGIC,
+            version: BLACKSHARD_PROTOCOL_VERSION,
+            size: mem::size_of::<DriverControlRequest>() as u16,
+            command: CONTROL_SET_READY_GENERATION,
+            generation,
+        };
+        let mut returned = 0u32;
+        let result = unsafe {
+            FilterSendMessage(
+                port,
+                (&request as *const DriverControlRequest).cast(),
+                mem::size_of::<DriverControlRequest>() as u32,
+                ptr::null_mut(),
+                0,
+                &mut returned,
+            )
+        };
+        if result != S_OK {
+            return Err(hresult_text(result));
+        }
+        if returned != 0 {
+            return Err("the minifilter returned unexpected readiness data".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -448,7 +546,7 @@ pub(crate) fn realtime_worker(
                         content_generation: notification.content_generation,
                     };
                     let current_gen = definition_generation.load(Ordering::Acquire);
-                    
+
                     let mut cached_result = None;
                     if let Ok(mut cache) = verdict_cache.write() {
                         cached_result = cache.get(&key, current_gen);
@@ -480,30 +578,33 @@ pub(crate) fn realtime_worker(
                             elapsed: std::time::Duration::ZERO,
                             from_cache: true,
                             error: None,
-                            automatic_quarantine_eligible: false, 
+                            automatic_quarantine_eligible: false,
                             execution_block_eligible: cached.verdict == CacheVerdict::Malicious,
                         }
                     } else {
                         log::debug!("Real-time cache miss for {:?}", key);
                         let scan_result = active_engine.scan_open_file(&file);
-                        
+
                         if let Ok(mut cache) = verdict_cache.write() {
-                            cache.insert(key, CachedVerdict {
-                                verdict: match scan_result.verdict {
-                                    DetectionVerdict::Clean => CacheVerdict::Clean,
-                                    DetectionVerdict::Malicious => CacheVerdict::Malicious,
-                                    DetectionVerdict::Suspicious => CacheVerdict::Suspicious,
-                                    DetectionVerdict::Error => CacheVerdict::ScanError,
+                            cache.insert(
+                                key,
+                                CachedVerdict {
+                                    verdict: match scan_result.verdict {
+                                        DetectionVerdict::Clean => CacheVerdict::Clean,
+                                        DetectionVerdict::Malicious => CacheVerdict::Malicious,
+                                        DetectionVerdict::Suspicious => CacheVerdict::Suspicious,
+                                        DetectionVerdict::Error => CacheVerdict::ScanError,
+                                    },
+                                    risk_score: scan_result.risk_score as u32,
+                                    threat_name: scan_result.threat_name.clone(),
+                                    definition_generation: current_gen,
+                                    freshclam_generation: 0,
+                                    rule_generation: 0,
+                                    model_generation: 0,
+                                    scanned_at: chrono::Utc::now(),
+                                    analysis_completeness: AnalysisCompleteness::Complete,
                                 },
-                                risk_score: scan_result.risk_score as u32,
-                                threat_name: scan_result.threat_name.clone(),
-                                definition_generation: current_gen,
-                                freshclam_generation: 0,
-                                rule_generation: 0,
-                                model_generation: 0,
-                                scanned_at: chrono::Utc::now(),
-                                analysis_completeness: AnalysisCompleteness::Complete,
-                            });
+                            );
                         }
                         scan_result
                     }
@@ -692,7 +793,9 @@ fn handle_protected_modification(
         notification.process_start_key,
     );
     let action = match notification.operation {
-        OPERATION_PROTECTED_WRITE => Some(crate::behavior::FileAction::Write { entropy: None }),
+        OPERATION_PROTECTED_WRITE => Some(crate::behavior::FileAction::Write {
+            entropy: crate::behavior::EntropyObservation::NotMeasured,
+        }),
         OPERATION_PROTECTED_METADATA => Some(crate::behavior::FileAction::Rename),
         _ => None,
     };
@@ -820,7 +923,12 @@ fn process_image_path(process_id: u32) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf16_lossy(&buffer)))
 }
 
-pub(crate) fn reply(port: HANDLE, message_id: u64, verdict: DriverVerdict, risk_score: u32) -> bool {
+pub(crate) fn reply(
+    port: HANDLE,
+    message_id: u64,
+    verdict: DriverVerdict,
+    risk_score: u32,
+) -> bool {
     let mut reply = BlackshardReplyMessage {
         header: FilterReplyHeader {
             status: 0,
@@ -962,8 +1070,8 @@ mod tests {
 
     #[test]
     fn protocol_layout_matches_x64_filter_manager_abi() {
-        assert_eq!(mem::size_of::<DriverControlRequest>(), 12);
-        assert_eq!(mem::size_of::<DriverHealthReply>(), 96);
+        assert_eq!(mem::size_of::<DriverControlRequest>(), 24);
+        assert_eq!(mem::size_of::<DriverHealthReply>(), 160);
         assert_eq!(mem::size_of::<FilterMessageHeader>(), 16);
         assert_eq!(mem::size_of::<BlackshardNotification>(), 2104);
         assert_eq!(mem::size_of::<BlackshardMessage>(), 2120);

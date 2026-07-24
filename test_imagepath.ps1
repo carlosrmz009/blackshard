@@ -1,5 +1,5 @@
 $svcName = "TestSvc60"
-$exePath = "C:\Program Files\Blackshard\blackshard.exe"
+$exePath = "C:\Program Files\Blackshard\blackshard-service.exe"
 
 # Approach 1: New-Service directly
 $serviceCommand = "`"$exePath`" --service"

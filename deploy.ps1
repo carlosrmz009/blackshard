@@ -15,14 +15,27 @@ try {
         exit $LASTEXITCODE
     }
 
-    cargo build --release
+    cargo build --workspace --release
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    $x86Target = "i686-pc-windows-msvc"
+    $installedTargets = @(& rustup target list --installed)
+    if ($LASTEXITCODE -ne 0 -or $x86Target -notin $installedTargets) {
+        throw "The $x86Target Rust target is required to build the 32-bit AMSI provider. Run: rustup target add $x86Target"
+    }
+    cargo build --release -p blackshard-amsi --target $x86Target
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
 
     $driverSource = Join-Path $PSScriptRoot "src\driver\blackshard_driver.c"
     $driverBinary = Join-Path $PSScriptRoot "src\driver\x64\Release\blackshard.sys"
-    $agentBinary = Join-Path $PSScriptRoot "target\release\blackshard.exe"
+    $serviceBinary = Join-Path $PSScriptRoot "target\release\blackshard-service.exe"
+    $uiBinary = Join-Path $PSScriptRoot "target\release\blackshard-ui.exe"
+    $amsiX64Binary = Join-Path $PSScriptRoot "target\release\blackshard_amsi.dll"
+    $amsiX86Binary = Join-Path $PSScriptRoot "target\$x86Target\release\blackshard_amsi.dll"
 
     if (-not (Test-Path -LiteralPath $driverBinary)) {
         throw "The driver build completed without producing blackshard.sys."
@@ -30,8 +43,15 @@ try {
     if ((Get-Item -LiteralPath $driverBinary).LastWriteTimeUtc -lt (Get-Item -LiteralPath $driverSource).LastWriteTimeUtc) {
         throw "blackshard.sys is older than its source. Refusing to package a stale kernel driver."
     }
-    if (-not (Test-Path -LiteralPath $agentBinary)) {
-        throw "The Cargo build completed without producing blackshard.exe."
+    foreach ($artifact in @(
+        @{ Path = $serviceBinary; Name = "blackshard-service.exe" },
+        @{ Path = $uiBinary; Name = "blackshard-ui.exe" },
+        @{ Path = $amsiX64Binary; Name = "blackshard-amsi-x64.dll" },
+        @{ Path = $amsiX86Binary; Name = "blackshard-amsi-x86.dll" }
+    )) {
+        if (-not (Test-Path -LiteralPath $artifact.Path -PathType Leaf)) {
+            throw "The Cargo build completed without producing $($artifact.Name)."
+        }
     }
 
     $distributionDirectory = Join-Path $PSScriptRoot "dist"
@@ -55,8 +75,24 @@ try {
     }
 
     Copy-Item -LiteralPath $driverBinary -Destination (Join-Path $distributionDirectory "blackshard.sys")
-    Copy-Item -LiteralPath $agentBinary -Destination (Join-Path $distributionDirectory "blackshard.exe")
+    Copy-Item -LiteralPath $serviceBinary -Destination (Join-Path $distributionDirectory "blackshard-service.exe")
+    Copy-Item -LiteralPath $uiBinary -Destination (Join-Path $distributionDirectory "blackshard-ui.exe")
+    Copy-Item -LiteralPath $amsiX64Binary -Destination (Join-Path $distributionDirectory "blackshard-amsi-x64.dll")
+    Copy-Item -LiteralPath $amsiX86Binary -Destination (Join-Path $distributionDirectory "blackshard-amsi-x86.dll")
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "README.md") -Destination $distributionDirectory
+
+    $requiredArtifacts = @(
+        "blackshard-service.exe",
+        "blackshard-ui.exe",
+        "blackshard.sys",
+        "blackshard-amsi-x64.dll",
+        "blackshard-amsi-x86.dll"
+    )
+    foreach ($requiredArtifact in $requiredArtifacts) {
+        if (-not (Test-Path -LiteralPath (Join-Path $distributionDirectory $requiredArtifact) -PathType Leaf)) {
+            throw "Missing release artifact: $requiredArtifact"
+        }
+    }
 
     $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $distributionDirectory "blackshard.sys")
     if ($signature.Status -ne "Valid") {

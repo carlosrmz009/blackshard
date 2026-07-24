@@ -10,8 +10,7 @@ $ErrorActionPreference = "Stop"
 $driverName = "blackshard"
 $protectionServiceName = "BlackshardProtectionService"
 $driverPath = Join-Path $env:SystemRoot "System32\drivers\blackshard.sys"
-$installedAgentPath = Join-Path $env:ProgramFiles "Blackshard\blackshard.exe"
-$localAgentPath = Join-Path $PSScriptRoot "blackshard.exe"
+$applicationNames = @("blackshard-service.exe", "blackshard-ui.exe")
 $healthPath = Join-Path $env:ProgramData "Blackshard\service-health.json"
 
 function Invoke-ServiceQuery {
@@ -66,25 +65,33 @@ if (Test-Path -LiteralPath $driverPath -PathType Leaf) {
     Write-Host "Driver file not found: $driverPath" -ForegroundColor Red
 }
 
-$agentPath = if (Test-Path -LiteralPath $installedAgentPath -PathType Leaf) {
-    $installedAgentPath
-} elseif (Test-Path -LiteralPath $localAgentPath -PathType Leaf) {
-    $localAgentPath
-} else {
-    $null
-}
-
-$agentSignatureValid = $false
-Write-Host "`n=== Blackshard application signature ===" -ForegroundColor Cyan
-if ($null -ne $agentPath) {
-    $agentSignature = Get-AuthenticodeSignature -LiteralPath $agentPath
-    $agentSignature |
+$applicationsPresent = $true
+$applicationsSigned = $true
+Write-Host "`n=== Blackshard application signatures ===" -ForegroundColor Cyan
+foreach ($applicationName in $applicationNames) {
+    $installedPath = Join-Path $env:ProgramFiles "Blackshard\$applicationName"
+    $localPath = Join-Path $PSScriptRoot $applicationName
+    $applicationPath = if (Test-Path -LiteralPath $installedPath -PathType Leaf) {
+        $installedPath
+    } elseif (Test-Path -LiteralPath $localPath -PathType Leaf) {
+        $localPath
+    } else {
+        $null
+    }
+    if ($null -eq $applicationPath) {
+        Write-Host "$applicationName was not found in Program Files or beside verify.ps1." -ForegroundColor Red
+        $applicationsPresent = $false
+        $applicationsSigned = $false
+        continue
+    }
+    $applicationSignature = Get-AuthenticodeSignature -LiteralPath $applicationPath
+    $applicationSignature |
         Select-Object Path, Status, StatusMessage, SignerCertificate |
         Format-List |
         Out-Host
-    $agentSignatureValid = ($agentSignature.Status -eq "Valid")
-} else {
-    Write-Host "blackshard.exe was not found in Program Files or beside verify.ps1." -ForegroundColor Red
+    if ($applicationSignature.Status -ne "Valid") {
+        $applicationsSigned = $false
+    }
 }
 
 $healthHealthy = $false
@@ -99,6 +106,7 @@ if (Test-Path -LiteralPath $healthPath -PathType Leaf) {
             [int]$health.schema_version -eq 3 -and
             [string]$health.lifecycle -eq "running" -and
             [string]$health.connection -eq "connected" -and
+            [string]$health.readiness -eq "Ready" -and
             [bool]$health.real_time_enabled -and
             -not [bool]$health.external_rules_suppressed -and
             $ageSeconds -ge -5 -and
@@ -131,20 +139,22 @@ $productionHealthy = (
     $null -ne $protectionService -and
     $protectionService.Running -and
     $healthHealthy -and
-    $agentSignatureValid
+    $applicationsPresent -and
+    $applicationsSigned
 )
 $developmentHealthy = (
     $driverService.Running -and
     $loaded -and
     $instancesHealthy -and
     $protectionService.Running -and
-    $healthHealthy
+    $healthHealthy -and
+    $applicationsPresent
 )
 
 if (($DevelopmentVm -and $developmentHealthy) -or (-not $DevelopmentVm -and $productionHealthy)) {
     if ($DevelopmentVm) {
         Write-Host "`n[PASS] The development-VM minifilter and protection service are healthy." -ForegroundColor Green
-        Write-Host "Launch .\blackshard.exe and run the harmless protection test. This result is not production qualification."
+        Write-Host "Launch .\blackshard-ui.exe and run the harmless protection test. This result is not production qualification."
     } else {
         Write-Host "`n[PASS] Both Blackshard services, filter attachment, service health, and application signature passed local checks." -ForegroundColor Green
         Write-Host "Run the UI's harmless protection test. This diagnostic does not prove detection efficacy or release readiness."

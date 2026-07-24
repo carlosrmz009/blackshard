@@ -2,7 +2,7 @@
 #include <dontuse.h>
 
 #define BLACKSHARD_PROTOCOL_MAGIC 0x35485342UL /* "BSH5" */
-#define BLACKSHARD_PROTOCOL_VERSION 5
+#define BLACKSHARD_PROTOCOL_VERSION 6
 #define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
 #define BLACKSHARD_STREAM_CONTEXT_TAG 'cShB'
 #define MAX_FILE_PATH_LENGTH 1024
@@ -12,9 +12,40 @@
 #define BLACKSHARD_OPERATION_PROTECTED_WRITE 3UL
 #define BLACKSHARD_OPERATION_PROTECTED_METADATA 4UL
 #define BLACKSHARD_CONTROL_GET_HEALTH 1UL
+#define BLACKSHARD_CONTROL_SET_READY_GENERATION 2UL
+
+typedef enum _BLACKSHARD_OPERATIONAL_PHASE {
+    BlackshardPhaseEarlyBoot = 0,
+    BlackshardPhaseStarting = 1,
+    BlackshardPhaseReady = 2,
+    BlackshardPhaseRecovering = 3,
+    BlackshardPhaseStopping = 4,
+    BlackshardPhaseSafeMode = 5
+} BLACKSHARD_OPERATIONAL_PHASE;
+
+typedef enum _BLACKSHARD_FAILURE_REASON {
+    BlackshardFailureServiceUnavailable,
+    BlackshardFailureTimeout,
+    BlackshardFailureInvalidReply,
+    BlackshardFailureObjectResolution,
+    BlackshardFailurePathResolution,
+    BlackshardFailurePathTooLong,
+    BlackshardFailureUnsupportedIrql,
+    BlackshardFailureInternalError,
+    BlackshardFailureQueueOverload,
+    BlackshardFailureProtocolMismatch,
+    BlackshardFailureContentRace
+} BLACKSHARD_FAILURE_REASON;
+
+typedef enum _BLACKSHARD_FAILURE_DECISION {
+    BlackshardFailureAllowTrustedCached,
+    BlackshardFailureAllowBootPolicy,
+    BlackshardFailureBlock,
+    BlackshardFailureAuditAllow
+} BLACKSHARD_FAILURE_DECISION;
 
 /*
- * Protocol V5 is intentionally fixed-width. User mode must validate Size,
+ * Protocol V6 is intentionally fixed-width. User mode must validate Size,
  * Magic, and Version before using any field. FileId is the live file-system
  * identity returned by FileInternalInformation for the exact FILE_OBJECT.
  */
@@ -52,6 +83,7 @@ typedef struct _BLACKSHARD_CONTROL_REQUEST {
     USHORT Version;
     USHORT Size;
     ULONG Command;
+    ULONGLONG Generation;
 } BLACKSHARD_CONTROL_REQUEST, *PBLACKSHARD_CONTROL_REQUEST;
 
 typedef struct _BLACKSHARD_HEALTH_REPLY {
@@ -69,6 +101,15 @@ typedef struct _BLACKSHARD_HEALTH_REPLY {
     ULONGLONG DirtyWrites;
     ULONGLONG EnforcementBypasses;
     ULONGLONG ContentRaceBlocks;
+    ULONGLONG PathResolutionFailures;
+    ULONGLONG ProtocolMismatches;
+    ULONGLONG CacheAllows;
+    ULONGLONG BootPolicyAllows;
+    ULONGLONG RequiredEnforcementBlocks;
+    ULONGLONG QueueOverloads;
+    ULONGLONG ReadyGeneration;
+    ULONG OperationalPhase;
+    ULONG Reserved;
 } BLACKSHARD_HEALTH_REPLY, *PBLACKSHARD_HEALTH_REPLY;
 
 typedef struct _BLACKSHARD_STREAM_CONTEXT {
@@ -97,6 +138,14 @@ typedef struct _BLACKSHARD_DATA {
     volatile LONG64 DirtyWrites;
     volatile LONG64 EnforcementBypasses;
     volatile LONG64 ContentRaceBlocks;
+    volatile LONG64 PathResolutionFailures;
+    volatile LONG64 ProtocolMismatches;
+    volatile LONG64 CacheAllows;
+    volatile LONG64 BootPolicyAllows;
+    volatile LONG64 RequiredEnforcementBlocks;
+    volatile LONG64 QueueOverloads;
+    volatile LONG64 ReadyGeneration;
+    volatile LONG OperationalPhase;
 } BLACKSHARD_DATA, *PBLACKSHARD_DATA;
 
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FilePath) == 24);
@@ -106,8 +155,8 @@ C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ProcessStartKey) == 2088);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, MustEnforce) == 2096);
 C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 2104);
 C_ASSERT(sizeof(BLACKSHARD_REPLY) == 16);
-C_ASSERT(sizeof(BLACKSHARD_CONTROL_REQUEST) == 12);
-C_ASSERT(sizeof(BLACKSHARD_HEALTH_REPLY) == 96);
+C_ASSERT(sizeof(BLACKSHARD_CONTROL_REQUEST) == 24);
+C_ASSERT(sizeof(BLACKSHARD_HEALTH_REPLY) == 160);
 
 BLACKSHARD_DATA gBlackshardData;
 
@@ -205,6 +254,18 @@ BlackshardEvaluateOpenedObject (
     _In_ BOOLEAN RestrictToHighRiskName
     );
 
+BLACKSHARD_FAILURE_DECISION
+BlackshardApplyFailurePolicy (
+    _In_ BLACKSHARD_FAILURE_REASON Reason,
+    _In_ ULONG MustEnforce
+    );
+
+BOOLEAN
+BlackshardFailureRequiresBlock (
+    _In_ BLACKSHARD_FAILURE_REASON Reason,
+    _In_ ULONG MustEnforce
+    );
+
 NTSTATUS
 BlackshardGetOrCreateStreamContext (
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -295,6 +356,7 @@ DriverEntry (
     UNREFERENCED_PARAMETER(RegistryPath);
 
     RtlZeroMemory(&gBlackshardData, sizeof(gBlackshardData));
+    gBlackshardData.OperationalPhase = BlackshardPhaseEarlyBoot;
 
     status = FltRegisterFilter(
         DriverObject,
@@ -353,6 +415,86 @@ DriverEntry (
     }
 
     return status;
+}
+
+BLACKSHARD_FAILURE_DECISION
+BlackshardApplyFailurePolicy (
+    _In_ BLACKSHARD_FAILURE_REASON Reason,
+    _In_ ULONG MustEnforce
+    )
+{
+    BLACKSHARD_OPERATIONAL_PHASE phase;
+
+    switch (Reason) {
+    case BlackshardFailureServiceUnavailable:
+        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
+        break;
+    case BlackshardFailureTimeout:
+        InterlockedIncrement64(&gBlackshardData.Timeouts);
+        break;
+    case BlackshardFailureInvalidReply:
+        InterlockedIncrement64(&gBlackshardData.InvalidReplies);
+        break;
+    case BlackshardFailureObjectResolution:
+    case BlackshardFailureInternalError:
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        break;
+    case BlackshardFailurePathResolution:
+        InterlockedIncrement64(&gBlackshardData.PathResolutionFailures);
+        break;
+    case BlackshardFailurePathTooLong:
+        InterlockedIncrement64(&gBlackshardData.OversizePathBypasses);
+        break;
+    case BlackshardFailureUnsupportedIrql:
+        InterlockedIncrement64(&gBlackshardData.IrqlBypasses);
+        break;
+    case BlackshardFailureQueueOverload:
+        InterlockedIncrement64(&gBlackshardData.QueueOverloads);
+        break;
+    case BlackshardFailureProtocolMismatch:
+        InterlockedIncrement64(&gBlackshardData.ProtocolMismatches);
+        break;
+    case BlackshardFailureContentRace:
+        InterlockedIncrement64(&gBlackshardData.ContentRaceBlocks);
+        break;
+    default:
+        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
+        break;
+    }
+
+    if (MustEnforce == 0) {
+        return BlackshardFailureAuditAllow;
+    }
+
+    phase = (BLACKSHARD_OPERATIONAL_PHASE)InterlockedCompareExchange(
+        &gBlackshardData.OperationalPhase,
+        0,
+        0
+        );
+    if (phase == BlackshardPhaseReady) {
+        InterlockedIncrement64(&gBlackshardData.RequiredEnforcementBlocks);
+        return BlackshardFailureBlock;
+    }
+
+    /*
+     * Before the service proves readiness, Windows must remain bootable.
+     * Every such bypass is explicit and counted. Milestone 3 narrows this
+     * branch to validated boot-critical and cached objects.
+     */
+    InterlockedIncrement64(&gBlackshardData.BootPolicyAllows);
+    return BlackshardFailureAllowBootPolicy;
+}
+
+BOOLEAN
+BlackshardFailureRequiresBlock (
+    _In_ BLACKSHARD_FAILURE_REASON Reason,
+    _In_ ULONG MustEnforce
+    )
+{
+    return (BOOLEAN)(
+        BlackshardApplyFailurePolicy(Reason, MustEnforce) ==
+        BlackshardFailureBlock
+        );
 }
 
 NTSTATUS
@@ -423,7 +565,10 @@ BlackshardPreCreate (
     }
 
     if (gBlackshardData.ClientPort == NULL) {
-        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
+        (VOID)BlackshardApplyFailurePolicy(
+            BlackshardFailureServiceUnavailable,
+            FALSE
+            );
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -461,7 +606,10 @@ BlackshardPostCreate (
     if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
         KeAreAllApcsDisabled() ||
         IoGetTopLevelIrp() != NULL) {
-        InterlockedIncrement64(&gBlackshardData.IrqlBypasses);
+        (VOID)BlackshardApplyFailurePolicy(
+            BlackshardFailureUnsupportedIrql,
+            FALSE
+            );
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
@@ -631,7 +779,10 @@ BlackshardPreSetInformation (
     if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
         KeAreAllApcsDisabled() ||
         IoGetTopLevelIrp() != NULL) {
-        InterlockedIncrement64(&gBlackshardData.IrqlBypasses);
+        (VOID)BlackshardApplyFailurePolicy(
+            BlackshardFailureUnsupportedIrql,
+            FALSE
+            );
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -686,7 +837,15 @@ BlackshardPreAcquireForSectionSynchronization (
     }
 
     if (gBlackshardData.ClientPort == NULL) {
-        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
+        if (BlackshardFailureRequiresBlock(
+                BlackshardFailureServiceUnavailable,
+                TRUE
+                )) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            InterlockedIncrement64(&gBlackshardData.Blocks);
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -694,7 +853,15 @@ BlackshardPreAcquireForSectionSynchronization (
     if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
         KeAreAllApcsDisabled() ||
         IoGetTopLevelIrp() != NULL) {
-        InterlockedIncrement64(&gBlackshardData.IrqlBypasses);
+        if (BlackshardFailureRequiresBlock(
+                BlackshardFailureUnsupportedIrql,
+                TRUE
+                )) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            InterlockedIncrement64(&gBlackshardData.Blocks);
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -745,25 +912,36 @@ BlackshardEvaluateOpenedObject (
     PAGED_CODE();
 
     if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
-        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureObjectResolution,
+            MustEnforce
+            );
     }
 
     requestorProcessId = FltGetRequestorProcessId(Data);
-    if (requestorProcessId == 0 ||
-        (gBlackshardData.ClientProcessId != NULL &&
-         requestorProcessId == HandleToULong(gBlackshardData.ClientProcessId))) {
+    if (gBlackshardData.ClientProcessId != NULL &&
+        requestorProcessId == HandleToULong(gBlackshardData.ClientProcessId)) {
         return FALSE;
+    }
+    if (requestorProcessId == 0) {
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureObjectResolution,
+            MustEnforce
+            );
     }
     requestorProcess = FltGetRequestorProcess(Data);
     if (requestorProcess == NULL) {
-        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureObjectResolution,
+            MustEnforce
+            );
     }
     processStartKey = PsGetProcessStartKey(requestorProcess);
     if (processStartKey == 0) {
-        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureObjectResolution,
+            MustEnforce
+            );
     }
 
     nameInformation = NULL;
@@ -773,15 +951,19 @@ BlackshardEvaluateOpenedObject (
         &nameInformation
         );
     if (!NT_SUCCESS(status)) {
-        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailurePathResolution,
+            MustEnforce
+            );
     }
 
     status = FltParseFileNameInformation(nameInformation);
     if (!NT_SUCCESS(status)) {
         FltReleaseFileNameInformation(nameInformation);
-        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailurePathResolution,
+            MustEnforce
+            );
     }
 
     if (RestrictToHighRiskName) {
@@ -812,11 +994,15 @@ BlackshardEvaluateOpenedObject (
         FileStandardInformation,
         NULL
         );
-    if (!NT_SUCCESS(status) || standardInformation.Directory) {
+    if (!NT_SUCCESS(status)) {
         FltReleaseFileNameInformation(nameInformation);
-        if (!NT_SUCCESS(status)) {
-            InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
-        }
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureObjectResolution,
+            MustEnforce
+            );
+    }
+    if (standardInformation.Directory) {
+        FltReleaseFileNameInformation(nameInformation);
         return FALSE;
     }
 
@@ -831,8 +1017,10 @@ BlackshardEvaluateOpenedObject (
         );
     if (!NT_SUCCESS(status)) {
         FltReleaseFileNameInformation(nameInformation);
-        InterlockedIncrement64(&gBlackshardData.ObjectResolutionBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureObjectResolution,
+            MustEnforce
+            );
     }
 
     /* Generation zero is reserved as an invalid/uninitialized wire value. */
@@ -850,19 +1038,29 @@ BlackshardEvaluateOpenedObject (
             0
             );
         FltReleaseContext(streamContext);
+    } else if (MustEnforce != 0) {
+        FltReleaseFileNameInformation(nameInformation);
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureObjectResolution,
+            MustEnforce
+            );
     }
 
     pathLength = (ULONG)(nameInformation->Name.Length / sizeof(WCHAR));
     if (pathLength >= MAX_FILE_PATH_LENGTH) {
         FltReleaseFileNameInformation(nameInformation);
-        InterlockedIncrement64(&gBlackshardData.OversizePathBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailurePathTooLong,
+            MustEnforce
+            );
     }
 
     if (gBlackshardData.ClientPort == NULL) {
         FltReleaseFileNameInformation(nameInformation);
-        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureServiceUnavailable,
+            MustEnforce
+            );
     }
 
     RtlZeroMemory(&notification, sizeof(notification));
@@ -908,22 +1106,33 @@ BlackshardEvaluateOpenedObject (
 
     /* STATUS_TIMEOUT is an NT success code, so test it explicitly. */
     if (status == STATUS_TIMEOUT) {
-        InterlockedIncrement64(&gBlackshardData.Timeouts);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureTimeout,
+            MustEnforce
+            );
     }
 
     if (status != STATUS_SUCCESS) {
-        InterlockedIncrement64(&gBlackshardData.ServiceUnavailableBypasses);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureServiceUnavailable,
+            MustEnforce
+            );
     }
 
     if (replyLength != sizeof(reply) ||
-        reply.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
-        reply.Version != BLACKSHARD_PROTOCOL_VERSION ||
-        reply.Size != sizeof(reply) ||
         (reply.Verdict != VERDICT_ALLOW && reply.Verdict != VERDICT_BLOCK)) {
-        InterlockedIncrement64(&gBlackshardData.InvalidReplies);
-        return FALSE;
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureInvalidReply,
+            MustEnforce
+            );
+    }
+    if (reply.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
+        reply.Version != BLACKSHARD_PROTOCOL_VERSION ||
+        reply.Size != sizeof(reply)) {
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureProtocolMismatch,
+            MustEnforce
+            );
     }
 
     /*
@@ -947,9 +1156,16 @@ BlackshardEvaluateOpenedObject (
                 );
             FltReleaseContext(streamContext);
             if (currentGeneration != contentGeneration) {
-                InterlockedIncrement64(&gBlackshardData.ContentRaceBlocks);
-                return TRUE;
+                return BlackshardFailureRequiresBlock(
+                    BlackshardFailureContentRace,
+                    MustEnforce
+                    );
             }
+        } else {
+            return BlackshardFailureRequiresBlock(
+                BlackshardFailureContentRace,
+                MustEnforce
+                );
         }
     }
 
@@ -1207,6 +1423,11 @@ BlackshardPortConnect (
 
     gBlackshardData.ClientProcessId = PsGetCurrentProcessId();
     gBlackshardData.ClientPort = ClientPort;
+    InterlockedExchange(
+        &gBlackshardData.OperationalPhase,
+        BlackshardPhaseStarting
+        );
+    InterlockedExchange64(&gBlackshardData.ReadyGeneration, 0);
 
     return STATUS_SUCCESS;
 }
@@ -1225,6 +1446,11 @@ BlackshardPortDisconnect (
         &gBlackshardData.ClientPort
         );
     gBlackshardData.ClientProcessId = NULL;
+    InterlockedExchange64(&gBlackshardData.ReadyGeneration, 0);
+    InterlockedExchange(
+        &gBlackshardData.OperationalPhase,
+        BlackshardPhaseRecovering
+        );
 }
 
 NTSTATUS
@@ -1251,9 +1477,7 @@ BlackshardPortMessage (
     *ReturnOutputBufferLength = 0;
 
     if (InputBuffer == NULL ||
-        InputBufferLength < sizeof(request) ||
-        OutputBuffer == NULL ||
-        OutputBufferLength < sizeof(reply)) {
+        InputBufferLength != sizeof(request)) {
         return STATUS_BUFFER_TOO_SMALL;
     }
 
@@ -1270,9 +1494,31 @@ BlackshardPortMessage (
 
     if (request.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
         request.Version != BLACKSHARD_PROTOCOL_VERSION ||
-        request.Size != sizeof(request) ||
-        request.Command != BLACKSHARD_CONTROL_GET_HEALTH) {
+        request.Size != sizeof(request)) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (request.Command == BLACKSHARD_CONTROL_SET_READY_GENERATION) {
+        if (request.Generation == 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        InterlockedExchange64(
+            &gBlackshardData.ReadyGeneration,
+            (LONG64)request.Generation
+            );
+        InterlockedExchange(
+            &gBlackshardData.OperationalPhase,
+            BlackshardPhaseReady
+            );
+        return STATUS_SUCCESS;
+    }
+
+    if (request.Command != BLACKSHARD_CONTROL_GET_HEALTH) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (OutputBuffer == NULL ||
+        OutputBufferLength < sizeof(reply)) {
+        return STATUS_BUFFER_TOO_SMALL;
     }
 
     RtlZeroMemory(&reply, sizeof(reply));
@@ -1306,6 +1552,27 @@ BlackshardPortMessage (
     reply.ContentRaceBlocks =
         (ULONGLONG)InterlockedCompareExchange64(
             &gBlackshardData.ContentRaceBlocks, 0, 0);
+    reply.PathResolutionFailures =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.PathResolutionFailures, 0, 0);
+    reply.ProtocolMismatches =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.ProtocolMismatches, 0, 0);
+    reply.CacheAllows = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.CacheAllows, 0, 0);
+    reply.BootPolicyAllows =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.BootPolicyAllows, 0, 0);
+    reply.RequiredEnforcementBlocks =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.RequiredEnforcementBlocks, 0, 0);
+    reply.QueueOverloads = (ULONGLONG)InterlockedCompareExchange64(
+        &gBlackshardData.QueueOverloads, 0, 0);
+    reply.ReadyGeneration =
+        (ULONGLONG)InterlockedCompareExchange64(
+            &gBlackshardData.ReadyGeneration, 0, 0);
+    reply.OperationalPhase = (ULONG)InterlockedCompareExchange(
+        &gBlackshardData.OperationalPhase, 0, 0);
 
     status = STATUS_SUCCESS;
     __try {
