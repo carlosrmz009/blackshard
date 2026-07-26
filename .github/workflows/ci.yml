@@ -14,20 +14,29 @@ permissions:
 jobs:
   rust:
     runs-on: windows-2022
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: i686-pc-windows-msvc
           components: rustfmt, clippy
+
       - run: cargo fmt --check
+
       - run: cargo check --workspace --all-targets
+
       - run: cargo test --workspace --all-targets
+
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
       - run: cargo build --workspace --release
+
       - name: Build minifilter and development distribution
         shell: pwsh
         run: .\deploy.ps1
+
       - name: Build one-click VM development installer
         shell: pwsh
         run: |
@@ -39,6 +48,7 @@ jobs:
             -AmsiX86Path .\dist\blackshard-amsi-x86.dll `
             -ClamRuntimePath .\dist\clamav-runtime.zip `
             -OutputDirectory .\dist
+
       - name: Verify development artifacts
         shell: pwsh
         run: |
@@ -51,11 +61,13 @@ jobs:
             "clamav-runtime.zip",
             "BlackshardVmSetup.exe"
           )
+
           foreach ($file in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path ".\dist" $file) -PathType Leaf)) {
               throw "Missing release artifact: $file"
             }
           }
+
       - name: Upload development test package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -63,39 +75,69 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
       - name: Parse PowerShell sources
         shell: pwsh
         run: |
           $failed = $false
+
           @(git ls-files "*.ps1") | ForEach-Object {
             $tokens = $null
             $errors = $null
-            [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $_).Path, [ref]$tokens, [ref]$errors)
+
+            [void][Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $_).Path,
+              [ref]$tokens,
+              [ref]$errors
+            )
+
             if ($errors.Count) {
               $failed = $true
-              $errors | ForEach-Object { Write-Error "$($_.Extent.File): $($_.Message)" }
+              $errors | ForEach-Object {
+                Write-Error "$($_.Extent.File): $($_.Message)"
+              }
             }
           }
-          if ($failed) { exit 1 }
+
+          if ($failed) {
+            exit 1
+          }
 
   dependency-audit:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
       - run: cargo install cargo-audit --locked
+
       - run: cargo audit
 
   fuzz-smoke:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 3 * * 6'
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
         with:
           toolchain: nightly
-      - run: cargo install cargo-fuzz --locked
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
       - name: Fuzz byte scanner
-        run: cargo +nightly fuzz run scan_bytes -- -runs=10000 -max_len=1048576
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          cargo +nightly fuzz run scan_bytes -- -runs=10000 -max_len=1048576
+
       - name: Fuzz VBA decompressor
-        run: cargo +nightly fuzz run vba_decompress -- -runs=10000 -max_len=1048576
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          cargo +nightly fuzz run vba_decompress -- -runs=10000 -max_len=1048576
