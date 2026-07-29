@@ -9,9 +9,6 @@ pub enum NotificationSeverity {
     Critical,
 }
 
-/// Delivers a native Windows toast. The production installer registers
-/// `APP_USER_MODEL_ID` through the Start-menu shortcut; a portable/development
-/// build may return an error because Windows has no registered toast identity.
 #[cfg(windows)]
 pub fn show_notification(
     title: &str,

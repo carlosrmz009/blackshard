@@ -1,13 +1,3 @@
-//! Low-resource, authenticated definition-update client.
-//!
-//! Network transport and update trust deliberately remain separate: WinHTTP
-//! supplies Windows' proxy and certificate validation, while [`crate::updater`]
-//! verifies the publisher's Ed25519 signature, product/channel scope, bounded
-//! issuance/expiry window, sequence, length, and digest before activating
-//! immutable definition bytes. Redirects are disabled and a signed payload URL
-//! must either share the manifest origin or match an explicitly configured
-//! HTTPS origin.
-
 use crate::definitions::{
     DefinitionPayload, DefinitionSource, DefinitionStore, MAX_DEFINITION_PAYLOAD_BYTES,
 };
@@ -43,8 +33,7 @@ pub struct HttpTimeouts {
     pub connect: Duration,
     pub send: Duration,
     pub receive: Duration,
-    /// Wall-clock bound checked between all synchronous WinHTTP operations.
-    /// One in-flight call can take up to its corresponding operation timeout.
+
     pub overall: Duration,
 }
 
@@ -60,15 +49,10 @@ impl Default for HttpTimeouts {
     }
 }
 
-/// Update configuration has no default URL. The release pipeline must provide
-/// an HTTPS endpoint and a separate, embedded publisher key to
-/// [`start_update_client`].
 #[derive(Debug, Clone)]
 pub struct UpdateClientConfig {
     pub manifest_url: String,
-    /// Additional exact HTTPS origins allowed for payloads, for example
-    /// `https://cdn.blackshard.dev`. Paths, queries, fragments, and credentials
-    /// are rejected. The manifest's own origin is always allowed.
+
     pub allowed_payload_origins: Vec<String>,
     pub maximum_envelope_bytes: usize,
     pub maximum_payload_bytes: u64,
@@ -92,8 +76,6 @@ impl UpdateClientConfig {
         }
     }
 
-    /// Builds and validates configuration from an endpoint embedded by the
-    /// release pipeline. There is intentionally no fallback endpoint.
     pub fn from_embedded_endpoint(manifest_url: &'static str) -> Result<Self, UpdateClientError> {
         let config = Self::new(manifest_url);
         config.validate()?;
@@ -331,9 +313,6 @@ impl Drop for UpdateClientHandle {
     }
 }
 
-/// Starts one background update worker and returns its control handle plus a
-/// bounded, best-effort event receiver. The trusted key is mandatory and must
-/// be embedded by the authenticated release pipeline; it is never downloaded.
 pub fn start_update_client(
     config: UpdateClientConfig,
     definitions: DefinitionStore,
@@ -845,9 +824,6 @@ fn perform_update(
         Err(error) => return Err(error.into()),
     };
 
-    // Compile and re-authenticate the activated snapshot before reporting it as
-    // healthy. DefinitionStore will fall back to LKG/built-ins if compilation
-    // fails, so callers never receive a false "installed" result.
     let loaded = definitions
         .load_with_defaults(Utc::now(), trusted_public_key)
         .map_err(|error| UpdateClientError::Definitions(error.to_string()))?;
@@ -1063,9 +1039,7 @@ mod windows_http {
         {
             return Err(last_http_error("timeout configuration"));
         }
-        // blackshard supports Windows 10 and later, where TLS 1.2 is always
-        // available. Do not inherit a machine policy which still permits SSL
-        // or TLS 1.0 for this security-sensitive channel.
+
         let mut secure_protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
         if unsafe {
             WinHttpSetOption(
@@ -1190,8 +1164,7 @@ mod windows_http {
         let mut buffer = [0_u8; HTTP_READ_CHUNK_BYTES];
         loop {
             check_deadline(started, config.timeouts.overall, stopping)?;
-            // Read one byte beyond the configured boundary so an oversized
-            // response is detected even when its valid prefix exactly fills it.
+
             let remaining_plus_one = maximum_bytes.saturating_sub(output.len()).saturating_add(1);
             let requested = buffer.len().min(remaining_plus_one).max(1);
             let mut received = 0_u32;

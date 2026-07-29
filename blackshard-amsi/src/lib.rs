@@ -109,12 +109,7 @@ impl IClassFactory_Impl for ProviderFactory {
 }
 
 #[no_mangle]
-/// Returns the COM class factory for the blackshard AMSI provider.
-///
-/// # Safety
-///
-/// COM must supply non-null `rclsid` and `riid` pointers to valid GUIDs and a
-/// writable `ppv` output pointer, as required by `DllGetClassObject`.
+
 pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
     riid: *const GUID,

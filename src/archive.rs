@@ -1,8 +1,3 @@
-//! Bounded inspection of ZIP and ZIP-based Office documents.
-//!
-//! Entries are never extracted to disk. A single budget is shared across all
-//! nested archives so recursion cannot multiply work or memory consumption.
-
 use crate::detection::{DetectionReport, DetectionVerdict};
 use crate::vba;
 use flate2::read::GzDecoder;

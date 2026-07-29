@@ -2,10 +2,6 @@ use crate::realtime;
 use std::fs;
 use uuid::Uuid;
 
-/// Project-specific inert content used for end-to-end enforcement tests.
-///
-/// This payload is intentionally not EICAR so another installed antivirus
-/// cannot consume the probe before blackshard observes it.
 pub const PAYLOAD: &[u8] =
     b"BLACKSHARD-HARMLESS-SELF-TEST-V2\nThis file contains no executable code.\n";
 
@@ -20,7 +16,6 @@ pub fn run_self_test() -> Result<String, String> {
     let result = std::env::current_exe()
         .map_err(|error| format!("could not locate the executable: {error}"))
         .and_then(|executable| {
-            // Note: We use the same argument defined in main.rs: "--blackshard-self-test-open"
             realtime::launch_hidden_probe(&executable, "--blackshard-self-test-open", &path)
                 .map_err(|error| format!("could not launch the isolated test probe: {error}"))
         });

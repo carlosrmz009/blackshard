@@ -1,5 +1,3 @@
-//! Parser surfaces shared with fuzzing and external evaluation harnesses.
-
 pub mod amsi;
 pub mod archive;
 pub mod atomic_file;

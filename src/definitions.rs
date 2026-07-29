@@ -1,16 +1,3 @@
-//! Authenticated malware-definition loading and fallback.
-//!
-//! Definition payloads are deliberately separate from update transport. The
-//! [`crate::updater`] module authenticates and atomically activates opaque
-//! payload bytes; this module re-authenticates those bytes on every process
-//! start, validates their semantic shape, and only then builds an enforcement
-//! engine. This second verification means a locally modified payload never
-//! becomes trusted merely because an activation pointer exists.
-//!
-//! The only public path which turns external definitions into a
-//! [`DetectionEngine`] is [`DefinitionStore::load`]. Parsing a
-//! [`DefinitionBundle`] alone does not grant it trusted/enforcement status.
-
 use crate::detection::{DetectionEngine, DetectionReport};
 use crate::engine::{ScanConfig, ScanEngine, SignatureDatabase};
 use crate::rules::{RuleBundle, RuleDisposition, RuleEngine, RulePolicy};
@@ -29,11 +16,8 @@ use std::path::{Path, PathBuf};
 pub const DEFINITION_SCHEMA_VERSION: u32 = 2;
 pub const COMPACT_DEFINITION_SCHEMA_VERSION: u32 = 3;
 
-/// A hard pre-parse bound. JSON has meaningful allocation amplification, so
-/// this intentionally remains much smaller than the updater's generic limit.
 pub const MAX_DEFINITION_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
-/// Compact payloads store SHA-256 digests as raw bytes, allowing millions of
-/// exact signatures without JSON allocation amplification.
+
 pub const MAX_DEFINITION_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_COMPACT_SHA256_SIGNATURES: usize = 8_000_000;
 pub const MAX_EXACT_SIGNATURES: usize = 100_000;
@@ -55,10 +39,6 @@ const COMPACT_PAYLOAD_MAGIC: &[u8; 16] = b"BLACKSHARD-CDB3\0";
 const COMPACT_PAYLOAD_PREFIX_BYTES: usize = 16 + 4 + 8;
 const TRUSTED_PUBLIC_KEY_HEX: Option<&str> = option_env!("BLACKSHARD_DEFINITION_PUBLIC_KEY_HEX");
 
-/// Returns the release publisher's compile-time Ed25519 verification key.
-/// Development builds intentionally have no fallback key: embedding a public
-/// key whose private half is available in source would let anyone publish
-/// enforcement rules to installed clients.
 pub fn configured_trusted_public_key() -> Result<Option<[u8; 32]>, String> {
     let Some(encoded) = TRUSTED_PUBLIC_KEY_HEX else {
         return Ok(None);
@@ -82,11 +62,6 @@ pub fn configured_trusted_public_key() -> Result<Option<[u8; 32]>, String> {
     Ok(Some(key))
 }
 
-/// Versioned, signed-payload format for blackshard malware definitions.
-///
-/// The signature and freshness metadata live in `SignedUpdateEnvelope`, not
-/// inside this object. All nested objects reject unknown fields so a publisher
-/// cannot accidentally emit data an older client silently ignores.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DefinitionBundle {
@@ -120,9 +95,7 @@ pub struct DefinitionRuleBundle {
 #[serde(deny_unknown_fields)]
 pub struct DefinitionRulePolicy {
     pub identifier: String,
-    /// Classification only. Even an authenticated `malicious` YARA policy is
-    /// alert/block-review data; automatic quarantine requires an independently
-    /// authenticated exact SHA-256 match.
+
     pub disposition: RuleDisposition,
     pub risk_score: u8,
     pub threat_name: String,
@@ -138,7 +111,7 @@ pub struct DefinitionSimilarityProfile {
     pub minimum_file_size: u64,
     pub maximum_file_size: u64,
     pub minimum_similarity_basis_points: u16,
-    /// Exactly 64 sorted, unique, lower-case 16-digit hexadecimal u64 values.
+
     pub sketch: Vec<String>,
 }
 
@@ -168,8 +141,6 @@ struct CompactHashHeader {
     family: Option<String>,
 }
 
-/// A validated definition payload. Schema-2 JSON remains supported while the
-/// schema-3 container adds one sorted, compact SHA-256 corpus.
 #[derive(Debug, Clone)]
 pub struct DefinitionPayload {
     pub bundle: DefinitionBundle,
@@ -354,9 +325,6 @@ impl DefinitionPayload {
 }
 
 impl DefinitionBundle {
-    /// Parses and semantically validates one bounded payload. This does not
-    /// authenticate the payload and therefore does not itself create an
-    /// enforcement engine.
     pub fn from_json(bytes: &[u8]) -> Result<Self, DefinitionError> {
         if bytes.len() > MAX_DEFINITION_BUNDLE_BYTES {
             return Err(DefinitionError::BundleTooLarge {
@@ -370,9 +338,6 @@ impl DefinitionBundle {
         Ok(bundle)
     }
 
-    /// Serializes publisher-side data only after applying the same validation
-    /// used by clients. The resulting bytes still require a signed updater
-    /// envelope before a client will enforce them.
     pub fn to_json(&self) -> Result<Vec<u8>, DefinitionError> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)
@@ -787,8 +752,6 @@ impl DefinitionSource {
         }
     }
 
-    /// Re-checks freshness for a long-lived service without trusting the state
-    /// observed at process startup.
     pub fn runtime_freshness(&self, now: DateTime<Utc>) -> DefinitionRuntimeFreshness {
         match self.expires_at() {
             None => DefinitionRuntimeFreshness::BuiltIn,
@@ -809,10 +772,6 @@ impl DefinitionSource {
     }
 }
 
-/// Advisory false-positive circuit breaker for authenticated external YARA
-/// rules. Automatic quarantine is independently restricted to exact hashes;
-/// callers can use this latched signal to stop enforcing or prominently flag
-/// an external ruleset whose match rate suddenly becomes implausibly broad.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefinitionMatchRateLimits {
     pub window_samples: usize,
@@ -920,8 +879,6 @@ impl DefinitionMatchRateCircuitBreaker {
         self.tripped
     }
 
-    /// A new authenticated definition sequence must start with an empty window;
-    /// a tripped ruleset never silently re-enables itself.
     pub fn reset_for_new_sequence(&mut self) {
         self.observations.clear();
         self.matches = 0;
@@ -929,8 +886,6 @@ impl DefinitionMatchRateCircuitBreaker {
     }
 }
 
-/// Successful loads always contain a usable engine. External failures are
-/// collected in `issues` while a last-known-good payload or built-ins are used.
 pub struct DefinitionLoadOutcome {
     pub engine: DetectionEngine,
     pub source: DefinitionSource,
@@ -959,9 +914,6 @@ impl DefinitionStore {
         Self { updates }
     }
 
-    /// Uses the installer-owned, service-writeable definitions directory. The
-    /// updater's immutable version folders and atomic current/previous pointers
-    /// live below this path.
     pub fn program_data() -> Result<Self, UpdateError> {
         Self::new(Self::program_data_path())
     }
@@ -974,16 +926,10 @@ impl DefinitionStore {
             .join("Definitions")
     }
 
-    /// Exposes the authenticated staging store to the service updater. Calling
-    /// `stage_and_activate` still requires a valid signed envelope and trusted
-    /// key; this method does not provide an alternate activation path.
     pub fn update_store(&self) -> &UpdateStore {
         &self.updates
     }
 
-    /// Loads one atomic snapshot in priority order: current, last-known-good,
-    /// built-ins. Version directories are immutable, so a concurrent pointer
-    /// swap cannot alter the candidate being compiled here.
     pub fn load(
         &self,
         now: DateTime<Utc>,
@@ -1139,8 +1085,6 @@ fn build_builtin_engine(scan_config: ScanConfig) -> Result<DetectionEngine, Defi
     Ok(DetectionEngine::new(static_engine, rules))
 }
 
-/// This function is deliberately private: only bytes re-authenticated by
-/// `load_active_candidate` may reach it.
 fn build_authenticated_engine(
     definitions: DefinitionPayload,
     scan_config: ScanConfig,
@@ -1151,8 +1095,7 @@ fn build_authenticated_engine(
         compact_threat_name,
         compact_family,
     } = definitions;
-    // Validate again so future internal callers cannot accidentally construct
-    // an unchecked bundle and bypass the public parser.
+
     bundle.validate()?;
 
     let similarity_profiles = bundle

@@ -179,11 +179,11 @@ foreach ($requiredClamFile in @("clamd.exe", "clamscan.exe", "freshclam.exe", "s
     }
 }
 
-# Keep the secure Program Files inheritance chain. In addition to SYSTEM,
-# administrators, and users, it carries the read/execute ACEs used by Windows
-# application-package and restricted-application-package brokers. Removing
-# those ACEs can make WinRT dependencies such as windows.storage.dll fail to
-# initialize with STATUS_ACCESS_DENIED (0xC0000022).
+
+
+
+
+
 & icacls.exe $agentDirectory "/inheritance:e" `
     "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `
     "/grant:r" "*S-1-5-32-544:(OI)(CI)(F)" `
@@ -231,24 +231,24 @@ if (Test-blackshardFilterLoaded) {
 & sc.exe stop $driverName 2>$null | Out-Host
 & sc.exe delete $driverName 2>$null | Out-Host
 
-# Wait for the SCM to fully remove the service. sc.exe delete only marks the
-# service for deletion; the actual registry key removal is deferred until all
-# handles are closed. If we create the new service too early, the deferred
-# cleanup can wipe out the Instances subkey we add for the minifilter, causing
-# fltmc load to fail with 0x800704db ("The specified service does not exist").
-$waitLimit = 20          # 20 × 500 ms = 10 seconds
+
+
+
+
+
+$waitLimit = 20
 for ($i = 0; $i -lt $waitLimit; $i++) {
     $query = & sc.exe query $driverName 2>&1
     if ($LASTEXITCODE -ne 0) {
-        # Service no longer exists in SCM — safe to proceed.
+
         break
     }
     Start-Sleep -Milliseconds 500
 }
 if (Test-Path -LiteralPath $serviceRegistryPath) {
-    # The registry key is still present even though SCM says the service is
-    # gone (handles from a filter-manager reference, etc.). Force-remove it
-    # so the subsequent sc.exe create starts from a clean slate.
+
+
+
     Remove-Item -LiteralPath $serviceRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
 }
@@ -267,11 +267,11 @@ if (-not (Test-Path -LiteralPath $serviceRegistryPath)) {
     New-Item -Path $serviceRegistryPath -Force | Out-Null
 }
 
-# Minifilter instance registration. Some Windows builds read the instances
-# from Services\<name>\Instances (the "legacy" layout) while others read from
-# Services\<name>\Parameters\Instances (the INF-standard layout populated by
-# DiInstallDriverW).  The production Rust installer covers both paths; this
-# development script must do the same.
+
+
+
+
+
 $instanceLayouts = @(
     (Join-Path $serviceRegistryPath "Instances"),
     (Join-Path $serviceRegistryPath "Parameters\Instances")
@@ -281,14 +281,14 @@ foreach ($instancesPath in $instanceLayouts) {
     New-Item -Path $instancesPath -Force | Out-Null
     New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
     New-Item -Path $instancePath -Force | Out-Null
-    # Development-only placeholder. A production package must use the unique
-    # altitude assigned to blackshard by Microsoft and install its signed INF/CAT
-    # through the Driver Store instead of this development script.
+
+
+
     New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
 }
 
-# Parameters-level driver settings (matching the INF's AddRegistry section).
+
 $parametersPath = Join-Path $serviceRegistryPath "Parameters"
 New-Item -Path $parametersPath -Force | Out-Null
 New-ItemProperty -Path $parametersPath -Name "DebugFlags" -Value 0 -PropertyType DWord -Force | Out-Null
@@ -296,8 +296,8 @@ New-ItemProperty -Path $parametersPath -Name "SupportedFeatures" -Value 3 -Prope
 
 Write-Host "[*] Loading blackshard minifilter..." -ForegroundColor Cyan
 
-# Capture a registry snapshot before the load attempt so failures are
-# diagnosable from the log alone.
+
+
 $registryDump = & reg.exe query "HKLM\System\CurrentControlSet\Services\$driverName" /s 2>&1
 $registryDump | Out-Host
 

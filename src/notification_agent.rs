@@ -1,5 +1,3 @@
-//! Per-user notification broker for service-generated security events.
-
 use crate::atomic_file;
 use crate::config::Settings;
 use crate::history::{EventHistory, EventKind};

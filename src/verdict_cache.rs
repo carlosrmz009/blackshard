@@ -42,8 +42,6 @@ pub struct CachedVerdict {
 }
 
 impl CachedVerdict {
-    /// Errors are never stable cache entries. A clean result is authoritative
-    /// only when every byte was analyzed and a complete-file hash exists.
     pub fn is_cacheable(&self) -> bool {
         if self.verdict == CacheVerdict::ScanError {
             return false;
@@ -89,14 +87,12 @@ impl VerdictCache {
                 && cached.rule_generation == current_definition_generation
                 && cached.model_generation == current_definition_generation
             {
-                // Update LRU position
                 if let Some(pos) = self.lru.iter().position(|k| k == key) {
                     let k = self.lru.remove(pos).unwrap();
                     self.lru.push_back(k);
                 }
                 return Some(cached.clone());
             } else {
-                // Invalidate
                 self.entries.remove(key);
                 if let Some(pos) = self.lru.iter().position(|k| k == key) {
                     self.lru.remove(pos);

@@ -11,10 +11,9 @@ pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 pub struct Settings {
     pub schema_version: u32,
     pub real_time_protection: bool,
-    /// Collect and correlate bounded modification telemetry for protected user data.
+
     pub ransomware_protection: bool,
-    /// Audit is the safe default until a machine's legitimate workload has
-    /// been observed. Block mode denies modifications after the behavior threshold.
+
     pub ransomware_block_mode: bool,
     pub automatic_quarantine: bool,
     pub notify_on_detection: bool,

@@ -82,7 +82,7 @@ pub fn run_worker_process() -> std::io::Result<()> {
                 write_message(&mut stdout_lock, &verdict)?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break; // Host closed connection
+                break;
             }
             Err(e) => {
                 return Err(e);

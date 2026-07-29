@@ -1,9 +1,3 @@
-//! Narrow UAC handoff for machine-wide antivirus administration.
-//!
-//! The desktop UI remains unelevated. Only a bounded, explicit control action
-//! is relaunched with the `runas` verb; the LocalSystem service still performs
-//! and authorizes the actual mutation through its named-pipe API.
-
 use crate::atomic_file;
 use crate::config::Settings;
 use crate::ipc::IpcClient;
@@ -70,7 +64,6 @@ pub fn request_clear_activity() -> Result<(), String> {
     .map_err(|error| format!("could not request administrator approval: {error}"))
 }
 
-/// Handles the narrow elevated helper mode and returns its process exit code.
 pub fn elevated_action_exit_code() -> Option<i32> {
     let mut arguments = std::env::args_os();
     arguments.next();

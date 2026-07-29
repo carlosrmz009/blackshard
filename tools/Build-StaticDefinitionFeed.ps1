@@ -89,8 +89,8 @@ try {
         $publishCandidate = $fullHistoryCandidate
     }
 
-    # Immutable payload names let a client that fetched the previous manifest
-    # complete its download while a new manifest is being published.
+
+
     $payloadUrl = $FeedBaseUrl.TrimEnd('/') + "/stable/rules-$Sequence.bundle"
     $publishArguments = @{
         BundlePath = $publishCandidate

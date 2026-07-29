@@ -1,12 +1,3 @@
-//! Authenticated, local-only control plane between the desktop UI and the
-//! LocalSystem protection service.
-//!
-//! Machine state is deliberately never made writable by ordinary desktop
-//! processes.  The service owns scanning, quarantine, history, settings, and
-//! update operations.  On Windows, the transport is a byte-mode named pipe
-//! with a protected DACL, remote clients rejected by the kernel, strict frame
-//! limits, finite read deadlines, and caller process/token validation.
-
 use crate::config::Settings;
 use crate::detection::DetectionVerdict;
 use crate::history::SecurityEvent;
@@ -669,8 +660,7 @@ mod windows_transport {
 
         fn shutdown(&mut self) {
             self.stop.store(true, Ordering::Release);
-            // Wake a listener blocked in ConnectNamedPipe. The request is not
-            // processed after the stop bit is observed.
+
             wake_listener(PIPE_NAME);
             wake_listener(AMSI_PIPE_NAME);
             for worker in self.workers.drain(..) {
@@ -741,8 +731,6 @@ mod windows_transport {
                 break;
             }
 
-            // Switching the connected server end to nonblocking mode keeps a
-            // client that stops reading from pinning the LocalSystem service.
             let nonblocking = PIPE_READMODE_BYTE | PIPE_NOWAIT;
             if unsafe { SetNamedPipeHandleState(pipe.raw(), &nonblocking, null(), null()) } == 0 {
                 append_rpc_error(
@@ -799,9 +787,6 @@ mod windows_transport {
                 }
             };
             if handled.is_ok() {
-                // Wait for the authenticated client to read the response and disconnect.
-                // This prevents the OS from discarding unread pipe data, without
-                // the infinite hang risk of FlushFileBuffers.
                 let mut dummy = [0u8; 1];
                 let _ = read_exact_until(pipe.raw(), &mut dummy, Instant::now() + IO_TIMEOUT);
             }
@@ -1815,13 +1800,11 @@ mod windows_transport {
                 }
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() != Some(231) {
-                    // ERROR_PIPE_BUSY
                     return Err(err);
                 }
             } else {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() != Some(2) {
-                    // ERROR_FILE_NOT_FOUND
                     return Err(err);
                 }
             }
@@ -1953,8 +1936,6 @@ mod windows_transport {
     impl Drop for ServiceScanJob {
         fn drop(&mut self) {
             self.stop_polling.store(true, Ordering::Release);
-            // The scan belongs to the service and intentionally continues if
-            // the UI exits. Cancellation is an explicit user action.
         }
     }
 

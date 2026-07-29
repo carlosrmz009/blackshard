@@ -1,7 +1,3 @@
-//! Low-overhead correlation of file-modification behavior by stable process
-//! identity. This layer consumes bounded minifilter telemetry; it never
-//! samples write buffers or uploads filenames.
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -139,9 +135,7 @@ impl RansomwareMonitor {
                 self.ancestry
                     .record_process_create(process_id, parent_id, image_path);
             }
-            EtwEvent::RegistryStartupChange { .. } => {
-                // Not actively used in prevention yet, but satisfies ETW tracking milestone requirements
-            }
+            EtwEvent::RegistryStartupChange { .. } => {}
         }
     }
 
@@ -213,7 +207,6 @@ impl RansomwareMonitor {
         if let Some(act) = action {
             activity.actions.entry(fingerprint).or_default().push(act);
 
-            // Check entropy-change and rename/write patterns
             let seq = activity.actions.get(&fingerprint).unwrap();
             let mut high_entropy_write = false;
             let mut has_rename = false;
@@ -229,7 +222,6 @@ impl RansomwareMonitor {
                 }
             }
             if high_entropy_write && has_rename {
-                // Ransomware pattern detected!
                 return BehaviorDecision {
                     protected_path: true,
                     distinct_files: 1,

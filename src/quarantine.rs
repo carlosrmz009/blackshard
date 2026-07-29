@@ -26,10 +26,8 @@ const MAX_QUARANTINE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IsolationState {
-    /// The source was removed after the neutralized container was committed.
     Isolated,
-    /// A protected copy exists, but Windows would not remove the source.
-    /// Callers must not report this state as successfully quarantined.
+
     SourceStillPresent,
 }
 
@@ -73,9 +71,6 @@ impl QuarantineStore {
         &self.root
     }
 
-    /// Copies a file into a neutralized stream-cipher container and only then
-    /// removes the source. The container cannot be executed as its original
-    /// file type, and the SHA-256 is checked again before any restore.
     #[cfg(test)]
     pub fn quarantine(
         &self,
@@ -96,9 +91,6 @@ impl QuarantineStore {
         )
     }
 
-    /// Quarantines only if the file still has the hash that was analyzed.
-    /// This closes the path-replacement race between a scan verdict and the
-    /// enforcement action. Hash-less/truncated reports should not call this.
     pub fn quarantine_verified(
         &self,
         source: &Path,
@@ -396,9 +388,6 @@ impl QuarantineStore {
         Ok(record)
     }
 
-    /// Restores to `destination`, or to the recorded path when it is `None`.
-    /// Existing files are never overwritten. The quarantine record is retained
-    /// unless `remove_after_restore` is explicitly requested.
     pub fn restore(
         &self,
         id: Uuid,
@@ -701,8 +690,6 @@ fn delete_open_file(file: &File, _original_path: &Path) -> io::Result<()> {
 
     #[repr(C)]
     struct FileDispositionInfo {
-        // FILE_DISPOSITION_INFO::DeleteFile is a Win32 BOOLEAN (one byte),
-        // not the four-byte BOOL used by most Win32 APIs.
         delete_file: u8,
     }
     #[link(name = "kernel32")]

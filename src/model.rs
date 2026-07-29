@@ -18,9 +18,7 @@ impl Default for HeuristicFeatures {
 }
 
 #[derive(Debug, Clone)]
-/// Versioned, deterministic static heuristic. This is deliberately not
-/// described as machine learning: it has no trained model artifact or measured
-/// calibration data.
+
 pub struct StaticHeuristic {
     pub version: u32,
 }
@@ -36,7 +34,6 @@ impl StaticHeuristic {
         Self { version }
     }
 
-    /// Evaluates the extracted features. Returns a float score.
     pub fn evaluate(&self, features: &HeuristicFeatures) -> f32 {
         let mut score = 0.0;
 

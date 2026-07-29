@@ -69,8 +69,8 @@ foreach ($entry in $labels.GetEnumerator()) {
     $scanFailed = $verdict -eq 'error' -or -not [string]::IsNullOrWhiteSpace([string]$result.error)
     if ($scanFailed) {
         $errors++
-        # If explicitly retained in a score, errors are assigned against the
-        # product: a missed malicious sample or a disrupted clean sample.
+
+
         if ($entry.Value -eq 'malicious') {
             $fn++; $strictFn++
         } else {

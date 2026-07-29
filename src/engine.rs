@@ -1,17 +1,3 @@
-//! Pure, side-effect-limited malware scanning primitives.
-//!
-//! This module deliberately separates *detection* from enforcement.  A scan
-//! produces structured evidence and an explicit verdict; the caller decides
-//! whether a suspicious file should be blocked, quarantined, or submitted for
-//! deeper analysis.
-//!
-//! The default scoring policy is intentionally conservative:
-//! - an exact, trusted malicious hash is `Malicious`;
-//! - independent heuristic signals totalling 55 points are `Suspicious`;
-//! - heuristics, including entropy, never produce `Malicious` on their own;
-//! - high entropy by itself contributes zero risk because compression,
-//!   encryption, media, and archives routinely have high entropy.
-
 use goblin::pe::PE;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -20,9 +6,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// SHA-256 of the canonical 68-byte EICAR antivirus test file.
 pub const EICAR_SHA256: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
-/// SHA-256 of blackshard's inert, project-specific end-to-end test payload.
+
 pub const BLACKSHARD_SELF_TEST_SHA256: &str =
     "e316cf90429b8ac181a7006de57c3f4af0c75642caf24589b86f63c8798294f8";
 
@@ -76,7 +61,7 @@ pub enum ContentType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisCompleteness {
     Complete,
-    /// Only the configured prefix was read. No complete-file digest exists.
+
     PrefixOnly,
     PrefixAndTargetedRegions,
     ResourceLimitReached,
@@ -94,10 +79,6 @@ pub enum EvidenceSeverity {
     Critical,
 }
 
-/// A human-readable reason for a scan decision.
-///
-/// `risk_points` is the contribution to the report's 0-100 risk score.  An
-/// informational observation may deliberately contribute zero points.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
     pub code: &'static str,
@@ -111,7 +92,7 @@ pub struct ScanReport {
     pub verdict: Verdict,
     pub content_type: ContentType,
     pub risk_score: u8,
-    /// Confidence in the *reported verdict*, not a probability of malware.
+
     pub confidence: u8,
     pub sha256: Option<String>,
     pub file_size: u64,
@@ -154,12 +135,10 @@ impl ScanReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanConfig {
-    /// Maximum bytes read from any one file. Files beyond the limit are
-    /// analyzed as a prefix and are never matched against whole-file hashes.
     pub max_read_bytes: usize,
-    /// Maximum decoded text inspected by script heuristics.
+
     pub max_script_sample_bytes: usize,
-    /// Minimum heuristic score that yields `Suspicious`. Must be 1..=100.
+
     pub suspicious_threshold: u8,
 }
 
@@ -206,11 +185,6 @@ pub struct ExactSignature {
     pub automatic_quarantine_eligible: bool,
 }
 
-/// Exact SHA-256 signatures trusted by the engine owner.
-///
-/// The built-in database contains only harmless test signatures.
-/// Production signatures should be supplied by a separately authenticated,
-/// rollback-protected update subsystem.
 #[derive(Debug, Clone)]
 pub struct SignatureDatabase {
     exact_sha256: BTreeMap<[u8; 32], ExactSignature>,
@@ -285,9 +259,6 @@ impl SignatureDatabase {
             .and(self.compact_signature.as_ref())
     }
 
-    /// Installs a sorted, duplicate-free compact corpus. A 16-bit prefix
-    /// directory limits a miss to a tiny bucket while storing only the raw
-    /// 32-byte digests plus 256 KiB of indexing overhead.
     pub fn replace_compact_sha256(
         &mut self,
         digests: Vec<[u8; 32]>,
@@ -361,8 +332,6 @@ impl ScanEngine {
         &self.signatures
     }
 
-    /// Scan a path while reading no more than `max_read_bytes + 1` bytes. The
-    /// extra byte is used only to determine whether the input was truncated.
     pub fn scan_path(&self, path: impl AsRef<Path>) -> ScanReport {
         let path = path.as_ref();
         let file = match File::open(path) {
@@ -379,7 +348,6 @@ impl ScanEngine {
         self.scan_reader(file, declared_size)
     }
 
-    /// Scan a reader with streaming analysis.
     pub fn scan_reader<R: Read>(&self, reader: R, declared_size: Option<u64>) -> ScanReport {
         let mut hasher = Sha256::new();
         let mut prefix = Vec::with_capacity(
@@ -451,17 +419,10 @@ impl ScanEngine {
         )
     }
 
-    /// Scan an in-memory candidate. Inputs above the configured read limit are
-    /// analyzed only up to that limit, just like files.
     pub fn scan_bytes(&self, bytes: &[u8]) -> ScanReport {
         self.scan_sample(bytes, bytes.len() as u64)
     }
 
-    /// Analyze an already-read sample while preserving the candidate's actual
-    /// size. This lets a composite engine read once and feed the same bounded
-    /// bytes to static analysis and other scanners. A sample is considered
-    /// complete only when `declared_size` does not exceed the supplied bytes;
-    /// exact whole-file hashes are intentionally skipped for truncated input.
     pub fn scan_sample(&self, bytes: &[u8], declared_size: u64) -> ScanReport {
         let sample = &bytes[..bytes.len().min(self.config.max_read_bytes)];
         let file_size = declared_size.max(bytes.len() as u64);
@@ -1728,9 +1689,6 @@ mod tests {
     }
 
     fn eicar_bytes() -> Vec<u8> {
-        // Keep the canonical test string split so source checkouts and test
-        // binaries are less likely to be mistaken for an EICAR test file by a
-        // host antivirus. The scanner itself stores only its SHA-256 digest.
         let mut bytes = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}".to_vec();
         bytes.extend_from_slice(b"$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*");
         bytes

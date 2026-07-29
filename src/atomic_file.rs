@@ -1,5 +1,3 @@
-//! Same-volume atomic file replacement helpers.
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -7,8 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Replaces `destination` with `source` and requests write-through semantics on
-/// Windows. Both paths must be on the same volume.
 #[cfg(windows)]
 pub fn replace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -58,7 +54,6 @@ pub fn replace(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
-/// Writes a complete file beside the destination and atomically publishes it.
 pub fn write(destination: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = destination
         .parent()

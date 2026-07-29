@@ -59,7 +59,7 @@ function Show-SetupMessage([string]$Message, [string]$Title, [bool]$ErrorMessage
         )
     }
     catch {
-        # The persistent log remains available if the graphical dialog cannot be created.
+
     }
 }
 
@@ -126,7 +126,7 @@ function Assert-SecureBootDisabled {
     }
     catch {
         if ($_.FullyQualifiedErrorId -match "(?i)(PlatformRequiresUEFI|CmdletizationQuery_NotSupported|NotSupported)") {
-            # Legacy BIOS guests do not expose Secure Boot.
+
             return
         }
         throw

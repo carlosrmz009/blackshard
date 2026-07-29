@@ -1,7 +1,3 @@
-//! Bounded locality-sensitive fingerprints for authenticated malware-family
-//! profiles. Similarity is an advisory signal only: it can find close variants
-//! cheaply, but never authorizes quarantine or execution blocking by itself.
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -91,8 +87,6 @@ impl SimilarityEngine {
     }
 }
 
-/// Computes a deterministic bottom-k sketch over overlapping 16-byte shingles.
-/// Work is linear in the sampled input and memory is fixed at 64 entries.
 pub fn compute_sketch(bytes: &[u8]) -> Option<[u64; SKETCH_SIZE]> {
     if bytes.len() < MIN_SKETCH_BYTES || bytes.len() < SHINGLE_BYTES {
         return None;

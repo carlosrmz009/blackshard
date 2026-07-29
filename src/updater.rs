@@ -1,11 +1,3 @@
-//! Authenticated, rollback-resistant update staging for blackshard rule bundles.
-//!
-//! This module deliberately does not perform network I/O. The caller is
-//! responsible for downloading the envelope and payload with a TLS-validating
-//! HTTPS client which also rejects redirects to non-HTTPS URLs. The updater
-//! authenticates the bytes, commits them to immutable versioned storage, and
-//! changes a small activation pointer atomically.
-
 use crate::atomic_file;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -23,13 +15,9 @@ use url::Url;
 pub const UPDATE_SCHEMA_VERSION: u32 = 2;
 pub const UPDATE_PRODUCT_ID: &str = "blackshard";
 pub const UPDATE_CHANNEL: &str = "stable";
-/// `u64::MAX` is intentionally reserved as an invalid/sentinel value so a
-/// malformed publisher manifest cannot permanently pin the monotonic counter
-/// at the type's terminal value.
+
 pub const MAX_UPDATE_SEQUENCE: u64 = u64::MAX - 1;
-/// Definitions are checked several times per day. A signed manifest may keep a
-/// snapshot usable during a short outage, but cannot suppress freshness checks
-/// indefinitely after a publisher-key or release-pipeline incident.
+
 pub const MAX_UPDATE_EXPIRY_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MAX_UPDATE_CLOCK_SKEW: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
@@ -38,9 +26,7 @@ pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 pub const UPDATE_CHECK_JITTER: Duration = Duration::from_secs(15 * 60);
 
 const SIGNING_DOMAIN: &[u8] = b"BLACKSHARD-UPDATE-MANIFEST-V2\0";
-// Local pointer format is independent from the remotely signed manifest
-// format. Keeping it stable lets a v2 client advance past a v1 installation
-// without ever trusting or loading a v1 manifest as definitions.
+
 const ACTIVATION_POINTER_SCHEMA_VERSION: u32 = 1;
 const PAYLOAD_FILE_NAME: &str = "rules.bundle";
 const ENVELOPE_FILE_NAME: &str = "envelope.json";
@@ -50,10 +36,6 @@ const COPY_BUFFER_BYTES: usize = 256 * 1024;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Metadata signed by the blackshard update publisher.
-///
-/// `payload_sha256` and the envelope signature are lower- or upper-case hex on
-/// input. Newly produced files should use lower-case hex for consistency.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateManifest {
@@ -70,8 +52,6 @@ pub struct UpdateManifest {
 }
 
 impl UpdateManifest {
-    /// Returns the exact, deterministic byte representation covered by the
-    /// Ed25519 signature. This avoids ambiguous JSON canonicalization rules.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, UpdateError> {
         let digest = decode_hex_exact::<32>(&self.payload_sha256)
             .map_err(|_| UpdateError::MalformedManifest("payload_sha256 must be 64 hex digits"))?;
@@ -101,9 +81,6 @@ impl UpdateManifest {
     }
 }
 
-/// JSON transport envelope. The public key is intentionally not stored here:
-/// callers must obtain a trusted public key from the installed application or
-/// another authenticated trust root.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignedUpdateEnvelope {
@@ -112,8 +89,6 @@ pub struct SignedUpdateEnvelope {
 }
 
 impl SignedUpdateEnvelope {
-    /// Parses a bounded JSON envelope. Bounding before parsing prevents a
-    /// malicious endpoint from turning metadata into an unbounded allocation.
     pub fn from_json(bytes: &[u8]) -> Result<Self, UpdateError> {
         if bytes.len() > MAX_ENVELOPE_BYTES {
             return Err(UpdateError::EnvelopeTooLarge {
@@ -290,9 +265,6 @@ pub struct VerifiedUpdate {
     pub payload_sha256: [u8; 32],
 }
 
-/// Verifies the signed manifest, including its product/channel scope and
-/// bounded freshness, before any payload is downloaded. Payload bytes still
-/// require [`verify_update`] before activation.
 pub fn verify_manifest(
     envelope: &SignedUpdateEnvelope,
     now: DateTime<Utc>,
@@ -353,9 +325,6 @@ pub fn verify_manifest(
     Ok(())
 }
 
-/// Authenticates an update entirely in memory. The caller-provided public key
-/// must come from a trusted installation channel; never accept a key delivered
-/// alongside the update itself.
 pub fn verify_update(
     envelope: &SignedUpdateEnvelope,
     payload: &[u8],
@@ -470,9 +439,6 @@ pub struct ActiveUpdate {
 }
 
 impl ActiveUpdate {
-    /// Runtime freshness check for long-lived services. Startup verification is
-    /// not sufficient because an otherwise-valid snapshot can expire while the
-    /// process remains alive.
     pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
         self.expires_at <= now
     }
@@ -522,17 +488,10 @@ impl UpdateStore {
         self.read_active_pointer(&self.state_dir().join(CURRENT_POINTER_FILE))
     }
 
-    /// Returns the update which was active immediately before `current`.
-    /// Payload versions are immutable, so this remains usable as a
-    /// last-known-good rollback target if the newly activated rules fail a
-    /// higher-level health check.
     pub fn last_known_good(&self) -> Result<Option<ActiveUpdate>, UpdateError> {
         self.read_active_pointer(&self.state_dir().join(PREVIOUS_POINTER_FILE))
     }
 
-    /// Verifies, stages, and activates one update while holding a cross-process
-    /// file lock. Immutable version contents are committed before the current
-    /// pointer changes. The previous pointer is saved before activation.
     pub fn stage_and_activate(
         &self,
         envelope: &SignedUpdateEnvelope,
@@ -550,8 +509,6 @@ impl UpdateStore {
             .open(lock_path)?;
         FileExt::lock_exclusive(&lock)?;
 
-        // Sequence is read only after taking the cross-process lock, closing a
-        // race where two otherwise-valid updates could activate out of order.
         let installed_sequence = self.installed_sequence()?;
         let verified = verify_update(
             envelope,
@@ -588,7 +545,6 @@ impl UpdateStore {
 
         let current_path = self.state_dir().join(CURRENT_POINTER_FILE);
         if let Some(current_bytes) = read_optional_bounded(&current_path, MAX_ENVELOPE_BYTES)? {
-            // Parsing first makes sure corrupt state is never promoted as LKG.
             parse_pointer(&current_bytes)?;
             atomic_write(
                 &self.state_dir().join(PREVIOUS_POINTER_FILE),
@@ -682,10 +638,6 @@ impl UpdateStore {
     }
 }
 
-/// Four-hour update cadence with symmetric, bounded jitter. `random_sample`
-/// should come from the caller's OS random source. The deterministic input
-/// keeps this helper testable and avoids coupling update scheduling to a
-/// particular runtime or network implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateScheduler {
     pub interval: Duration,

@@ -43,9 +43,6 @@ pub struct ActiveDatabase {
     pub unpacked_path: PathBuf,
 }
 
-/// Download, publisher-verify, unpack, and atomically activate the three
-/// official ClamAV databases. The supplied path is blackshard's protected
-/// ProgramData directory, not the global ProgramData root.
 pub fn download_databases(blackshard_data: &Path) -> Result<ActiveDatabase, DownloadError> {
     if let Ok(active) = active_database(blackshard_data) {
         if Utc::now()
@@ -164,8 +161,6 @@ fn validate_with_sigtool(sigtool: &Path, database: &Path) -> Result<String, Down
         )));
     }
 
-    // sigtool performs ClamAV's CVD payload digest and publisher-signature
-    // verification. A home-grown SHA-256 comparison is not equivalent.
     let output = Command::new(sigtool).arg("--info").arg(database).output()?;
     if !output.status.success() {
         return Err(DownloadError::Validation(format!(

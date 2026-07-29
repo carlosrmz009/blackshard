@@ -393,8 +393,6 @@ fn driver_change_exit_code(install: bool) -> i32 {
     }
 }
 
-// UI code removed
-
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 

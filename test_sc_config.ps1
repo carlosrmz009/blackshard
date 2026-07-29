@@ -5,4 +5,3 @@ $binPath = "`"$exePath`" --service"
 & sc.exe config $svcName binPath= $binPath | Out-Null
 $outPath = Join-Path $PSScriptRoot "temp_svc45.txt"
 & sc.exe qc $svcName | Out-File $outPath
-# Remove-Service $svcName

@@ -80,9 +80,6 @@ pub enum RuleDisposition {
     Malicious,
 }
 
-/// Origin of a rule match. Provenance is carried into the evidence resolver so
-/// an authenticated publisher bundle cannot silently acquire enforcement
-/// authority merely by labelling a rule "malicious".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleProvenance {
     EmbeddedTrustedTest,
@@ -135,9 +132,6 @@ impl RuleEngine {
         Self::compile(&[])
     }
 
-    /// Compiles built-ins plus already authenticated rule bundles. Signature,
-    /// expiry, and rollback verification belongs to the updater and must happen
-    /// before this method is called.
     pub fn compile(authenticated_bundles: &[RuleBundle]) -> Result<Self, String> {
         let mut compiler = Compiler::new();
         compiler.new_namespace("blackshard_builtin");

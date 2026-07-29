@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ParseRequest {
     ScanPath(String),
-    ScanHandle(u64), // casted from Windows HANDLE
+    ScanHandle(u64),
     HealthCheck,
 }
 

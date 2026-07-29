@@ -35,34 +35,22 @@ pub struct DetectionReport {
     pub analysis_completeness: crate::engine::AnalysisCompleteness,
     pub static_report: Option<ScanReport>,
     pub rule_matches: Vec<RuleMatch>,
-    /// Authenticated family-similarity results. These are advisory and require
-    /// corroboration; they never authorize blocking or quarantine alone.
+
     pub similarity_matches: Vec<SimilarityMatch>,
-    /// Bounded findings from ZIP/OOXML contents. Entries are scanned in memory
-    /// and are never extracted to the filesystem.
+
     pub container_inspection: Option<ContainerInspection>,
-    /// Result returned by the locally registered Windows AMSI provider. This is
-    /// kept separate from blackshard's signatures and heuristics so callers can
-    /// apply a non-destructive execution policy without authorizing quarantine.
+
     pub amsi_report: Option<AmsiScanReport>,
-    /// An AMSI initialization/provider failure is diagnostic only. The primary
-    /// engines continue to produce an independent verdict.
+
     pub amsi_error: Option<String>,
-    /// Full sidecar outcome. Clean, error, and intentionally not-scanned are
-    /// distinct and never inferred from the aggregate verdict.
+
     pub clamav_verdict: Option<ScanVerdict>,
     pub elapsed: Duration,
     pub from_cache: bool,
     pub error: Option<String>,
-    /// True only when a complete-file SHA-256 matched a trusted exact
-    /// signature. YARA/heuristic matches can still report malicious or
-    /// suspicious findings, but cannot trigger destructive automatic action.
+
     pub automatic_quarantine_eligible: bool,
-    /// True for a trusted labelled exact signature, a signed historical hash
-    /// reputation match, or a Windows AMSI provider/policy detection.
-    /// Publisher-defined YARA classifications remain alert-only until
-    /// independently corroborated. Unlike quarantine, an execution deny is
-    /// reversible and does not mutate the candidate.
+
     pub execution_block_eligible: bool,
 }
 
@@ -248,9 +236,6 @@ impl DetectionEngine {
         self.scan_open_file(&file)
     }
 
-    /// Scans the exact already-open file object, bypassing all verdict caches.
-    /// Real-time enforcement must use this entry point so a pathname swap cannot
-    /// substitute a different object between open and analysis.
     pub fn scan_open_file(&self, file: &File) -> DetectionReport {
         let started = Instant::now();
         let before = match file.metadata() {
@@ -491,8 +476,6 @@ impl DetectionEngine {
         self.with_container_inspection(bytes, report, started)
     }
 
-    /// Scans one already-expanded object without recursively opening it as a
-    /// container. The archive walker owns the single recursion/resource budget.
     pub(crate) fn scan_leaf_bytes(&self, bytes: &[u8]) -> DetectionReport {
         let started = Instant::now();
         let static_start = Instant::now();
@@ -678,11 +661,7 @@ impl DetectionEngine {
         }
     }
 
-    pub fn clear_cache(&self) {
-        // Intentionally a no-op. Metadata-only clean-result caching can be
-        // bypassed by restoring timestamps. A future cache must be keyed by a
-        // stable file ID plus a mutation journal/version, not a pathname.
-    }
+    pub fn clear_cache(&self) {}
 
     pub fn external_rules_tripped(&self) -> bool {
         let rules_tripped = self
@@ -788,8 +767,6 @@ pub(crate) fn open_candidate_file(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 
-/// Returns the stable 64-bit file index for an already-open Windows file.
-/// The index is unique within its volume for the lifetime of the file object.
 #[cfg(windows)]
 pub(crate) fn opened_file_id(file: &File) -> io::Result<u64> {
     Ok(opened_file_identity(file)?.file_id)
@@ -951,7 +928,7 @@ impl EvidenceCascade {
             risk_score = 99;
             confidence = 99;
             threat_name = Some("AMSI.Provider.MalwareDetected".to_owned());
-            block_eligible = true; // AMSI provider detection
+            block_eligible = true;
         } else if let Some(rule) = malicious_rule {
             verdict = DetectionVerdict::Malicious;
             risk_score = rule.risk_score.max(95);

@@ -1,29 +1,13 @@
-//! Local Authenticode verification for the installed blackshard executable.
-//!
-//! This module deliberately calls `WinVerifyTrust` directly. It never infers
-//! trust from a release build, a filename, or an installer marker, and it does
-//! not launch PowerShell or another helper process.
-//!
-//! Startup verification is cache-only and disables online revocation lookups.
-//! That keeps startup deterministic on slow or disconnected networks while
-//! still asking Windows' generic Authenticode policy to validate the signature,
-//! file digest, certificate chain, and local trust policy. It is therefore a
-//! local package-integrity check, not proof of fresh online revocation status.
-//! Full online revocation checking belongs in the installer/update path where a
-//! network delay can be surfaced to the user instead of stalling every launch.
-
 use std::path::Path;
 
-/// Result of asking the operating system to verify an Authenticode signature.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthenticodeStatus {
-    /// Windows accepted the file under the generic Authenticode policy.
     Trusted { publisher: String },
-    /// Windows found no Authenticode signature it knows how to verify.
+
     Unsigned,
-    /// A signature was present, but Windows rejected its integrity or trust.
+
     Untrusted(String),
-    /// Verification could not be completed (for example, the file disappeared).
+
     Error(String),
 }
 
@@ -33,11 +17,8 @@ impl AuthenticodeStatus {
     }
 }
 
-/// Compatibility-friendly short name for callers that do not need to mention
-/// the verification mechanism in their own type names.
 pub type TrustStatus = AuthenticodeStatus;
 
-/// Verify the executable backing the current process.
 pub fn verify_current_executable() -> AuthenticodeStatus {
     match std::env::current_exe() {
         Ok(path) => verify_file(&path),
@@ -47,11 +28,6 @@ pub fn verify_current_executable() -> AuthenticodeStatus {
     }
 }
 
-/// Verify one file using the platform's Authenticode trust implementation.
-///
-/// On Windows, the file is opened before verification and its handle is passed
-/// to the policy provider, which pins verification to that file object rather
-/// than trusting a path that could be replaced concurrently.
 pub fn verify_file(path: &Path) -> AuthenticodeStatus {
     platform::verify_file(path)
 }
@@ -76,9 +52,6 @@ mod platform {
     const WTD_CHOICE_FILE: Dword = 1;
     const WTD_STATEACTION_IGNORE: Dword = 0;
 
-    // Never let a package-trust indicator make application startup depend on
-    // AIA/CRL/OCSP network availability. The installer/updater performs the
-    // network-aware policy checks at the appropriate lifecycle boundary.
     const WTD_CACHE_ONLY_URL_RETRIEVAL: Dword = 0x0000_1000;
 
     #[repr(C)]
@@ -89,7 +62,6 @@ mod platform {
         data4: [u8; 8],
     }
 
-    // WINTRUST_ACTION_GENERIC_VERIFY_V2
     const GENERIC_AUTHENTICODE_POLICY: Guid = Guid {
         data1: 0x00aa_c56b,
         data2: 0xcd44,
@@ -105,9 +77,6 @@ mod platform {
         known_subject: *mut Guid,
     }
 
-    // The anonymous union following `dwUnionChoice` contains one pointer for
-    // every choice. Representing its active `pFile` member directly preserves
-    // the ABI on both 32-bit and 64-bit Windows.
     #[repr(C)]
     struct WintrustData {
         cb_struct: Dword,
@@ -175,10 +144,6 @@ mod platform {
             signature_settings: ptr::null_mut(),
         };
 
-        // SAFETY: Both C-compatible structures and the UTF-16 path remain alive
-        // for the duration of this synchronous call. `file` also keeps the raw
-        // handle valid. All unused optional fields are null, as required by the
-        // WinVerifyTrust contract.
         let status = unsafe {
             WinVerifyTrust(
                 ptr::null_mut(),
@@ -203,8 +168,6 @@ mod platform {
     }
 }
 
-// WinVerifyTrust returns zero on success and otherwise returns a trust-provider
-// status code directly (it is not a conventional `GetLastError` API).
 const ERROR_SUCCESS: i32 = 0;
 const TRUST_E_PROVIDER_UNKNOWN: i32 = 0x800b_0001_u32 as i32;
 const TRUST_E_SUBJECT_FORM_UNKNOWN: i32 = 0x800b_0003_u32 as i32;
@@ -224,9 +187,6 @@ const CRYPT_E_SECURITY_SETTINGS: i32 = 0x8009_2026_u32 as i32;
 fn map_winverifytrust_status(status: i32) -> AuthenticodeStatus {
     match status {
         ERROR_SUCCESS => AuthenticodeStatus::Trusted {
-            // Extracting a signer subject safely requires retaining provider
-            // state and walking Windows certificate-chain structures. Until
-            // that code is audited, do not guess an identity from file metadata.
             publisher: "Windows-verified Authenticode publisher".to_owned(),
         },
         TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN | TRUST_E_PROVIDER_UNKNOWN => {

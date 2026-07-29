@@ -24,13 +24,6 @@ updates:
         update-types:
           - minor
           - patch
-      rust-major:
-        applies-to: version-updates
-        patterns:
-          - "*"
-        update-types:
-          - major
-
   - package-ecosystem: github-actions
     directory: /
     schedule:

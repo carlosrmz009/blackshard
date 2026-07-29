@@ -1,7 +1,3 @@
-//! Bounded MS-OVBA compressed-container decoding.
-
-/// Decodes one MS-OVBA compressed container without allowing its output to
-/// exceed `maximum_output`.
 pub fn decompress(input: &[u8], maximum_output: usize) -> Result<Vec<u8>, &'static str> {
     if input.first() != Some(&1) {
         return Err("invalid container signature");

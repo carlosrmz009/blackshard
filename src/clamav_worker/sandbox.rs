@@ -26,8 +26,6 @@ impl Drop for SandboxedChild {
 }
 
 impl SandboxedChild {
-    /// Duplicate a service-owned file handle directly into the worker process.
-    /// The worker owns and closes the returned handle value.
     pub fn duplicate_handle_into_worker(&self, source: HANDLE) -> std::io::Result<u64> {
         let mut target = 0;
         let succeeded = unsafe {
@@ -72,11 +70,8 @@ pub fn spawn_sandboxed_worker() -> std::io::Result<SandboxedChild> {
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
 
-        // The protocol worker may launch exactly one official clamscan child.
         limit_info.BasicLimitInformation.ActiveProcessLimit = 2;
-        // Current ClamAV signature generations exceed 512 MiB when compiled.
-        // This is a per-process ceiling; the service worker remains tiny while
-        // the single resident clamd child may use up to 1536 MiB.
+
         limit_info.ProcessMemoryLimit = 1536usize * 1024 * 1024;
 
         let res = SetInformationJobObject(

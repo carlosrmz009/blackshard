@@ -70,8 +70,8 @@ pub fn spawn_sandboxed_worker() -> std::io::Result<SandboxedChild> {
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
 
-        limit_info.BasicLimitInformation.ActiveProcessLimit = 1; // no child processes
-        limit_info.ProcessMemoryLimit = 512 * 1024 * 1024; // 512 MB memory limit
+        limit_info.BasicLimitInformation.ActiveProcessLimit = 1;
+        limit_info.ProcessMemoryLimit = 512 * 1024 * 1024;
 
         let res = SetInformationJobObject(
             job_handle,

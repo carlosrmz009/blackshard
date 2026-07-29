@@ -168,8 +168,6 @@ impl ScanJob {
 impl Drop for ScanJob {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
-        // Do not block the UI during shutdown. The worker owns only Arcs and
-        // terminates as soon as the bounded path channel is drained/cancelled.
     }
 }
 

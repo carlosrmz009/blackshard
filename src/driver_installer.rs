@@ -1,10 +1,3 @@
-//! Privileged installer entry points for the signed minifilter package.
-//!
-//! These helpers are intentionally narrow. They accept only the blackshard INF
-//! and rely on Windows Driver Store/code-integrity policy to authenticate the
-//! catalog and driver. The production bootstrapper performs stricter signing
-//! validation before it invokes this mode.
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -134,9 +127,6 @@ fn read_inf_altitude(path: &Path) -> Result<String, String> {
     Ok(altitude)
 }
 
-/// Side-effect-free release-pipeline check. Unlike normal debug validation,
-/// this always requires a compile-time production altitude and binds it to the
-/// exact INF being packaged.
 pub fn validate_release_inf(path: &Path) -> Result<(), String> {
     let path = validate_inf_path(path)?;
     let declared = read_inf_altitude(&path)?;
@@ -345,7 +335,7 @@ pub fn install_driver(inf_path: &Path) -> Result<DriverChange, String> {
 
     if reboot == 0 {
         let load_result = unsafe { FilterLoad(filter_name().as_ptr()) };
-        // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)
+
         if load_result != 0 && load_result as u32 != 0x8007_00B7 {
             return Err(format!(
                 "the driver was installed but the minifilter could not be loaded (0x{:08X})",
@@ -380,7 +370,7 @@ pub fn uninstall_driver(inf_path: &Path) -> Result<DriverChange, String> {
     let inf_path = validate_installer_owned_inf(inf_path)?;
     let inf_path = wide(inf_path.as_os_str())?;
     let unload_result = unsafe { FilterUnload(filter_name().as_ptr()) };
-    // ERROR_FLT_FILTER_NOT_FOUND and HRESULT_FROM_WIN32(ERROR_SERVICE_DOES_NOT_EXIST)
+
     if unload_result != 0
         && unload_result as u32 != 0x801F_0013
         && unload_result as u32 != 0x8007_0424

@@ -1,7 +1,7 @@
 #include <fltKernel.h>
 #include <dontuse.h>
 
-#define BLACKSHARD_PROTOCOL_MAGIC 0x35485342UL /* "BSH5" */
+#define BLACKSHARD_PROTOCOL_MAGIC 0x35485342UL
 #define BLACKSHARD_PROTOCOL_VERSION 6
 #define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
 #define BLACKSHARD_STREAM_CONTEXT_TAG 'cShB'
@@ -48,11 +48,11 @@ typedef enum _BLACKSHARD_FAILURE_DECISION {
     BlackshardFailureAuditAllow
 } BLACKSHARD_FAILURE_DECISION;
 
-/*
- * Protocol V6 is intentionally fixed-width. User mode must validate Size,
- * Magic, and Version before using any field. FileId is the live file-system
- * identity returned by FileInternalInformation for the exact FILE_OBJECT.
- */
+
+
+
+
+
 typedef struct _BLACKSHARD_NOTIFICATION {
     ULONG Magic;
     USHORT Version;
@@ -485,11 +485,11 @@ BlackshardApplyFailurePolicy (
         return BlackshardFailureBlock;
     }
 
-    /*
-     * Before the service proves readiness, Windows must remain bootable.
-     * Every such bypass is explicit and counted. Milestone 3 narrows this
-     * branch to validated boot-critical and cached objects.
-     */
+
+
+
+
+
     InterlockedIncrement64(&gBlackshardData.BootPolicyAllows);
     return BlackshardFailureAllowBootPolicy;
 }
@@ -581,7 +581,7 @@ BlackshardPreCreate (
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    /* Create operations are already synchronized by Filter Manager. */
+
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
 
@@ -635,7 +635,7 @@ BlackshardPostCreate (
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
-    /* FltCancelFileOpen is legal only here, at PASSIVE_LEVEL, before a handle. */
+
     if (FlagOn(FltObjects->FileObject->Flags, FO_HANDLE_CREATED)) {
         InterlockedIncrement64(&gBlackshardData.EnforcementBypasses);
         return FLT_POSTOP_FINISHED_PROCESSING;
@@ -749,7 +749,7 @@ BlackshardPreWrite (
         FltReleaseContext(streamContext);
     }
 
-    /* Mark before dispatch: a failed write causes only a conservative rescan. */
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -914,7 +914,7 @@ BlackshardPreAcquireForSectionSynchronization (
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    /* FltQueryInformationFile, used below, is PASSIVE_LEVEL-only. */
+
     if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
         KeAreAllApcsDisabled() ||
         IoGetTopLevelIrp() != NULL) {
@@ -1049,7 +1049,7 @@ BlackshardEvaluateOpenedObject (
         }
     }
 
-    /* Resolve object identity only after the inexpensive name prefilter. */
+
     RtlZeroMemory(&standardInformation, sizeof(standardInformation));
     status = FltQueryInformationFile(
         FltObjects->Instance,
@@ -1088,7 +1088,7 @@ BlackshardEvaluateOpenedObject (
             );
     }
 
-    /* Generation zero is reserved as an invalid/uninitialized wire value. */
+
     contentGeneration = 1;
     status = BlackshardGetOrCreateStreamContext(
         FltObjects,
@@ -1169,7 +1169,7 @@ BlackshardEvaluateOpenedObject (
         &timeout
         );
 
-    /* STATUS_TIMEOUT is an NT success code, so test it explicitly. */
+
     if (status == STATUS_TIMEOUT) {
         return BlackshardFailureRequiresBlock(
             BlackshardFailureTimeout,
@@ -1200,11 +1200,11 @@ BlackshardEvaluateOpenedObject (
             );
     }
 
-    /*
-     * An executable image must not be authorized from bytes that changed
-     * while user mode was scanning them. A later execution attempt will be
-     * rescanned against the new generation.
-     */
+
+
+
+
+
     if (MustEnforce != 0) {
         status = FltGetStreamContext(
             FltObjects->Instance,

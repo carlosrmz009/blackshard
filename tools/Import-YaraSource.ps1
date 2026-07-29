@@ -79,8 +79,8 @@ $bundle.bundle_id = $BundleId
 $bundle.yara_bundles = @($bundle.yara_bundles) + @([ordered]@{
     namespace = $Namespace
     source = $sourceText
-    # Unmapped authenticated rules default to low-risk suspicious/advisory
-    # findings in the client and can never authorize quarantine.
+
+
     policies = @()
 })
 $sourceDigest = [Security.Cryptography.SHA256]::Create()

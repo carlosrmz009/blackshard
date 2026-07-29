@@ -1,18 +1,5 @@
-//! Bounded access to the Windows Antimalware Scan Interface (AMSI).
-//!
-//! AMSI is a secondary signal supplied by an antimalware provider already
-//! installed on the machine. It is deliberately not treated as a file
-//! signature source: a provider detection can stop execution, but it must not
-//! by itself authorize destructive actions such as automatic quarantine.
-
 use std::fmt;
 
-/// Maximum number of bytes submitted to an AMSI provider for one scan.
-///
-/// The primary blackshard engines retain their own independent limits. This
-/// lower ceiling prevents a synchronous third-party provider from receiving an
-/// unexpectedly large allocation or doing unbounded work on blackshard's
-/// real-time path.
 pub const MAX_AMSI_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_APPLICATION_NAME_UTF16_UNITS: usize = 128;
 const MAX_CONTENT_NAME_UTF16_UNITS: usize = 1024;
@@ -119,8 +106,6 @@ impl fmt::Display for AmsiError {
 
 impl std::error::Error for AmsiError {}
 
-/// A process-local AMSI context. Initialization and teardown are RAII-managed;
-/// each call opens its own correlation session and closes it before returning.
 pub struct AmsiScanner {
     inner: platform::Scanner,
 }

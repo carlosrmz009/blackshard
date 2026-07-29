@@ -97,9 +97,6 @@ impl EventHistory {
             .open(&self.path)?;
         output.write_all(&bytes)?;
 
-        // Detection and quarantine events are security-relevant and should
-        // survive a sudden restart. Routine scan progress is left buffered by
-        // Windows to avoid unnecessary disk flushes.
         if matches!(
             event.kind,
             EventKind::Detection | EventKind::Quarantined | EventKind::QuarantineFailed

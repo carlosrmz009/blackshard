@@ -68,7 +68,7 @@
           Start="auto"
           ErrorControl="normal"
           Vital="yes">
-        <!-- Avoid the broken MSI 5 service-configuration tables. -->
+
         <util:ServiceConfig
             FirstFailureActionType="restart"
             SecondFailureActionType="restart"
@@ -174,12 +174,7 @@
     </Component>
 
     <Component Id="RuntimeDataDirectoriesComponent" Directory="BLACKSHARDDATAFOLDER" Guid="*">
-      <!--
-        The root permits authenticated users to read settings.json,
-        service-health.json, and history.jsonl but not create, replace, or
-        delete them. Sensitive children use protected DACLs so this read ACE
-        cannot leak into quarantine, updater staging, or private state.
-      -->
+
       <CreateFolder>
         <PermissionEx
             Id="BlackshardDataRootAcl"
@@ -231,7 +226,7 @@
           Description="Open the blackshard Windows client"
           Target="[#BlackshardUiExecutable]"
           WorkingDirectory="INSTALLFOLDER">
-        <!-- Must match notifications::APP_USER_MODEL_ID exactly. -->
+
         <ShortcutProperty
             Key="System.AppUserModel.ID"
             Value="blackshard.security.client" />
@@ -246,11 +241,7 @@
           KeyPath="yes" />
     </Component>
 
-    <!--
-      Services cannot display desktop notifications from session 0. Start one
-      hidden, single-instance broker in each interactive user's session and
-      let MSI ownership remove the registration during upgrade/uninstall.
-    -->
+
     <Component Id="NotificationAgentAutostartComponent" Directory="INSTALLFOLDER" Guid="*">
       <RegistryValue
           Root="HKLM"
@@ -275,18 +266,7 @@
       <ComponentRef Id="NotificationAgentAutostartComponent" />
     </Feature>
 
-    <!--
-      The same signed binary supplies narrow, non-interactive driver lifecycle
-      modes. Arguments are resolved exclusively from MSI-owned File rows; no
-      user-controlled command line is accepted. These type-18 actions must
-      remain after InstallFiles and before RemoveFiles respectively.
 
-      Helper contract: the executable accepts the install-driver or
-      uninstall-driver switch followed by the absolute INF path.
-
-      Return 0 only after the requested operation is complete. Every nonzero
-      exit is fatal because Return="check" is intentional.
-    -->
     <CustomAction
         Id="RollbackBlackshardDriverInstall"
         FileRef="BlackshardServiceExecutable"
@@ -321,7 +301,7 @@
         HideTarget="yes" />
 
     <InstallExecuteSequence>
-      <!-- Stop the user-mode service before attempting to unload its filter. -->
+
       <Custom
           Action="RollbackBlackshardDriverUninstall"
           After="StopServices"
@@ -331,7 +311,7 @@
           After="RollbackBlackshardDriverUninstall"
           Condition="$DriverInfComponent = 2" />
 
-      <!-- Install the filter before InstallServices/StartServices run. -->
+
       <Custom
           Action="RollbackBlackshardDriverInstall"
           After="InstallFiles"

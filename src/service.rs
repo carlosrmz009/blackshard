@@ -1,10 +1,3 @@
-//! Windows Service Control Manager host for blackshard's real-time engine.
-//!
-//! The service and GUI intentionally do not communicate over a network socket.
-//! The service publishes a small, read-only health snapshot beneath ProgramData;
-//! security events and quarantine metadata continue to use their dedicated
-//! stores.
-
 use crate::atomic_file;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,8 +6,6 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// User-mode protection service. This must remain distinct from the
-/// `blackshard` FILE_SYSTEM_DRIVER service installed by the minifilter INF.
 pub const SERVICE_NAME: &str = "blackshard-protection-service";
 pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 4;
 pub const SERVICE_HEALTH_FILE_NAME: &str = "service-health.json";
@@ -148,8 +139,6 @@ impl ServiceHealthSnapshot {
     }
 }
 
-/// Builds the health-file path without consulting process-global environment
-/// state, which keeps callers and tests deterministic.
 pub fn service_health_path_from_program_data(program_data: &Path) -> PathBuf {
     program_data
         .join("blackshard")
@@ -200,9 +189,6 @@ pub fn read_service_health(path: &Path) -> io::Result<ServiceHealthSnapshot> {
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
-/// Commits a complete JSON document with a same-volume atomic replacement.
-/// Readers therefore see either the previous snapshot or the new one, never a
-/// partially-written document.
 pub fn write_service_health_atomic(
     path: &Path,
     snapshot: &ServiceHealthSnapshot,
@@ -280,20 +266,14 @@ mod windows_service_host {
 
     define_windows_service!(blackshard_service_main, service_main);
 
-    /// Enters the Windows Service Control Manager dispatcher. The executable's
-    /// `--service` mode should call this on its initial thread.
     pub fn run_service_dispatcher() -> windows_service::Result<()> {
         service_dispatcher::start(SERVICE_NAME, blackshard_service_main)
     }
 
-    /// Runs the same service body without the SCM wrapper. This is useful for a
-    /// console harness: set `stop_requested` to true to request a clean stop.
     pub fn run_service_console(stop_requested: Arc<AtomicBool>) -> Result<(), String> {
         run_service_body(stop_requested)
     }
 
-    /// Starts and owns the detector, quarantine store, event history, and
-    /// minifilter connection until `stop_requested` becomes true.
     pub fn run_service_body(stop_requested: Arc<AtomicBool>) -> Result<(), String> {
         run_service_body_with_reporter(stop_requested, |_| Ok(()))
     }

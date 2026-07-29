@@ -230,7 +230,7 @@ pub struct RealtimeDecision {
     pub process_id: u32,
     pub path: PathBuf,
     pub report: DetectionReport,
-    /// True only when Filter Manager accepted the block reply before timeout.
+
     pub block_reply_accepted: bool,
     pub quarantine: Option<QuarantineRecord>,
     pub action_error: Option<String>,
@@ -258,9 +258,6 @@ pub struct RealtimeCounters {
     pub clamav_not_scanned: u64,
 }
 
-/// Atomically replaceable detector used by the service. Scan workers clone the
-/// current immutable engine for each item, so a signed definition activation
-/// never invalidates an in-flight decision.
 pub type SharedDetectionEngine = Arc<RwLock<Arc<DetectionEngine>>>;
 
 pub fn new_shared_detection_engine(engine: DetectionEngine) -> SharedDetectionEngine {
@@ -409,8 +406,6 @@ impl RealtimeProtection {
         })
     }
 
-    /// Arms fail-closed executable-map enforcement for one fully validated
-    /// service generation. Callers must derive readiness before invoking this.
     pub fn set_ready_generation(&self, generation: u64) -> Result<(), String> {
         if generation == 0 {
             return Err("driver readiness generation zero is reserved".to_owned());
@@ -925,9 +920,7 @@ fn cached_process_trust(
         if let Some(trust) = cache.get(&key) {
             return *trust;
         }
-        // Do not let a process-churn workload turn this bounded cache into an
-        // unbounded stream of comparatively expensive Authenticode checks.
-        // Unknown uses the conservative middle threshold.
+
         if cache.len() >= 256 {
             return ProcessTrust::Unknown;
         }

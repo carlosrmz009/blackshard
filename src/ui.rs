@@ -1,9 +1,3 @@
-//! blackshard's desktop shell.
-//!
-//! The UI deliberately treats runtime health as input from the protection
-//! service.  A running window is not evidence that the minifilter, scanner,
-//! update trust chain, or independent certification are healthy.
-
 use crate::config::Settings;
 use crate::elevation::{self, QuarantineAdminAction};
 use crate::history::{EventKind, SecurityEvent};
@@ -38,9 +32,6 @@ const ACTIVITY_LIMIT: usize = 500;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(650);
 
-/// The actual state of the real-time protection engine, as reported by the
-/// background runtime. `Configured` is intentionally not represented here:
-/// enabling a setting is not the same as successfully starting protection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtectionStatus {
     Starting,
@@ -50,7 +41,6 @@ pub enum ProtectionStatus {
     Unavailable(String),
 }
 
-/// State of the kernel minifilter communication channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverStatus {
     Checking,
@@ -60,8 +50,6 @@ pub enum DriverStatus {
     Error(String),
 }
 
-/// Authenticode establishes package identity and integrity. It does not, by
-/// itself, mean the antivirus has passed independent efficacy certification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildTrustStatus {
     Checking,
@@ -96,10 +84,6 @@ pub enum DefinitionStatus {
     Failed(String),
 }
 
-/// Handshake for the harmless end-to-end protection test. The UI sets
-/// `Requested`; the runtime atomically consumes it with
-/// [`take_protection_test_request`] and publishes the final result with
-/// [`complete_protection_test`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtectionTestStatus {
     Idle,
@@ -109,9 +93,6 @@ pub enum ProtectionTestStatus {
     Failed(String),
 }
 
-/// Mutable state shared by the protection runtime and the UI. The runtime
-/// should only set `Active`/`Connected` after the corresponding subsystem has
-/// completed its own health check.
 #[derive(Debug, Clone)]
 pub struct UiRuntimeState {
     pub protection: ProtectionStatus,
@@ -165,7 +146,6 @@ pub fn new_shared_ui_state() -> SharedUiState {
     Arc::new(Mutex::new(UiRuntimeState::default()))
 }
 
-/// Returns true exactly once for each request and moves it to `Running`.
 pub fn take_protection_test_request(state: &SharedUiState) -> bool {
     let Ok(mut state) = state.lock() else {
         return false;
@@ -241,8 +221,6 @@ struct QuarantineOutcome {
     result: Result<String, String>,
 }
 
-/// Fully stateful eframe application. Construct it after the detection engine
-/// and stores are initialized, then pass it to `eframe::run_native`.
 pub struct BlackshardApp {
     runtime: SharedUiState,
     client: IpcClient,
@@ -316,8 +294,6 @@ impl BlackshardApp {
         Self::new(runtime, IpcClient)
     }
 
-    /// Lets an installer, command-line argument, or future native folder picker
-    /// populate the custom target without adding a dialog dependency.
     pub fn set_custom_scan_path(&mut self, path: impl AsRef<Path>) {
         self.custom_scan_path = path.as_ref().display().to_string();
         self.page = Page::Scan;
