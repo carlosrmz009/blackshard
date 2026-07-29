@@ -9,7 +9,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $driverName = "blackshard"
-$protectionServiceName = "BlackshardProtectionService"
+$protectionServiceName = "blackshard-protection-service"
+$legacyProtectionServiceName = "blackshardprotectionservice"
 $sourceDriver = Join-Path $PSScriptRoot "blackshard.sys"
 $sourceService = Join-Path $PSScriptRoot "blackshard-service.exe"
 $sourceUi = Join-Path $PSScriptRoot "blackshard-ui.exe"
@@ -17,16 +18,16 @@ $sourceAmsiX64 = Join-Path $PSScriptRoot "blackshard-amsi-x64.dll"
 $sourceAmsiX86 = Join-Path $PSScriptRoot "blackshard-amsi-x86.dll"
 $sourceClamRuntime = Join-Path $PSScriptRoot "clamav-runtime.zip"
 $destinationDriver = Join-Path $env:SystemRoot "System32\drivers\blackshard.sys"
-$agentDirectory = Join-Path $env:ProgramFiles "Blackshard"
+$agentDirectory = Join-Path $env:ProgramFiles "blackshard"
 $destinationService = Join-Path $agentDirectory "blackshard-service.exe"
 $destinationUi = Join-Path $agentDirectory "blackshard-ui.exe"
 $destinationAmsiX64 = Join-Path $agentDirectory "blackshard-amsi-x64.dll"
 $destinationAmsiX86 = Join-Path $agentDirectory "blackshard-amsi-x86.dll"
-$dataDirectory = Join-Path $env:ProgramData "Blackshard"
+$dataDirectory = Join-Path $env:ProgramData "blackshard"
 $amsiClsid = "{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
 $serviceRegistryPath = "HKLM:\System\CurrentControlSet\Services\$driverName"
 
-function Test-BlackshardFilterLoaded {
+function Test-blackshardFilterLoaded {
     $filterOutput = & fltmc.exe filters 2>$null
     return ($filterOutput -match "(?im)^blackshard\s")
 }
@@ -64,18 +65,20 @@ function Get-DriverLoadDiagnostics {
     return $lines -join "`n"
 }
 
-function Remove-BlackshardInstallation {
-    Write-Host "[*] Stopping Blackshard protection service..." -ForegroundColor Cyan
-    & sc.exe stop $protectionServiceName 2>$null | Out-Host
-    & sc.exe delete $protectionServiceName 2>$null | Out-Host
+function Remove-blackshardInstallation {
+    Write-Host "[*] Stopping blackshard protection service..." -ForegroundColor Cyan
+    foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)) {
+        & sc.exe stop $serviceName 2>$null | Out-Host
+        & sc.exe delete $serviceName 2>$null | Out-Host
+    }
 
     foreach ($registryView in @("32", "64")) {
         & reg.exe delete "HKLM\Software\Microsoft\AMSI\Providers\$amsiClsid" /f "/reg:$registryView" 2>$null | Out-Null
         & reg.exe delete "HKLM\Software\Classes\CLSID\$amsiClsid" /f "/reg:$registryView" 2>$null | Out-Null
     }
 
-    if (Test-BlackshardFilterLoaded) {
-        Write-Host "[*] Unloading Blackshard minifilter..." -ForegroundColor Cyan
+    if (Test-blackshardFilterLoaded) {
+        Write-Host "[*] Unloading blackshard minifilter..." -ForegroundColor Cyan
         & fltmc.exe unload $driverName | Out-Host
     }
 
@@ -107,11 +110,11 @@ function Remove-BlackshardInstallation {
         }
     }
 
-    Write-Host "[+] Blackshard was removed." -ForegroundColor Green
+    Write-Host "[+] blackshard was removed." -ForegroundColor Green
 }
 
 if ($Uninstall) {
-    Remove-BlackshardInstallation
+    Remove-blackshardInstallation
     exit 0
 }
 
@@ -155,8 +158,10 @@ foreach ($sourceExecutable in @($sourceService, $sourceUi)) {
     }
 }
 
-& sc.exe stop $protectionServiceName 2>$null | Out-Host
-& sc.exe delete $protectionServiceName 2>$null | Out-Host
+foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)) {
+    & sc.exe stop $serviceName 2>$null | Out-Host
+    & sc.exe delete $serviceName 2>$null | Out-Host
+}
 Start-Sleep -Seconds 1
 New-Item -ItemType Directory -Path $agentDirectory -Force | Out-Null
 Copy-Item -LiteralPath $sourceService -Destination $destinationService -Force
@@ -174,10 +179,17 @@ foreach ($requiredClamFile in @("clamd.exe", "clamscan.exe", "freshclam.exe", "s
     }
 }
 
-& icacls.exe $agentDirectory "/inheritance:r" `
+# Keep the secure Program Files inheritance chain. In addition to SYSTEM,
+# administrators, and users, it carries the read/execute ACEs used by Windows
+# application-package and restricted-application-package brokers. Removing
+# those ACEs can make WinRT dependencies such as windows.storage.dll fail to
+# initialize with STATUS_ACCESS_DENIED (0xC0000022).
+& icacls.exe $agentDirectory "/inheritance:e" `
     "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `
     "/grant:r" "*S-1-5-32-544:(OI)(CI)(F)" `
-    "/grant:r" "*S-1-5-32-545:(OI)(CI)(RX)" | Out-Host
+    "/grant:r" "*S-1-5-32-545:(OI)(CI)(RX)" `
+    "/grant:r" "*S-1-15-2-1:(OI)(CI)(RX)" `
+    "/grant:r" "*S-1-15-2-2:(OI)(CI)(RX)" | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "Could not apply the protected Program Files ACL."
 }
@@ -209,11 +221,11 @@ foreach ($provider in @(
     if ($LASTEXITCODE -ne 0) { throw "Could not register the $($provider.View)-bit AMSI COM server." }
     & reg.exe add "HKLM\Software\Classes\CLSID\$amsiClsid\InprocServer32" /v ThreadingModel /t REG_SZ /d Both /f "/reg:$($provider.View)" | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Could not configure the $($provider.View)-bit AMSI COM server." }
-    & reg.exe add "HKLM\Software\Microsoft\AMSI\Providers\$amsiClsid" /ve /t REG_SZ /d "Blackshard AMSI Provider" /f "/reg:$($provider.View)" | Out-Host
+    & reg.exe add "HKLM\Software\Microsoft\AMSI\Providers\$amsiClsid" /ve /t REG_SZ /d "blackshard AMSI provider" /f "/reg:$($provider.View)" | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Could not register the $($provider.View)-bit AMSI provider." }
 }
 
-if (Test-BlackshardFilterLoaded) {
+if (Test-blackshardFilterLoaded) {
     & fltmc.exe unload $driverName | Out-Host
 }
 & sc.exe stop $driverName 2>$null | Out-Host
@@ -248,7 +260,7 @@ $createOutput = & cmd.exe /c $createCmd 2>&1
 $createExitCode = $LASTEXITCODE
 $createOutput | Out-Host
 if ($createExitCode -ne 0) {
-    throw "Could not create the Blackshard driver service (sc.exe exit code $createExitCode)."
+    throw "Could not create the blackshard driver service (sc.exe exit code $createExitCode)."
 }
 
 if (-not (Test-Path -LiteralPath $serviceRegistryPath)) {
@@ -270,7 +282,7 @@ foreach ($instancesPath in $instanceLayouts) {
     New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
     New-Item -Path $instancePath -Force | Out-Null
     # Development-only placeholder. A production package must use the unique
-    # altitude assigned to Blackshard by Microsoft and install its signed INF/CAT
+    # altitude assigned to blackshard by Microsoft and install its signed INF/CAT
     # through the Driver Store instead of this development script.
     New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
@@ -282,7 +294,7 @@ New-Item -Path $parametersPath -Force | Out-Null
 New-ItemProperty -Path $parametersPath -Name "DebugFlags" -Value 0 -PropertyType DWord -Force | Out-Null
 New-ItemProperty -Path $parametersPath -Name "SupportedFeatures" -Value 3 -PropertyType DWord -Force | Out-Null
 
-Write-Host "[*] Loading Blackshard minifilter..." -ForegroundColor Cyan
+Write-Host "[*] Loading blackshard minifilter..." -ForegroundColor Cyan
 
 # Capture a registry snapshot before the load attempt so failures are
 # diagnosable from the log alone.
@@ -305,16 +317,16 @@ $regDump
 "@
 }
 
-if (-not (Test-BlackshardFilterLoaded)) {
-    throw "fltmc reported success, but Blackshard is absent from the loaded filter list."
+if (-not (Test-blackshardFilterLoaded)) {
+    throw "fltmc reported success, but blackshard is absent from the loaded filter list."
 }
 
-Write-Host "[*] Installing Blackshard protection service..." -ForegroundColor Cyan
+Write-Host "[*] Installing blackshard protection service..." -ForegroundColor Cyan
 $null = New-Service `
     -Name $protectionServiceName `
     -BinaryPathName $destinationService `
     -StartupType Automatic `
-    -Description "Blackshard real-time protection and quarantine service"
+    -Description "blackshard real-time protection and quarantine service"
 
 $serviceCommand = "`"$destinationService`" --service"
 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$protectionServiceName" -Name ImagePath -Value $serviceCommand -Type ExpandString
@@ -332,8 +344,8 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
     Start-Sleep -Milliseconds 250
 }
 if (-not $serviceRunning) {
-    throw "The Blackshard protection service did not reach RUNNING state."
+    throw "The blackshard protection service did not reach RUNNING state."
 }
 
-Write-Host "[+] Blackshard minifilter and protection service are running." -ForegroundColor Green
+Write-Host "[+] blackshard minifilter and protection service are running." -ForegroundColor Green
 & fltmc.exe instances -f $driverName | Out-Host

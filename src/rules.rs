@@ -5,21 +5,21 @@ use std::time::Duration;
 use yara_x::{Compiler, Rules, Scanner};
 
 const BUILTIN_RULES: &str = r#"
-rule Blackshard_EICAR_Test_File {
+rule blackshard_eicar_test_file {
     strings:
         $eicar = { 58 35 4F 21 50 25 40 41 50 5B 34 5C 50 5A 58 35 34 28 50 5E 29 37 43 43 29 37 7D 24 45 49 43 41 52 2D 53 54 41 4E 44 41 52 44 2D 41 4E 54 49 56 49 52 55 53 2D 54 45 53 54 2D 46 49 4C 45 21 24 48 2B 48 2A }
     condition:
         filesize == 68 and $eicar at 0
 }
 
-rule Blackshard_Harmless_Self_Test {
+rule blackshard_harmless_self_test {
     strings:
         $v2 = "BLACKSHARD-HARMLESS-SELF-TEST-V2" ascii
     condition:
         $v2 at 0
 }
 
-rule Blackshard_PowerShell_Obfuscated_Download_Execute {
+rule blackshard_powershell_obfuscated_download_execute {
     strings:
         $ps1 = "powershell" ascii wide nocase
         $ps2 = "pwsh" ascii wide nocase
@@ -34,7 +34,7 @@ rule Blackshard_PowerShell_Obfuscated_Download_Execute {
         1 of ($ps*) and 1 of ($encode*) and 1 of ($download*) and 1 of ($execute*)
 }
 
-rule Blackshard_PowerShell_AMSI_Bypass_Sequence {
+rule blackshard_powershell_amsi_bypass_sequence {
     strings:
         $amsi1 = "AmsiScanBuffer" ascii wide nocase
         $amsi2 = "amsiInitFailed" ascii wide nocase
@@ -46,7 +46,7 @@ rule Blackshard_PowerShell_AMSI_Bypass_Sequence {
         2 of ($amsi*) and 1 of ($tamper*) and $reflect
 }
 
-rule Blackshard_LOLBin_Remote_Execution_Command {
+rule blackshard_lolbin_remote_execution_command {
     strings:
         $certutil = /certutil(\.exe)?\s+[^\r\n]{0,100}(-urlcache|-decode)/ ascii nocase
         $bitsadmin = /bitsadmin(\.exe)?\s+[^\r\n]{0,100}\/transfer/ ascii nocase
@@ -56,7 +56,7 @@ rule Blackshard_LOLBin_Remote_Execution_Command {
         any of them
 }
 
-rule Blackshard_Office_Macro_AutoExec_Shell_Chain {
+rule blackshard_office_macro_autoexec_shell_chain {
     strings:
         $auto1 = "AutoOpen" ascii wide nocase
         $auto2 = "Document_Open" ascii wide nocase
@@ -216,7 +216,7 @@ fn provenance_for(namespace: &str, identifier: &str) -> RuleProvenance {
         RuleProvenance::PublisherAuthenticated
     } else if matches!(
         identifier,
-        "Blackshard_EICAR_Test_File" | "Blackshard_Harmless_Self_Test"
+        "blackshard_eicar_test_file" | "blackshard_harmless_self_test"
     ) {
         RuleProvenance::EmbeddedTrustedTest
     } else {
@@ -228,7 +228,7 @@ fn enforcement_authority_for(namespace: &str, identifier: &str) -> RuleEnforceme
     if namespace == "blackshard_builtin"
         && matches!(
             identifier,
-            "Blackshard_EICAR_Test_File" | "Blackshard_Harmless_Self_Test"
+            "blackshard_eicar_test_file" | "blackshard_harmless_self_test"
         )
     {
         RuleEnforcementAuthority::ExecutionDeny
@@ -240,42 +240,42 @@ fn enforcement_authority_for(namespace: &str, identifier: &str) -> RuleEnforceme
 fn builtin_policies() -> HashMap<String, RulePolicy> {
     let entries = [
         (
-            "Blackshard_EICAR_Test_File",
+            "blackshard_eicar_test_file",
             RuleDisposition::Malicious,
             100,
             "EICAR-Test-File",
             "matched the industry-standard harmless antivirus test file",
         ),
         (
-            "Blackshard_Harmless_Self_Test",
+            "blackshard_harmless_self_test",
             RuleDisposition::Malicious,
             100,
-            "Blackshard-Self-Test",
-            "matched the internal Blackshard harmless protection test payload",
+            "blackshard-self-test",
+            "matched the internal blackshard harmless protection test payload",
         ),
         (
-            "Blackshard_PowerShell_Obfuscated_Download_Execute",
+            "blackshard_powershell_obfuscated_download_execute",
             RuleDisposition::Suspicious,
             45,
             "Suspicious.PowerShell.DownloadExecute",
             "combined obfuscation, download, and in-memory execution indicators",
         ),
         (
-            "Blackshard_PowerShell_AMSI_Bypass_Sequence",
+            "blackshard_powershell_amsi_bypass_sequence",
             RuleDisposition::Suspicious,
             55,
             "Suspicious.PowerShell.AMSIBypass",
             "multiple AMSI tampering indicators appeared in one payload",
         ),
         (
-            "Blackshard_LOLBin_Remote_Execution_Command",
+            "blackshard_lolbin_remote_execution_command",
             RuleDisposition::Suspicious,
             40,
             "Suspicious.LOLBin.RemoteExecution",
             "a Windows utility was configured to retrieve or execute remote content",
         ),
         (
-            "Blackshard_Office_Macro_AutoExec_Shell_Chain",
+            "blackshard_office_macro_autoexec_shell_chain",
             RuleDisposition::Suspicious,
             45,
             "Suspicious.Office.AutoExecShell",
@@ -346,7 +346,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches.iter().any(|item| {
-            item.identifier == "Blackshard_PowerShell_Obfuscated_Download_Execute"
+            item.identifier == "blackshard_powershell_obfuscated_download_execute"
                 && item.disposition == RuleDisposition::Suspicious
         }));
         assert!(!matches
@@ -358,7 +358,7 @@ mod tests {
     fn ordinary_text_has_no_matches() {
         let engine = RuleEngine::builtin().unwrap();
         assert!(engine
-            .scan(b"This is an ordinary Blackshard project document.")
+            .scan(b"This is an ordinary blackshard project document.")
             .unwrap()
             .is_empty());
     }

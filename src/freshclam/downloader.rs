@@ -44,7 +44,7 @@ pub struct ActiveDatabase {
 }
 
 /// Download, publisher-verify, unpack, and atomically activate the three
-/// official ClamAV databases. The supplied path is Blackshard's protected
+/// official ClamAV databases. The supplied path is blackshard's protected
 /// ProgramData directory, not the global ProgramData root.
 pub fn download_databases(blackshard_data: &Path) -> Result<ActiveDatabase, DownloadError> {
     if let Ok(active) = active_database(blackshard_data) {

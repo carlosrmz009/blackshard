@@ -45,7 +45,7 @@ $bundle = if ([string]::IsNullOrWhiteSpace($BaseBundlePath)) {
 }
 
 if ([int]$bundle.schema_version -ne 2) {
-    throw "Only Blackshard definition schema 2 can be extended."
+    throw "Only blackshard definition schema 2 can be extended."
 }
 $bundle.bundle_id = $BundleId
 foreach ($propertyName in @('exact_sha256', 'yara_bundles', 'similarity_profiles', 'sources')) {
@@ -101,7 +101,7 @@ foreach ($file in $databaseFiles) {
             family     = $null
         })
         if ($records.Count -gt $maximumSignatures) {
-            throw "The merged bundle exceeds Blackshard's $maximumSignatures-signature safety limit. Split and curate the source set."
+            throw "The merged bundle exceeds blackshard's $maximumSignatures-signature safety limit. Split and curate the source set."
         }
     }
 }
@@ -138,4 +138,4 @@ try {
 
 Write-Host "Created unsigned candidate bundle: $outputFullPath"
 Write-Host "Exact SHA-256 signatures: $($records.Count)"
-Write-Host "This candidate is inert until reviewed and wrapped in a Blackshard-signed update envelope."
+Write-Host "This candidate is inert until reviewed and wrapped in a blackshard-signed update envelope."

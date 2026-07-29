@@ -42,7 +42,7 @@ pub struct DetectionReport {
     /// and are never extracted to the filesystem.
     pub container_inspection: Option<ContainerInspection>,
     /// Result returned by the locally registered Windows AMSI provider. This is
-    /// kept separate from Blackshard's signatures and heuristics so callers can
+    /// kept separate from blackshard's signatures and heuristics so callers can
     /// apply a non-destructive execution policy without authorizing quarantine.
     pub amsi_report: Option<AmsiScanReport>,
     /// An AMSI initialization/provider failure is diagnostic only. The primary

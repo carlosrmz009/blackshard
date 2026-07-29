@@ -88,7 +88,7 @@ impl UpdateClientConfig {
             timeouts: HttpTimeouts::default(),
             scheduler: UpdateScheduler::default(),
             check_on_start: true,
-            user_agent: format!("Blackshard/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: format!("blackshard/{}", env!("CARGO_PKG_VERSION")),
         }
     }
 
@@ -1063,7 +1063,7 @@ mod windows_http {
         {
             return Err(last_http_error("timeout configuration"));
         }
-        // Blackshard supports Windows 10 and later, where TLS 1.2 is always
+        // blackshard supports Windows 10 and later, where TLS 1.2 is always
         // available. Do not inherit a machine policy which still permits SSL
         // or TLS 1.0 for this security-sensitive channel.
         let mut secure_protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;

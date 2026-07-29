@@ -22,7 +22,7 @@ use std::path::Path;
 
 /// SHA-256 of the canonical 68-byte EICAR antivirus test file.
 pub const EICAR_SHA256: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
-/// SHA-256 of Blackshard's inert, project-specific end-to-end test payload.
+/// SHA-256 of blackshard's inert, project-specific end-to-end test payload.
 pub const BLACKSHARD_SELF_TEST_SHA256: &str =
     "e316cf90429b8ac181a7006de57c3f4af0c75642caf24589b86f63c8798294f8";
 
@@ -228,10 +228,10 @@ impl Default for SignatureDatabase {
         database
             .insert_sha256_hex(
                 BLACKSHARD_SELF_TEST_SHA256,
-                "Blackshard-Harmless-Self-Test",
+                "blackshard-harmless-self-test",
                 Some("Test".to_owned()),
             )
-            .expect("the built-in Blackshard self-test digest is valid");
+            .expect("the built-in blackshard self-test digest is valid");
         database
     }
 }

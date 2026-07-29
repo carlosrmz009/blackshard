@@ -1,4 +1,4 @@
-//! Blackshard's desktop shell.
+//! blackshard's desktop shell.
 //!
 //! The UI deliberately treats runtime health as input from the protection
 //! service.  A running window is not evidence that the minifilter, scanner,
@@ -340,7 +340,7 @@ impl BlackshardApp {
                 ),
                 driver: DriverStatus::Error("the runtime status lock was poisoned".to_owned()),
                 attention: Some(
-                    "Blackshard cannot verify protection state; restart the application."
+                    "blackshard cannot verify protection state; restart the application."
                         .to_owned(),
                 ),
                 ..UiRuntimeState::default()
@@ -450,7 +450,7 @@ impl BlackshardApp {
         self.page = Page::Scan;
         self.notice = Some(Notice {
             level: NoticeLevel::Information,
-            message: "Scan started. Blackshard will continue while you view other pages."
+            message: "Scan started. blackshard will continue while you view other pages."
                 .to_owned(),
             created: Instant::now(),
         });
@@ -603,7 +603,7 @@ impl BlackshardApp {
         ui.add_space(9.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("BLACKSHARD")
+                RichText::new("blackshard")
                     .family(FontFamily::Monospace)
                     .size(21.0)
                     .strong()
@@ -1407,7 +1407,7 @@ impl BlackshardApp {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "Blackshard reports independent certification only when the runtime supplies a named authority. Signed development builds remain clearly identified.",
+                    "blackshard reports independent certification only when the runtime supplies a named authority. Signed development builds remain clearly identified.",
                 )
                 .size(11.0)
                 .color(MUTED),
@@ -1989,7 +1989,7 @@ fn overall_health(runtime: &UiRuntimeState) -> (String, String, Color32) {
         ),
         (ProtectionStatus::Starting, _) | (_, DriverStatus::Checking) => (
             "VERIFYING PROTECTION".to_owned(),
-            "Blackshard is checking the engine and kernel enforcement channel.".to_owned(),
+            "blackshard is checking the engine and kernel enforcement channel.".to_owned(),
             AMBER,
         ),
     }

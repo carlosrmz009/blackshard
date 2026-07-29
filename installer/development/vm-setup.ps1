@@ -3,22 +3,35 @@
 param(
     [switch]$ResumeAfterReboot,
     [switch]$Uninstall,
-    [switch]$UiMode
+    [switch]$UiMode,
+    [switch]$CompleteForUser
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$taskName = "BlackshardDevelopmentSetupResume"
-$stageRoot = Join-Path $env:ProgramData "BlackshardDevelopmentInstaller"
+$taskName = "blackshard-development-setup-resume"
+$legacyTaskName = "blacksharddevelopmentsetupresume"
+$stageRoot = Join-Path $env:ProgramData "blackshard-development-installer"
 $logPath = Join-Path $stageRoot "setup.log"
 $successPath = Join-Path $stageRoot "installed.txt"
 $failurePath = Join-Path $stageRoot "failed.txt"
-$installedUi = Join-Path $env:ProgramFiles "Blackshard\blackshard-ui.exe"
-$uninstallRegistryPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BlackshardDevelopment"
+$installedDirectory = Join-Path $env:ProgramFiles "blackshard"
+$installedUi = Join-Path $installedDirectory "blackshard-ui.exe"
+$installedOobe = Join-Path $installedDirectory "oobe.png"
+$installedLogo = Join-Path $installedDirectory "logo.png"
+$installedIcon = Join-Path $installedDirectory "blackshard.ico"
+$uninstallRegistryPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\blackshard-development"
 $runOnceRegistryPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
-$startMenuShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Blackshard.lnk"
-$bootstrapLogPath = Join-Path $env:TEMP "BlackshardVmSetup.log"
+$runOnceValueName = "blackshard-development-complete"
+$legacyRunOnceValueName = "blacksharddevelopmentlaunch"
+$startMenuShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\blackshard.lnk"
+$commonDesktopDirectory = [Environment]::GetFolderPath("CommonDesktopDirectory")
+if ([string]::IsNullOrWhiteSpace($commonDesktopDirectory)) {
+    $commonDesktopDirectory = Join-Path $env:PUBLIC "Desktop"
+}
+$desktopShortcut = Join-Path $commonDesktopDirectory "blackshard.lnk"
+$bootstrapLogPath = Join-Path $env:TEMP "blackshard-vm-setup.log"
 $immediateInstallTimeoutSeconds = 300
 $serviceReadinessTimeoutSeconds = 180
 
@@ -63,9 +76,9 @@ trap {
     if ($ResumeAfterReboot -or (Test-SystemAccount)) {
         try { Set-Content -LiteralPath $failurePath -Value $record -Encoding UTF8 -Force } catch {}
     }
-    Show-SetupMessage -Message ("Blackshard VM setup failed.`n`n{0}`n`nDiagnostic log:`n{1}" -f $detail, $bootstrapLogPath) `
-        -Title "Blackshard VM Setup" -ErrorMessage $true
-    Write-Output "BLACKSHARD_UI:ERROR:$detail"
+    Show-SetupMessage -Message ("blackshard VM setup failed.`n`n{0}`n`nDiagnostic log:`n{1}" -f $detail, $bootstrapLogPath) `
+        -Title "blackshard VM setup" -ErrorMessage $true
+    Write-Output "blackshard_ui:ERROR:$detail"
     exit 1
 }
 
@@ -85,6 +98,7 @@ function Invoke-SelfElevated {
     if ($ResumeAfterReboot) { $arguments += "-ResumeAfterReboot" }
     if ($Uninstall) { $arguments += "-Uninstall" }
     if ($UiMode) { $arguments += "-UiMode" }
+    if ($CompleteForUser) { $arguments += "-CompleteForUser" }
     $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -ArgumentList ($arguments -join " ") -Verb RunAs -WindowStyle Hidden -Wait -PassThru
     exit $process.ExitCode
@@ -96,7 +110,7 @@ function Assert-DisposableVirtualMachine {
     $knownVirtualMachine = $identity -match "(?i)(virtual machine|vmware|virtualbox|kvm|qemu|xen|parallels|hyper-v|nutanix|bochs)"
     if (-not $knownVirtualMachine) {
         throw @"
-Blackshard VM Development Setup refused to run because this system was not identified as a virtual machine:
+blackshard VM development setup refused to run because this system was not identified as a virtual machine:
 $identity
 
 This installer enables Windows test-signing and installs a development kernel driver. Use it only in a disposable, snapshotted VM. It intentionally has no physical-machine override.
@@ -178,7 +192,10 @@ function Copy-InstallerPayload {
         "enable-test-signing.ps1",
         "disable-test-signing.ps1",
         "vm-setup.ps1",
-        "BlackshardSetupUi.exe"
+        "blackshard-setup-ui.exe",
+        "oobe.png",
+        "logo.png",
+        "blackshard.ico"
     )
     foreach ($name in $required) {
         $source = Join-Path $PSScriptRoot $name
@@ -192,7 +209,8 @@ function Copy-InstallerPayload {
     Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
 }
 
-function Register-ResumeTask {
+function Register-ResumeTask([switch]$RegisterInteractiveCompletion) {
+    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
     $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $resumeScript = Join-Path $stageRoot "vm-setup.ps1"
     $action = New-ScheduledTaskAction -Execute $powerShell `
@@ -203,27 +221,59 @@ function Register-ResumeTask {
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force | Out-Null
+    if ($RegisterInteractiveCompletion) {
+        Register-CompletionRunOnce
+    }
 }
 
 function Remove-ResumeTask {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+function Register-CompletionRunOnce {
+    New-Item -Path $runOnceRegistryPath -Force | Out-Null
+    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $completionScript = Join-Path $stageRoot "vm-setup.ps1"
+    $completionCommand = '"{0}" -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -CompleteForUser' -f `
+        $powerShell, $completionScript
+    New-ItemProperty -Path $runOnceRegistryPath -Name $runOnceValueName `
+        -Value $completionCommand -PropertyType String -Force | Out-Null
+}
+
+function Remove-CompletionRunOnce {
+    Remove-ItemProperty -Path $runOnceRegistryPath -Name $runOnceValueName -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $runOnceRegistryPath -Name $legacyRunOnceValueName -ErrorAction SilentlyContinue
+}
+
+function New-blackshardShortcut([string]$Path) {
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($Path)
+    $shortcut.TargetPath = $installedUi
+    $shortcut.WorkingDirectory = $installedDirectory
+    $shortcut.Description = "blackshard antivirus"
+    $shortcut.IconLocation = "$installedIcon,0"
+    $shortcut.Save()
 }
 
 function Install-ShortcutsAndRegistration {
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($startMenuShortcut)
-    $shortcut.TargetPath = $installedUi
-    $shortcut.WorkingDirectory = Split-Path -Parent $installedUi
-    $shortcut.Description = "Blackshard antivirus"
-    $shortcut.Save()
+    foreach ($assetName in @("oobe.png", "logo.png", "blackshard.ico")) {
+        $source = Join-Path $stageRoot $assetName
+        $destination = Join-Path $installedDirectory $assetName
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+    New-blackshardShortcut -Path $startMenuShortcut
+    New-blackshardShortcut -Path $desktopShortcut
 
     New-Item -Path $uninstallRegistryPath -Force | Out-Null
     $uninstallCommand = '"{0}" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{1}" -Uninstall' -f `
         "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe", (Join-Path $stageRoot "vm-setup.ps1")
-    New-ItemProperty -Path $uninstallRegistryPath -Name DisplayName -Value "Blackshard Development (VM Only)" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallRegistryPath -Name DisplayName -Value "blackshard development (VM only)" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name DisplayVersion -Value "0.1.0-dev" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $uninstallRegistryPath -Name Publisher -Value "Blackshard Open Source Project" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $uninstallRegistryPath -Name DisplayIcon -Value $installedUi -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallRegistryPath -Name Publisher -Value "blackshard open source project" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallRegistryPath -Name DisplayIcon -Value $installedIcon -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name UninstallString -Value $uninstallCommand -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name NoModify -Value 1 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryPath -Name NoRepair -Value 1 -PropertyType DWord -Force | Out-Null
@@ -233,9 +283,9 @@ function Install-AllComponents {
     Set-Content -LiteralPath (Join-Path $stageRoot "development-ipc-policy") `
         -Value "Disposable VM development policy. Unsigned clients are restricted to this protected installation directory." `
         -Encoding UTF8 -Force
-    Write-Output "BLACKSHARD_UI:STATUS:Trusting the VM development certificate and signing the minifilter."
+    Write-Output "blackshard_ui:STATUS:Trusting the VM development certificate and signing the minifilter."
     & (Join-Path $stageRoot "enable-test-signing.ps1") -SkipBootConfiguration
-    Write-Output "BLACKSHARD_UI:STATUS:Installing the kernel minifilter and LocalSystem protection service."
+    Write-Output "blackshard_ui:STATUS:Installing the kernel minifilter and LocalSystem protection service."
     $installer = Join-Path $stageRoot "install.ps1"
     $verifier = Join-Path $stageRoot "verify.ps1"
     & $installer
@@ -243,36 +293,28 @@ function Install-AllComponents {
     & $powerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $verifier `
         -DevelopmentVm -WaitSeconds $serviceReadinessTimeoutSeconds
     if ($LASTEXITCODE -ne 0) {
-        throw "Blackshard components were installed, but runtime verification failed (exit code $LASTEXITCODE)."
+        throw "blackshard components were installed, but runtime verification failed (exit code $LASTEXITCODE)."
     }
     Install-ShortcutsAndRegistration
 
-    New-Item -Path $runOnceRegistryPath -Force | Out-Null
-    New-ItemProperty -Path $runOnceRegistryPath -Name "BlackshardDevelopmentLaunch" `
-        -Value ('"{0}"' -f $installedUi) -PropertyType String -Force | Out-Null
     Set-Content -LiteralPath $successPath `
         -Value ("Installed and verified at {0:o}" -f (Get-Date)) -Encoding UTF8
     Remove-Item -LiteralPath $failurePath -Force -ErrorAction SilentlyContinue
     Remove-ResumeTask
-    Write-Output "BLACKSHARD_UI:INSTALL_COMPLETE"
+    Write-Output "blackshard_ui:INSTALL_COMPLETE"
 
-    Write-Host "[+] Blackshard UI, LocalSystem service, and minifilter are installed and verified." -ForegroundColor Green
-    Write-Host "[+] Blackshard will open when an interactive user signs in." -ForegroundColor Green
+    Write-Host "[+] blackshard UI, LocalSystem service, and minifilter are installed and verified." -ForegroundColor Green
+    Write-Host "[+] blackshard completion will appear when an interactive user signs in." -ForegroundColor Green
 }
 
 function Start-ImmediateSystemInstall {
-    Write-Output "BLACKSHARD_UI:STATUS:Repairing the partial installation with LocalSystem authority."
+    Write-Output "blackshard_ui:STATUS:Repairing the partial installation with LocalSystem authority."
     Register-ResumeTask
     Start-ScheduledTask -TaskName $taskName
     $marker = $successPath
     for ($attempt = 0; $attempt -lt $immediateInstallTimeoutSeconds; $attempt++) {
         if (Test-Path -LiteralPath $marker -PathType Leaf) {
-            Write-Output "BLACKSHARD_UI:INSTALL_COMPLETE"
-            Show-SetupMessage -Message @"
-Blackshard was installed and verified successfully.
-
-The LocalSystem protection service and minifilter are now active. Open Blackshard from the Start menu.
-"@ -Title "Blackshard VM Setup"
+            Write-Output "blackshard_ui:INSTALL_COMPLETE"
             return
         }
         if (Test-Path -LiteralPath $failurePath -PathType Leaf) {
@@ -296,6 +338,75 @@ The LocalSystem protection service and minifilter are now active. Open Blackshar
     throw "The SYSTEM installation did not finish within $immediateInstallTimeoutSeconds seconds (task state: $taskState; last result: $lastResult).`n`n$tail`n`nFull worker log: $logPath"
 }
 
+function Show-UserCompletion {
+    Remove-CompletionRunOnce
+    if (-not [Environment]::UserInteractive) {
+        return
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($immediateInstallTimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $successPath -PathType Leaf) {
+            break
+        }
+        if (Test-Path -LiteralPath $failurePath -PathType Leaf) {
+            $failure = (Get-Content -LiteralPath $failurePath -Raw -ErrorAction SilentlyContinue).Trim()
+            if ([string]::IsNullOrWhiteSpace($failure)) {
+                $failure = "The installation worker failed without diagnostic text."
+            }
+            Show-SetupMessage -Message ("blackshard installation failed.`n`n{0}`n`nFull log:`n{1}" -f $failure, $logPath) `
+                -Title "blackshard VM setup" -ErrorMessage $true
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not (Test-Path -LiteralPath $successPath -PathType Leaf)) {
+        Show-SetupMessage -Message ("blackshard setup did not finish within {0} seconds.`n`nFull log:`n{1}" -f `
+            $immediateInstallTimeoutSeconds, $logPath) -Title "blackshard VM setup" -ErrorMessage $true
+        return
+    }
+    if (-not (Test-Path -LiteralPath $installedOobe -PathType Leaf)) {
+        Show-SetupMessage -Message "blackshard was installed, but the OOBE image is missing." `
+            -Title "blackshard VM setup" -ErrorMessage $true
+        return
+    }
+
+    Get-Process -Name "blackshard-setup-ui" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 350
+
+    Add-Type -AssemblyName PresentationCore
+    Add-Type -AssemblyName PresentationFramework
+    $bitmap = [Windows.Media.Imaging.BitmapImage]::new()
+    $bitmap.BeginInit()
+    $bitmap.CacheOption = [Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    $bitmap.UriSource = [Uri]::new($installedOobe)
+    $bitmap.EndInit()
+    $bitmap.Freeze()
+
+    $image = [Windows.Controls.Image]::new()
+    $image.Source = $bitmap
+    $image.Stretch = [Windows.Media.Stretch]::Uniform
+
+    $workArea = [Windows.SystemParameters]::WorkArea
+    $window = [Windows.Window]::new()
+    $window.Title = "blackshard installation complete"
+    $window.Content = $image
+    $window.Background = [Windows.Media.Brushes]::Black
+    $window.Width = [Math]::Min(1280, [Math]::Floor($workArea.Width * 0.86))
+    $window.Height = [Math]::Min(720, [Math]::Floor($workArea.Height * 0.86))
+    $window.MinWidth = 640
+    $window.MinHeight = 360
+    $window.WindowStartupLocation = [Windows.WindowStartupLocation]::CenterScreen
+    $window.Topmost = $true
+    [void]$window.ShowDialog()
+
+    if (Test-Path -LiteralPath $installedUi -PathType Leaf) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $installedUi)
+    }
+}
+
 function Remove-AllComponents {
     Remove-ResumeTask
     $uninstaller = Join-Path $stageRoot "uninstall.ps1"
@@ -303,20 +414,26 @@ function Remove-AllComponents {
         & $uninstaller
     }
     Remove-Item -LiteralPath $startMenuShortcut -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $desktopShortcut -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $uninstallRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $runOnceRegistryPath -Name "BlackshardDevelopmentLaunch" -ErrorAction SilentlyContinue
+    Remove-CompletionRunOnce
     $disableTestSigning = Join-Path $stageRoot "disable-test-signing.ps1"
     if (Test-Path -LiteralPath $disableTestSigning -PathType Leaf) {
         & $disableTestSigning
     }
-    Write-Host "[+] Blackshard development components were removed. Restart the VM to leave test-signing mode." -ForegroundColor Green
+    Write-Host "[+] blackshard development components were removed. Restart the VM to leave test-signing mode." -ForegroundColor Green
+}
+
+if ($CompleteForUser) {
+    Show-UserCompletion
+    exit 0
 }
 
 if (-not (Test-Administrator)) {
     Invoke-SelfElevated
 }
 
-Write-Output "BLACKSHARD_UI:STATUS:Validating the virtual-machine safety boundary."
+Write-Output "blackshard_ui:STATUS:Validating the virtual-machine safety boundary."
 Assert-DisposableVirtualMachine
 
 if ($Uninstall) {
@@ -339,7 +456,7 @@ if ($ResumeAfterReboot) {
 
 Assert-SecureBootDisabled
 $testSigningActive = Test-TestSigningActive
-Write-Output "BLACKSHARD_UI:STATUS:Staging the protected installer payload."
+Write-Output "blackshard_ui:STATUS:Staging the protected installer payload."
 Copy-InstallerPayload
 try { Start-Transcript -LiteralPath $bootstrapLogPath -Append | Out-Null } catch {}
 try {
@@ -349,23 +466,23 @@ try {
         exit 0
     }
     Write-Host "[*] Enabling Windows test-signing mode for the disposable VM..." -ForegroundColor Yellow
-    Write-Output "BLACKSHARD_UI:STATUS:Enabling Windows test-signing for the disposable VM."
+    Write-Output "blackshard_ui:STATUS:Enabling Windows test-signing for the disposable VM."
     & bcdedit.exe /set testsigning on | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "Windows could not enable test-signing. Disable Secure Boot in this disposable VM and retry."
     }
-    Register-ResumeTask
-    Write-Output "BLACKSHARD_UI:REBOOT_PENDING"
+    Register-ResumeTask -RegisterInteractiveCompletion
+    Write-Output "blackshard_ui:REBOOT_PENDING"
     Write-Host "[+] Setup will automatically resume during the next VM boot." -ForegroundColor Green
     Show-SetupMessage -Message @"
 The test certificate and boot configuration are ready.
 
-The disposable VM will restart in 15 seconds. Blackshard setup will resume automatically during boot and install the UI, protection service, and minifilter.
+The disposable VM will restart in 15 seconds. blackshard setup will resume automatically during boot and install the UI, protection service, and minifilter.
 
 Run shutdown /a now if you need to postpone the restart.
-"@ -Title "Blackshard VM Setup"
+"@ -Title "blackshard VM setup"
     Write-Host "[*] Restarting the disposable VM in 15 seconds. Run 'shutdown /a' now to postpone." -ForegroundColor Yellow
-    & shutdown.exe /r /t 15 /d p:2:4 /c "Blackshard development setup must restart to activate test-signing."
+    & shutdown.exe /r /t 15 /d p:2:4 /c "blackshard development setup must restart to activate test-signing."
     if ($LASTEXITCODE -ne 0) {
         throw "Windows refused the setup restart request. Restart the VM manually; setup will resume automatically."
     }

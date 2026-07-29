@@ -174,7 +174,7 @@ fn validate_settings_request_path(path: &Path) -> Result<(), String> {
         .and_then(Path::parent)
         .and_then(Path::file_name)
         .and_then(OsStr::to_str);
-    if parent != Some("Elevation") || grandparent != Some("Blackshard") || !path.is_absolute() {
+    if parent != Some("elevation") || grandparent != Some("blackshard") || !path.is_absolute() {
         return Err("the settings request is outside the expected staging layout".to_owned());
     }
     Ok(())
@@ -184,8 +184,8 @@ fn elevation_request_directory() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("Blackshard")
-        .join("Elevation")
+        .join("blackshard")
+        .join("elevation")
 }
 
 #[cfg(windows)]
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn staged_settings_paths_are_narrowly_named() {
-        let valid = PathBuf::from(r"C:\Users\Test\AppData\Local\Blackshard\Elevation")
+        let valid = PathBuf::from(r"C:\Users\Test\AppData\Local\blackshard\elevation")
             .join(format!("settings-{}.json", Uuid::new_v4()));
         assert!(validate_settings_request_path(&valid).is_ok());
         assert!(validate_settings_request_path(Path::new(r"C:\Windows\system.ini")).is_err());

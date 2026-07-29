@@ -66,7 +66,7 @@ fn cursor_path() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("Blackshard")
+        .join("blackshard")
         .join("notification-cursor.json")
 }
 
@@ -114,7 +114,7 @@ impl SingleInstance {
             ) -> isize;
         }
 
-        let name = "Local\\BlackshardNotificationAgent\0"
+        let name = "Local\\blackshard-notification-agent\0"
             .encode_utf16()
             .collect::<Vec<_>>();
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };

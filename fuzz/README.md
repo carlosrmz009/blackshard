@@ -1,4 +1,4 @@
-# Blackshard fuzzing
+# blackshard fuzzing
 
 Install `cargo-fuzz` with a current nightly Rust toolchain, then run:
 

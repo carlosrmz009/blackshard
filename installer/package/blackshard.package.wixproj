@@ -2,7 +2,7 @@
   <PropertyGroup>
     <OutputType>Package</OutputType>
     <InstallerPlatform>x64</InstallerPlatform>
-    <OutputName>Blackshard</OutputName>
+    <OutputName>blackshard</OutputName>
     <SignOutput>true</SignOutput>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <DefineConstants>ProductVersion=$(ProductVersion);StageDir=$(StageDir)</DefineConstants>
@@ -16,19 +16,19 @@
     <Error Condition="'$(AcceptEula)' != 'wix7'"
            Text="WiX v7 EULA acceptance is required. Use installer\build-production-installer.ps1 -AcceptWixEula after reviewing the WiX OSMF terms." />
     <Error Condition="'$(SignOutput)' != 'true'"
-           Text="Unsigned Blackshard installer output is forbidden. SignOutput must be true." />
+           Text="Unsigned blackshard installer output is forbidden. SignOutput must be true." />
     <Error Condition="'$(ProductVersion)' == ''"
            Text="ProductVersion is required." />
     <Error Condition="'$(StageDir)' == ''"
            Text="StageDir is required." />
     <Error Condition="!Exists('$(StageDir)\blackshard-service.exe')"
-           Text="The staged Blackshard service executable is missing." />
+           Text="The staged blackshard service executable is missing." />
     <Error Condition="!Exists('$(StageDir)\blackshard-ui.exe')"
-           Text="The staged Blackshard UI executable is missing." />
+           Text="The staged blackshard UI executable is missing." />
     <Error Condition="!Exists('$(StageDir)\blackshard-amsi-x64.dll')"
-           Text="The staged x64 Blackshard AMSI provider is missing." />
+           Text="The staged x64 blackshard AMSI provider is missing." />
     <Error Condition="!Exists('$(StageDir)\blackshard-amsi-x86.dll')"
-           Text="The staged x86 Blackshard AMSI provider is missing." />
+           Text="The staged x86 blackshard AMSI provider is missing." />
     <Error Condition="!Exists('$(StageDir)\LICENSE.txt')"
            Text="The staged license is missing." />
     <Error Condition="!Exists('$(StageDir)\DriverPackage\blackshard.inf')"
@@ -46,6 +46,6 @@
   </Target>
 
   <Target Name="SignMsi">
-    <Exec Command="&quot;$(SignToolPath)&quot; sign /v $(CertificateStoreArguments) /sha1 &quot;$(SigningCertificateThumbprint)&quot; /fd SHA256 /tr &quot;$(TimestampUrl)&quot; /td SHA256 /d &quot;Blackshard Windows Client&quot; &quot;%(SignMsi.FullPath)&quot;" />
+    <Exec Command="&quot;$(SignToolPath)&quot; sign /v $(CertificateStoreArguments) /sha1 &quot;$(SigningCertificateThumbprint)&quot; /fd SHA256 /tr &quot;$(TimestampUrl)&quot; /td SHA256 /d &quot;blackshard Windows client&quot; &quot;%(SignMsi.FullPath)&quot;" />
   </Target>
 </Project>

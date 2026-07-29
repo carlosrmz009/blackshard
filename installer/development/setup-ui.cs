@@ -5,7 +5,7 @@ using System.IO;
 using System.Text;
 using System.Windows.Forms;
 
-namespace BlackshardDevelopmentSetup
+namespace blackshardDevelopmentSetup
 {
     internal sealed class SetupForm : Form
     {
@@ -30,7 +30,7 @@ namespace BlackshardDevelopmentSetup
 
         internal SetupForm()
         {
-            Text = "Blackshard VM Setup";
+            Text = "blackshard VM setup";
             ClientSize = new Size(760, 520);
             MinimumSize = new Size(776, 559);
             MaximumSize = new Size(776, 559);
@@ -63,7 +63,7 @@ namespace BlackshardDevelopmentSetup
 
             header.Controls.Add(new Label
             {
-                Text = "BLACKSHARD // VM SETUP",
+                Text = "blackshard // VM SETUP",
                 Font = new Font("Consolas", 15F, FontStyle.Bold),
                 ForeColor = Accent,
                 AutoSize = true,
@@ -123,9 +123,9 @@ namespace BlackshardDevelopmentSetup
             Controls.Add(installButton);
             UpdateInstallButtonAvailability();
 
-            openButton = CreateButton("OPEN BLACKSHARD", new Point(260, 184), new Size(180, 38), false);
+            openButton = CreateButton("OPEN blackshard", new Point(260, 184), new Size(180, 38), false);
             openButton.Enabled = false;
-            openButton.Click += OpenBlackshard;
+            openButton.Click += OpenProduct;
             Controls.Add(openButton);
 
             copyButton = CreateButton("COPY LOG", new Point(451, 184), new Size(120, 38), false);
@@ -222,7 +222,7 @@ namespace BlackshardDevelopmentSetup
             confirmation.Enabled = false;
             progress.Style = ProgressBarStyle.Marquee;
             SetStatus("INITIALIZING", "Validating the VM and preparing the protected installer payload.", Accent);
-            AppendLog("Starting elevated Blackshard setup engine...");
+            AppendLog("Starting elevated blackshard setup engine...");
 
             var script = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "vm-setup.ps1");
             if (!File.Exists(script))
@@ -273,29 +273,29 @@ namespace BlackshardDevelopmentSetup
                 BeginInvoke((Action)(() => HandleOutput(line, error)));
                 return;
             }
-            if (line.StartsWith("BLACKSHARD_UI:STATUS:", StringComparison.Ordinal))
+            if (line.StartsWith("blackshard_ui:STATUS:", StringComparison.Ordinal))
             {
-                var message = line.Substring("BLACKSHARD_UI:STATUS:".Length);
+                var message = line.Substring("blackshard_ui:STATUS:".Length);
                 SetStatus("INSTALLING", message, Accent);
                 AppendLog(message);
                 return;
             }
-            if (line == "BLACKSHARD_UI:REBOOT_PENDING")
+            if (line == "blackshard_ui:REBOOT_PENDING")
             {
                 rebootPending = true;
                 SetStatus("REBOOT SCHEDULED", "Windows will restart and setup will resume automatically.", Accent);
                 AppendLog("Restart scheduled. Setup will continue as LocalSystem during boot.");
                 return;
             }
-            if (line == "BLACKSHARD_UI:INSTALL_COMPLETE")
+            if (line == "blackshard_ui:INSTALL_COMPLETE")
             {
                 installComplete = true;
                 AppendLog("All components installed and verified.");
                 return;
             }
-            if (line.StartsWith("BLACKSHARD_UI:ERROR:", StringComparison.Ordinal))
+            if (line.StartsWith("blackshard_ui:ERROR:", StringComparison.Ordinal))
             {
-                failureDetail = line.Substring("BLACKSHARD_UI:ERROR:".Length).Trim();
+                failureDetail = line.Substring("blackshard_ui:ERROR:".Length).Trim();
                 SetStatus("INSTALLATION FAILED", "The setup engine reported an error. See the activity log below.", Failure);
                 AppendLog("ERROR: " + failureDetail);
                 return;
@@ -313,11 +313,13 @@ namespace BlackshardDevelopmentSetup
             progress.Style = ProgressBarStyle.Blocks;
             progress.Value = 0;
 
-            if (exitCode == 0 && (installComplete || File.Exists(@"C:\Program Files\Blackshard\blackshard-ui.exe")) && !rebootPending)
+            if (exitCode == 0 && (installComplete || File.Exists(@"C:\Program Files\blackshard\blackshard-ui.exe")) && !rebootPending)
             {
-                SetStatus("PROTECTION ONLINE", "Installation and verification completed. Open Blackshard to begin testing.", Accent);
-                openButton.Enabled = true;
-                installButton.Text = "REPAIR INSTALLATION";
+                SetStatus("PROTECTION ONLINE", "Installation and verification completed.", Accent);
+                AppendLog("Opening the blackshard completion experience.");
+                LaunchCompletionExperience();
+                Close();
+                return;
             }
             else if (exitCode == 0 && rebootPending)
             {
@@ -331,7 +333,7 @@ namespace BlackshardDevelopmentSetup
                         ? "The setup engine reported an error. Review and copy the activity log below."
                         : "Setup exited with code " + exitCode + ". Review and copy the activity log below.";
                 SetStatus("INSTALLATION FAILED", detail, Failure);
-                AppendLog("Setup failed. Persistent logs: %TEMP%\\BlackshardVmSetup.log and C:\\ProgramData\\BlackshardDevelopmentInstaller\\setup.log");
+                AppendLog("Setup failed. Persistent logs: %TEMP%\\blackshard-vm-setup.log and C:\\ProgramData\\blackshard-development-installer\\setup.log");
                 installButton.Text = "RETRY INSTALLATION";
             }
             confirmation.Enabled = true;
@@ -357,12 +359,28 @@ namespace BlackshardDevelopmentSetup
             logBox.ScrollToCaret();
         }
 
-        private void OpenBlackshard(object sender, EventArgs eventArgs)
+        private static void LaunchCompletionExperience()
         {
-            const string ui = @"C:\Program Files\Blackshard\blackshard-ui.exe";
+            var script = @"C:\ProgramData\blackshard-development-installer\vm-setup.ps1";
+            if (!File.Exists(script)) return;
+
+            var powerShell = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = powerShell,
+                Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\" -CompleteForUser",
+                WorkingDirectory = Path.GetDirectoryName(script),
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+        }
+
+        private void OpenProduct(object sender, EventArgs eventArgs)
+        {
+            const string ui = @"C:\Program Files\blackshard\blackshard-ui.exe";
             if (!File.Exists(ui))
             {
-                MessageBox.Show("The installed Blackshard executable was not found.", "Blackshard VM Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("The installed blackshard executable was not found.", "blackshard VM setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
             Process.Start(new ProcessStartInfo("explorer.exe", "\"" + ui + "\"") { UseShellExecute = true });
@@ -373,7 +391,7 @@ namespace BlackshardDevelopmentSetup
             if (setupProcess == null) return;
             var result = MessageBox.Show(
                 "Setup is still running. Closing this window could leave installation incomplete. Close anyway?",
-                "Blackshard VM Setup",
+                "blackshard VM setup",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning);
             if (result != DialogResult.Yes) eventArgs.Cancel = true;

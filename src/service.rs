@@ -1,4 +1,4 @@
-//! Windows Service Control Manager host for Blackshard's real-time engine.
+//! Windows Service Control Manager host for blackshard's real-time engine.
 //!
 //! The service and GUI intentionally do not communicate over a network socket.
 //! The service publishes a small, read-only health snapshot beneath ProgramData;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// User-mode protection service. This must remain distinct from the
 /// `blackshard` FILE_SYSTEM_DRIVER service installed by the minifilter INF.
-pub const SERVICE_NAME: &str = "BlackshardProtectionService";
+pub const SERVICE_NAME: &str = "blackshard-protection-service";
 pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 4;
 pub const SERVICE_HEALTH_FILE_NAME: &str = "service-health.json";
 pub const UPDATE_REQUEST_FILE_NAME: &str = "update-request";
@@ -152,7 +152,7 @@ impl ServiceHealthSnapshot {
 /// state, which keeps callers and tests deterministic.
 pub fn service_health_path_from_program_data(program_data: &Path) -> PathBuf {
     program_data
-        .join("Blackshard")
+        .join("blackshard")
         .join(SERVICE_HEALTH_FILE_NAME)
 }
 
@@ -168,7 +168,7 @@ pub fn default_update_request_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     program_data
-        .join("Blackshard")
+        .join("blackshard")
         .join("Requests")
         .join(UPDATE_REQUEST_FILE_NAME)
 }
@@ -300,7 +300,7 @@ mod windows_service_host {
 
     fn service_main(_arguments: Vec<OsString>) {
         if let Err(error) = run_registered_service() {
-            append_service_error(format!("Blackshard service stopped with an error: {error}"));
+            append_service_error(format!("blackshard service stopped with an error: {error}"));
         }
     }
 
@@ -419,7 +419,7 @@ mod windows_service_host {
         let readiness = crate::readiness::ReadinessMonitor::new();
         readiness.update_state(crate::readiness::ReadinessState::Starting);
         report_state(BodyState::StartPending)?;
-        log::info!("Blackshard service is starting");
+        log::info!("blackshard service is starting");
 
         let health_path = default_service_health_path();
         let started_at = Utc::now();
@@ -453,7 +453,7 @@ mod windows_service_host {
         let program_data = std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        let blackshard_data = program_data.join("Blackshard");
+        let blackshard_data = program_data.join("blackshard");
         let mut active_freshclam =
             match crate::freshclam::downloader::download_databases(&blackshard_data) {
                 Ok(active) => Some(active),
@@ -1240,7 +1240,7 @@ mod tests {
         let path = service_health_path_from_program_data(Path::new(r"D:\MachineData"));
         assert_eq!(
             path,
-            PathBuf::from(r"D:\MachineData\Blackshard\service-health.json")
+            PathBuf::from(r"D:\MachineData\blackshard\service-health.json")
         );
     }
 

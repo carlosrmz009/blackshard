@@ -39,7 +39,7 @@ function Assert-ChildPath {
 $headers = @{
     Accept                 = "application/vnd.github+json"
     "X-GitHub-Api-Version" = "2022-11-28"
-    "User-Agent"           = "Blackshard-ClamAV-Runtime-Resolver"
+    "User-Agent"           = "blackshard-clamav-runtime-resolver"
 }
 if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
     $headers.Authorization = "Bearer $($env:GITHUB_TOKEN)"

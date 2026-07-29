@@ -139,7 +139,7 @@ impl ClamdSession {
         // Decode the inert EICAR sample only when the sidecar self-test runs.
         // Embedding the canonical signature contiguously causes other
         // antivirus products to classify the shipped service or installer as
-        // containing a test virus before Blackshard is installed.
+        // containing a test virus before blackshard is installed.
         let mut eicar_bytes = vec![
             0xFD, 0x90, 0xEA, 0x84, 0xF5, 0x80, 0xE5, 0xE4, 0xF5, 0xFE, 0x91, 0xF9, 0xF5, 0xFF,
             0xFD, 0x90, 0x91, 0x8D, 0xF5, 0xFB, 0x8C, 0x92, 0xE6, 0xE6, 0x8C, 0x92, 0xD8, 0x81,
@@ -431,7 +431,7 @@ fn blackshard_data_directory() -> PathBuf {
     std::env::var_os("PROGRAMDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("Blackshard")
+        .join("blackshard")
 }
 
 fn active_database_directory() -> std::io::Result<PathBuf> {

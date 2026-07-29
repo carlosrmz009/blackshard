@@ -9,9 +9,9 @@ use std::fmt;
 
 /// Maximum number of bytes submitted to an AMSI provider for one scan.
 ///
-/// The primary Blackshard engines retain their own independent limits. This
+/// The primary blackshard engines retain their own independent limits. This
 /// lower ceiling prevents a synchronous third-party provider from receiving an
-/// unexpectedly large allocation or doing unbounded work on Blackshard's
+/// unexpectedly large allocation or doing unbounded work on blackshard's
 /// real-time path.
 pub const MAX_AMSI_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_APPLICATION_NAME_UTF16_UNITS: usize = 128;

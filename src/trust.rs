@@ -1,4 +1,4 @@
-//! Local Authenticode verification for the installed Blackshard executable.
+//! Local Authenticode verification for the installed blackshard executable.
 //!
 //! This module deliberately calls `WinVerifyTrust` directly. It never infers
 //! trust from a release build, a filename, or an installer marker, and it does

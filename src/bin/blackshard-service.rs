@@ -429,7 +429,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let destination = std::env::args_os()
                 .nth(2)
                 .map(std::path::PathBuf::from)
-                .ok_or("usage: blackshard-service --freshclam-update <Blackshard data path>")?;
+                .ok_or("usage: blackshard-service --freshclam-update <blackshard data path>")?;
             let active = freshclam::downloader::download_databases(&destination)?;
             println!(
                 "Activated ClamAV generation {} version {} at {}",

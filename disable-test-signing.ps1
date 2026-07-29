@@ -5,7 +5,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$subject = "CN=Blackshard Development Test"
+$subject = "CN=blackshard development test"
 foreach ($store in @("My", "Root", "TrustedPublisher")) {
     Get-ChildItem -LiteralPath "Cert:\LocalMachine\$store" |
         Where-Object Subject -eq $subject |
@@ -17,5 +17,5 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Host "[+] Blackshard test certificates removed and test-signing disabled." -ForegroundColor Green
+Write-Host "[+] blackshard test certificates removed and test-signing disabled." -ForegroundColor Green
 Write-Host "Restart Windows to apply the boot configuration change." -ForegroundColor Yellow

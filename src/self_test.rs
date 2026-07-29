@@ -5,7 +5,7 @@ use uuid::Uuid;
 /// Project-specific inert content used for end-to-end enforcement tests.
 ///
 /// This payload is intentionally not EICAR so another installed antivirus
-/// cannot consume the probe before Blackshard observes it.
+/// cannot consume the probe before blackshard observes it.
 pub const PAYLOAD: &[u8] =
     b"BLACKSHARD-HARMLESS-SELF-TEST-V2\nThis file contains no executable code.\n";
 

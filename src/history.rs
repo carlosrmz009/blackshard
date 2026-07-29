@@ -69,7 +69,7 @@ impl EventHistory {
         let base = std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        Self::new(base.join("Blackshard").join("history.jsonl"))
+        Self::new(base.join("blackshard").join("history.jsonl"))
     }
 
     pub fn append(&self, event: &SecurityEvent) -> io::Result<()> {

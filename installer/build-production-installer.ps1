@@ -430,11 +430,11 @@ function Assert-MicrosoftSignedDriverPackage {
         '(?im)^\s*HKR\s*,\s*"Parameters\\Instances\\blackshard Instance"\s*,\s*"Altitude"\s*,[^\r\n,]*,\s*"([0-9]+(?:\.[0-9]+)?)"\s*(?:;.*)?$'
     )
     if ($altitudeMatches.Count -ne 1) {
-        throw "The driver INF must declare exactly one altitude for the Blackshard minifilter instance; found $($altitudeMatches.Count)."
+        throw "The driver INF must declare exactly one altitude for the blackshard minifilter instance; found $($altitudeMatches.Count)."
     }
     $declaredAltitude = $altitudeMatches[0].Groups[1].Value
     if ($declaredAltitude -in @("328000", "320000.4242")) {
-        throw "The driver INF uses a reserved/development altitude ($declaredAltitude). Obtain Blackshard's unique altitude from Microsoft before packaging."
+        throw "The driver INF uses a reserved/development altitude ($declaredAltitude). Obtain blackshard's unique altitude from Microsoft before packaging."
     }
     if ($declaredAltitude -ne $ExpectedAltitude) {
         throw "The driver INF altitude ($declaredAltitude) does not match -AssignedMinifilterAltitude ($ExpectedAltitude)."
@@ -535,7 +535,7 @@ if ([string]::IsNullOrWhiteSpace($DriverPackageDirectory)) {
 if ([string]::IsNullOrWhiteSpace($AssignedMinifilterAltitude) -or
     $AssignedMinifilterAltitude -notmatch '^[0-9]+(?:\.[0-9]+)?$' -or
     $AssignedMinifilterAltitude -in @("328000", "320000.4242")) {
-    throw "AssignedMinifilterAltitude is required and must be Blackshard's unique Microsoft-assigned production altitude."
+    throw "AssignedMinifilterAltitude is required and must be blackshard's unique Microsoft-assigned production altitude."
 }
 if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
     throw "SigningCertificateThumbprint is required. Unsigned release output is not supported."
@@ -582,11 +582,11 @@ $driverCat = Join-Path $DriverPackageDirectory "blackshard.cat"
 Assert-FileExists -Path $driverInf -Description "Production driver INF"
 Assert-FileExists -Path $driverSys -Description "Production driver binary"
 Assert-FileExists -Path $driverCat -Description "Production driver catalog"
-Assert-X64PeFile -Path $ServicePath -Description "Blackshard protection service"
-Assert-X64PeFile -Path $UiPath -Description "Blackshard desktop UI"
-Assert-X64PeFile -Path $AmsiX64Path -Description "Blackshard x64 AMSI provider"
-Assert-X86PeFile -Path $AmsiX86Path -Description "Blackshard x86 AMSI provider"
-Assert-X64PeFile -Path $driverSys -Description "Blackshard driver"
+Assert-X64PeFile -Path $ServicePath -Description "blackshard protection service"
+Assert-X64PeFile -Path $UiPath -Description "blackshard desktop UI"
+Assert-X64PeFile -Path $AmsiX64Path -Description "blackshard x64 AMSI provider"
+Assert-X86PeFile -Path $AmsiX86Path -Description "blackshard x86 AMSI provider"
+Assert-X64PeFile -Path $driverSys -Description "blackshard driver"
 Invoke-GuiValidationTool -FilePath $ServicePath -ArgumentList @(
     "--validate-release-configuration",
     $driverInf,
@@ -637,10 +637,10 @@ try {
     Copy-Item -LiteralPath $driverSys -Destination (Join-Path $stagedDriverDirectory "blackshard.sys")
     Copy-Item -LiteralPath $driverCat -Destination (Join-Path $stagedDriverDirectory "blackshard.cat")
 
-    Invoke-AuthenticodeSign -Path $stagedService -Description "Blackshard Protection Service" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
-    Invoke-AuthenticodeSign -Path $stagedUi -Description "Blackshard Windows Client" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
-    Invoke-AuthenticodeSign -Path $stagedAmsiX64 -Description "Blackshard AMSI Provider x64" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
-    Invoke-AuthenticodeSign -Path $stagedAmsiX86 -Description "Blackshard AMSI Provider x86" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedService -Description "blackshard protection service" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedUi -Description "blackshard Windows client" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedAmsiX64 -Description "blackshard AMSI provider x64" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
+    Invoke-AuthenticodeSign -Path $stagedAmsiX86 -Description "blackshard AMSI provider x86" -SignTool $SignToolPath -Thumbprint $normalizedThumbprint -StoreLocation $CertificateStoreLocation -TimestampServer $TimestampUrl
 
     $buildEngine = Resolve-MsBuildEngine
     $certificateStoreArguments = "/s My"
@@ -662,30 +662,30 @@ try {
     $packageProperties["StageDir"] = $stageDirectory
     $packageProperties["OutputPath"] = $msiOutputDirectory
     $packageProperties["BaseIntermediateOutputPath"] = $msiIntermediateDirectory
-    Invoke-WixProjectBuild -BuildEngine $buildEngine -ProjectPath (Join-Path $PSScriptRoot "package\Blackshard.Package.wixproj") -Properties $packageProperties -Description "Build and sign the Blackshard MSI"
+    Invoke-WixProjectBuild -BuildEngine $buildEngine -ProjectPath (Join-Path $PSScriptRoot "package\blackshard.package.wixproj") -Properties $packageProperties -Description "Build and sign the blackshard MSI"
 
     $msiFiles = @(Get-ChildItem -LiteralPath $msiOutputDirectory -Filter "*.msi" -File -Recurse)
     if ($msiFiles.Count -ne 1) {
         throw "Expected exactly one MSI output, but found $($msiFiles.Count) under $msiOutputDirectory."
     }
     $signedMsi = $msiFiles[0].FullName
-    Invoke-NativeTool -FilePath $SignToolPath -ArgumentList @("verify", "/pa", "/all", "/v", $signedMsi) -Description "Verify the signed Blackshard MSI"
+    Invoke-NativeTool -FilePath $SignToolPath -ArgumentList @("verify", "/pa", "/all", "/v", $signedMsi) -Description "Verify the signed blackshard MSI"
 
     $bundleProperties = $commonProperties.Clone()
     $bundleProperties["MsiPath"] = $signedMsi
     $bundleProperties["OutputPath"] = $bundleOutputDirectory
     $bundleProperties["BaseIntermediateOutputPath"] = $bundleIntermediateDirectory
-    Invoke-WixProjectBuild -BuildEngine $buildEngine -ProjectPath (Join-Path $PSScriptRoot "bundle\Blackshard.Bundle.wixproj") -Properties $bundleProperties -Description "Build and sign the Blackshard setup bundle"
+    Invoke-WixProjectBuild -BuildEngine $buildEngine -ProjectPath (Join-Path $PSScriptRoot "bundle\blackshard.bundle.wixproj") -Properties $bundleProperties -Description "Build and sign the blackshard setup bundle"
 
     $bundleFiles = @(Get-ChildItem -LiteralPath $bundleOutputDirectory -Filter "*.exe" -File -Recurse)
     if ($bundleFiles.Count -ne 1) {
         throw "Expected exactly one setup executable, but found $($bundleFiles.Count) under $bundleOutputDirectory."
     }
     $signedBundle = $bundleFiles[0].FullName
-    Invoke-NativeTool -FilePath $SignToolPath -ArgumentList @("verify", "/pa", "/all", "/v", $signedBundle) -Description "Verify the signed Blackshard setup bundle"
+    Invoke-NativeTool -FilePath $SignToolPath -ArgumentList @("verify", "/pa", "/all", "/v", $signedBundle) -Description "Verify the signed blackshard setup bundle"
 
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-    $finalSetupPath = Join-Path $OutputDirectory "BlackshardSetup.exe"
+    $finalSetupPath = Join-Path $OutputDirectory "blackshard-setup.exe"
     Copy-Item -LiteralPath $signedBundle -Destination $finalSetupPath -Force
     $finalSetupPath = [System.IO.Path]::GetFullPath($finalSetupPath)
     $finalHash = (Get-FileHash -LiteralPath $finalSetupPath -Algorithm SHA256).Hash

@@ -1,18 +1,18 @@
-# Blackshard production packaging foundation
+# blackshard production packaging foundation
 
 This directory contains a fail-closed WiX 7 packaging pipeline for the Phase 1 x64 Windows client. When every production prerequisite is present, it emits one distributable file:
 
 ```text
-target\production-installer\BlackshardSetup.exe
+target\production-installer\blackshard-setup.exe
 ```
 
-The setup executable is a signed WiX Burn bundle containing a signed MSI. The MSI embeds the signed Blackshard executable, the project license, and a complete `blackshard.inf` / `blackshard.sys` / `blackshard.cat` driver package. No runtime download is required to install those payloads.
+The setup executable is a signed WiX Burn bundle containing a signed MSI. The MSI embeds the signed blackshard executable, the project license, and a complete `blackshard.inf` / `blackshard.sys` / `blackshard.cat` driver package. No runtime download is required to install those payloads.
 
 ## Current boundary
 
 This is deliberately a production **packaging foundation**, not a claim that the current client is already independently validated or production-ready.
 
-The MSI registers the signed `blackshard-service.exe --service` entry point as the automatic, LocalSystem, own-process **Blackshard Protection Service**, with SCM name `BlackshardProtectionService`. The distinct name is mandatory because `blackshard` is already the minifilter driver's SCM service name. It stops the user-mode service before upgrade or removal, starts it after installation, removes it on uninstall, restarts it 30 seconds after each of the first two failures, and resets that failure count after one healthy day. A third consecutive failure is left stopped to avoid an endless crash loop. The same signed service executable supplies the privileged driver lifecycle helper modes:
+The MSI registers the signed `blackshard-service.exe --service` entry point as the automatic, LocalSystem, own-process **blackshard protection service**, with SCM name `blackshard-protection-service`. The distinct name is mandatory because `blackshard` is already the minifilter driver's SCM service name. It stops the user-mode service before upgrade or removal, starts it after installation, removes it on uninstall, restarts it 30 seconds after each of the first two failures, and resets that failure count after one healthy day. A third consecutive failure is left stopped to avoid an endless crash loop. The same signed service executable supplies the privileged driver lifecycle helper modes:
 
 ```text
 blackshard-service.exe --install-driver <absolute-INF-path>
@@ -39,27 +39,27 @@ Until those gates are complete, a successfully built package proves that its rel
 
 The GUI stays unelevated. Quick/full/custom scan requests, settings, quarantine operations, activity, and update checks are routed through the local service IPC API. The service authorizes each caller from its impersonated token; machine-wide mutations require an elevated administrator. When needed, the GUI stages a narrowly named, bounded, SHA-256-bound request and asks Windows UAC to run the same signed executable in a restricted helper mode. Production ACLs continue to deny direct ordinary-user writes to service-owned state.
 
-Likewise, a LocalSystem service runs in session 0 and cannot be the user-notification endpoint. The MSI therefore registers `"%ProgramFiles%\Blackshard\blackshard-service.exe" --notification-agent` under the machine `Run` key. Windows starts one hidden, single-instance broker in every interactive user session at logon; MSI ownership removes that registration on upgrade or uninstall. The broker reads the service-owned detection history and only displays quarantine success/failure notifications. It never performs privileged mutations.
+Likewise, a LocalSystem service runs in session 0 and cannot be the user-notification endpoint. The MSI therefore registers `"%ProgramFiles%\blackshard\blackshard-service.exe" --notification-agent` under the machine `Run` key. Windows starts one hidden, single-instance broker in every interactive user session at logon; MSI ownership removes that registration on upgrade or uninstall. The broker reads the service-owned detection history and only displays quarantine success/failure notifications. It never performs privileged mutations.
 
-The Start menu shortcut is assigned the exact `Blackshard.Security.Client` AppUserModelID required by `winrt-notification`, following Microsoft's [desktop-toast shortcut requirement](https://learn.microsoft.com/en-us/windows/win32/shell/quickstart-sending-desktop-toast). The broker uses that same identity. Installation does not inject a process into an already-running session, so a user who installs after signing in must sign out and back in (or launch `blackshard-service.exe --notification-agent` once) before service-originated notifications appear. The registry value is removed immediately during uninstall; a broker already running in a logged-on session can remain alive until Restart Manager closes it or that session signs out, so the broker should also gain an authenticated service-shutdown/uninstall signal before public release.
+The Start menu shortcut is assigned the exact `blackshard.security.client` AppUserModelID required by `winrt-notification`, following Microsoft's [desktop-toast shortcut requirement](https://learn.microsoft.com/en-us/windows/win32/shell/quickstart-sending-desktop-toast). The broker uses that same identity. Installation does not inject a process into an already-running session, so a user who installs after signing in must sign out and back in (or launch `blackshard-service.exe --notification-agent` once) before service-originated notifications appear. The registry value is removed immediately during uninstall; a broker already running in a logged-on session can remain alive until Restart Manager closes it or that session signs out, so the broker should also gain an authenticated service-shutdown/uninstall signal before public release.
 
 ## What the MSI owns
 
-- `%ProgramFiles%\Blackshard\blackshard-service.exe`
-- `%ProgramFiles%\Blackshard\blackshard-ui.exe`
-- `%ProgramFiles%\Blackshard\blackshard-amsi-x64.dll`
-- `%ProgramFiles%\Blackshard\blackshard-amsi-x86.dll`
-- `%ProgramFiles%\Blackshard\LICENSE.txt`
-- `%ProgramFiles%\Blackshard\DriverPackage\blackshard.inf`
-- `%ProgramFiles%\Blackshard\DriverPackage\blackshard.sys`
-- `%ProgramFiles%\Blackshard\DriverPackage\blackshard.cat`
+- `%ProgramFiles%\blackshard\blackshard-service.exe`
+- `%ProgramFiles%\blackshard\blackshard-ui.exe`
+- `%ProgramFiles%\blackshard\blackshard-amsi-x64.dll`
+- `%ProgramFiles%\blackshard\blackshard-amsi-x86.dll`
+- `%ProgramFiles%\blackshard\LICENSE.txt`
+- `%ProgramFiles%\blackshard\DriverPackage\blackshard.inf`
+- `%ProgramFiles%\blackshard\DriverPackage\blackshard.sys`
+- `%ProgramFiles%\blackshard\DriverPackage\blackshard.cat`
 - A Start menu shortcut
-- The machine-wide `BlackshardNotificationAgent` logon entry, which starts `blackshard-service.exe --notification-agent` once per interactive user session and is removed on uninstall
-- `%ProgramData%\Blackshard` and the `Definitions`, `Quarantine`, `State`, `Logs`, and `Updates\Staging` directories
-- The automatic `BlackshardProtectionService` user-mode service (`blackshard-service.exe --service`); the separate `blackshard` SCM entry belongs to the minifilter driver
+- The machine-wide `blackshard-notification-agent` logon entry, which starts `blackshard-service.exe --notification-agent` once per interactive user session and is removed on uninstall
+- `%ProgramData%\blackshard` and the `Definitions`, `Quarantine`, `State`, `Logs`, and `Updates\Staging` directories
+- The automatic `blackshard-protection-service` user-mode service (`blackshard-service.exe --service`); the separate `blackshard` SCM entry belongs to the minifilter driver
 - Installation of the validated minifilter package through the signed helper modes
 
-The Start menu shortcut carries `System.AppUserModel.ID=Blackshard.Security.Client`, matching the application constant used for desktop toast notifications.
+The Start menu shortcut carries `System.AppUserModel.ID=blackshard.security.client`, matching the application constant used for desktop toast notifications.
 
 ProgramData is protected with MSI 5.0 SDDL entries. LocalSystem (the service identity) and Administrators have full control. Authenticated users can read the root status/history/settings files, definitions, and logs, but cannot create or replace them. `Quarantine`, `State`, `Updates`, and `Updates\Staging` use protected DACLs and are inaccessible to ordinary users. Runtime-created descendants inherit the same policy. If the service account changes in the future, these ACLs must be revised in the same release.
 
@@ -114,16 +114,16 @@ The script:
 8. Builds an MSI that installs the service, applies hardened ProgramData ACLs, and transactionally invokes the signed driver helper.
 9. Signs the MSI, then builds and signs both the detached Burn engine and final bundle.
 10. Authenticode-verifies every signed release artifact and prints the final SHA-256 hash.
-11. Removes the verified temporary build directory and writes only `BlackshardSetup.exe` for this build.
+11. Removes the verified temporary build directory and writes only `blackshard-setup.exe` for this build.
 
 The current development `dist` output is expected to fail these gates because it does not contain a Microsoft-signed production catalog. Test certificates, test-signing mode, and an unsigned catalog are never accepted by this pipeline.
 
 ## Source layout
 
 - `package/Product.wxs` defines the machine-wide MSI payload, service lifecycle, driver transaction, hardened data directories, notification shortcut and per-user broker launch, and upgrade behavior.
-- `package/Blackshard.Package.wixproj` pins the WiX 7 utility extension and enforces signed MSI output with warnings treated as errors.
+- `package/blackshard.package.wixproj` pins the WiX 7 utility extension and enforces signed MSI output with warnings treated as errors.
 - `bundle/Bundle.wxs` embeds the MSI in a one-file x64 Burn setup executable.
-- `bundle/Blackshard.Bundle.wixproj` enforces signing of the Burn engine and final bundle.
+- `bundle/blackshard.bundle.wixproj` enforces signing of the Burn engine and final bundle.
 - `build-production-installer.ps1` validates all release inputs and orchestrates the build.
 
 ## Production-signing notes

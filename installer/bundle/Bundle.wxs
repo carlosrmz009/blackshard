@@ -3,13 +3,13 @@
     xmlns="http://wixtoolset.org/schemas/v4/wxs"
     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
   <Bundle
-      Name="Blackshard"
-      Manufacturer="Blackshard Project"
+      Name="blackshard"
+      Manufacturer="blackshard project"
       Version="$(var.ProductVersion)"
       UpgradeCode="{1E04EC71-3143-4295-986C-B9D7D1FAF585}"
       AboutUrl="https://blackshard.dev/"
       HelpUrl="https://blackshard.dev/"
-      Copyright="Copyright (c) Blackshard contributors">
+      Copyright="Copyright (c) blackshard contributors">
 
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication
@@ -17,8 +17,8 @@
           LicenseUrl="https://www.gnu.org/licenses/gpl-3.0.html"
           ShowVersion="yes"
           SuppressOptionsUI="yes"
-          LaunchTarget="[ProgramFiles64Folder]Blackshard\blackshard-ui.exe"
-          LaunchWorkingFolder="[ProgramFiles64Folder]Blackshard" />
+          LaunchTarget="[ProgramFiles64Folder]blackshard\blackshard-ui.exe"
+          LaunchWorkingFolder="[ProgramFiles64Folder]blackshard" />
     </BootstrapperApplication>
 
     <Chain>

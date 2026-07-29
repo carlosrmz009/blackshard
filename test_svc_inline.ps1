@@ -1,5 +1,5 @@
 $svcName = "TestSvc86"
-$exePath = "C:\Program Files\Blackshard\blackshard-service.exe"
+$exePath = "C:\Program Files\blackshard\blackshard-service.exe"
 $serviceCommand = "`"$exePath`" --service"
 $outPath = Join-Path $PSScriptRoot "test_results.txt"
 Remove-Item -Force $outPath -ErrorAction SilentlyContinue

@@ -31,12 +31,14 @@ function Resolve-RequiredFile([string]$Path, [string]$Description) {
 
 $iexpress = Join-Path $env:SystemRoot "System32\iexpress.exe"
 $iexpress = Resolve-RequiredFile $iexpress "Windows IExpress"
-$ServicePath = Resolve-RequiredFile $ServicePath "Blackshard protection service"
-$UiPath = Resolve-RequiredFile $UiPath "Blackshard desktop UI"
-$DriverPath = Resolve-RequiredFile $DriverPath "Blackshard development driver"
-$AmsiX64Path = Resolve-RequiredFile $AmsiX64Path "Blackshard x64 AMSI provider"
-$AmsiX86Path = Resolve-RequiredFile $AmsiX86Path "Blackshard x86 AMSI provider"
+$ServicePath = Resolve-RequiredFile $ServicePath "blackshard protection service"
+$UiPath = Resolve-RequiredFile $UiPath "blackshard desktop UI"
+$DriverPath = Resolve-RequiredFile $DriverPath "blackshard development driver"
+$AmsiX64Path = Resolve-RequiredFile $AmsiX64Path "blackshard x64 AMSI provider"
+$AmsiX86Path = Resolve-RequiredFile $AmsiX86Path "blackshard x86 AMSI provider"
 $ClamRuntimePath = Resolve-RequiredFile $ClamRuntimePath "Verified latest ClamAV runtime archive"
+$oobeSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "..\oobe.png") "blackshard OOBE image"
+$logoSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "..\logo.png") "blackshard logo"
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
@@ -62,13 +64,13 @@ if (-not $csc) {
     throw "The .NET Framework C# compiler is required to build the VM setup interface."
 }
 
-$uiSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "development\SetupUi.cs") "VM setup UI source"
-$uiExecutable = Join-Path $buildRoot "BlackshardSetupUi.exe"
-$uiManifest = Join-Path $buildRoot "BlackshardSetupUi.manifest"
+$uiSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "development\setup-ui.cs") "VM setup UI source"
+$uiExecutable = Join-Path $buildRoot "blackshard-setup-ui.exe"
+$uiManifest = Join-Path $buildRoot "blackshard-setup-ui.manifest"
 $manifest = @"
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="1.0.0.0" name="BlackshardDevelopment.SetupUi" />
+  <assemblyIdentity version="1.0.0.0" name="blackshard.development.setup-ui" />
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -98,11 +100,73 @@ $compiler = Start-Process -FilePath $csc -ArgumentList @(
     ('"{0}"' -f $uiSource)
 ) -WorkingDirectory $buildRoot -WindowStyle Hidden -Wait -PassThru
 if ($compiler.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $uiExecutable -PathType Leaf)) {
-    throw "The Blackshard VM setup interface could not be compiled (csc exit code $($compiler.ExitCode))."
+    throw "The blackshard VM setup interface could not be compiled (csc exit code $($compiler.ExitCode))."
+}
+
+$iconPath = Join-Path $buildRoot "blackshard.ico"
+Add-Type -AssemblyName System.Drawing
+$sourceImage = $null
+$iconBitmap = $null
+$graphics = $null
+$pngStream = $null
+$iconStream = $null
+$iconWriter = $null
+try {
+    $sourceImage = [Drawing.Image]::FromFile($logoSource)
+    $iconBitmap = [Drawing.Bitmap]::new(
+        256,
+        256,
+        [Drawing.Imaging.PixelFormat]::Format32bppArgb
+    )
+    $graphics = [Drawing.Graphics]::FromImage($iconBitmap)
+    $graphics.Clear([Drawing.Color]::Transparent)
+    $graphics.CompositingQuality = [Drawing.Drawing2D.CompositingQuality]::HighQuality
+    $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $maximumDimension = 224.0
+    $scale = [Math]::Min(
+        $maximumDimension / [double]$sourceImage.Width,
+        $maximumDimension / [double]$sourceImage.Height
+    )
+    $drawWidth = [Math]::Max(1, [int][Math]::Round($sourceImage.Width * $scale))
+    $drawHeight = [Math]::Max(1, [int][Math]::Round($sourceImage.Height * $scale))
+    $drawX = [int][Math]::Floor((256 - $drawWidth) / 2.0)
+    $drawY = [int][Math]::Floor((256 - $drawHeight) / 2.0)
+    $graphics.DrawImage($sourceImage, $drawX, $drawY, $drawWidth, $drawHeight)
+
+    $pngStream = [IO.MemoryStream]::new()
+    $iconBitmap.Save($pngStream, [Drawing.Imaging.ImageFormat]::Png)
+    $pngBytes = $pngStream.ToArray()
+
+    $iconStream = [IO.File]::Open($iconPath, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+    $iconWriter = [IO.BinaryWriter]::new($iconStream)
+    $iconWriter.Write([uint16]0)
+    $iconWriter.Write([uint16]1)
+    $iconWriter.Write([uint16]1)
+    $iconWriter.Write([byte]0)
+    $iconWriter.Write([byte]0)
+    $iconWriter.Write([byte]0)
+    $iconWriter.Write([byte]0)
+    $iconWriter.Write([uint16]1)
+    $iconWriter.Write([uint16]32)
+    $iconWriter.Write([uint32]$pngBytes.Length)
+    $iconWriter.Write([uint32]22)
+    $iconWriter.Write($pngBytes)
+}
+finally {
+    if ($null -ne $iconWriter) { $iconWriter.Dispose() }
+    elseif ($null -ne $iconStream) { $iconStream.Dispose() }
+    if ($null -ne $pngStream) { $pngStream.Dispose() }
+    if ($null -ne $graphics) { $graphics.Dispose() }
+    if ($null -ne $iconBitmap) { $iconBitmap.Dispose() }
+    if ($null -ne $sourceImage) { $sourceImage.Dispose() }
+}
+if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+    throw "The blackshard shortcut icon could not be created from $logoSource."
 }
 
 $payload = [ordered]@{
-    "BlackshardSetupUi.exe" = $uiExecutable
+    "blackshard-setup-ui.exe" = $uiExecutable
     "blackshard-service.exe" = $ServicePath
     "blackshard-ui.exe" = $UiPath
     "blackshard.sys" = $DriverPath
@@ -115,6 +179,9 @@ $payload = [ordered]@{
     "enable-test-signing.ps1" = (Join-Path $PSScriptRoot "..\enable-test-signing.ps1")
     "disable-test-signing.ps1" = (Join-Path $PSScriptRoot "..\disable-test-signing.ps1")
     "vm-setup.ps1" = (Join-Path $PSScriptRoot "development\vm-setup.ps1")
+    "oobe.png" = $oobeSource
+    "logo.png" = $logoSource
+    "blackshard.ico" = $iconPath
 }
 
 foreach ($entry in $payload.GetEnumerator()) {
@@ -125,7 +192,10 @@ foreach ($entry in $payload.GetEnumerator()) {
     }
 }
 
-$outputPath = Join-Path $OutputDirectory "BlackshardVmSetup.exe"
+$packageOutputDirectory = Join-Path $buildRoot "package-output"
+New-Item -ItemType Directory -Path $packageOutputDirectory | Out-Null
+$packageOutputPath = Join-Path $packageOutputDirectory "blackshard-vm-setup.exe"
+$outputPath = Join-Path $OutputDirectory "blackshard-vm-setup.exe"
 if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
     Remove-Item -LiteralPath $outputPath -Force
 }
@@ -138,7 +208,7 @@ foreach ($name in $payload.Keys) {
     $index++
 }
 
-$sedPath = Join-Path $buildRoot "BlackshardVmSetup.sed"
+$sedPath = Join-Path $buildRoot "blackshard-vm-setup.sed"
 $sed = @"
 [Version]
 Class=IEXPRESS
@@ -168,9 +238,9 @@ SourceFiles=SourceFiles
 InstallPrompt=
 DisplayLicense=
 FinishMessage=
-TargetName=$outputPath
-FriendlyName=Blackshard VM Development Setup
-AppLaunched=BlackshardSetupUi.exe
+TargetName=$packageOutputPath
+FriendlyName=blackshard VM development setup
+AppLaunched=blackshard-setup-ui.exe
 PostInstallCmd=<None>
 AdminQuietInstCmd=
 UserQuietInstCmd=
@@ -184,14 +254,15 @@ $($sourceEntries -join "`r`n")
 "@
 [IO.File]::WriteAllText($sedPath, $sed, [Text.Encoding]::ASCII)
 
-$iexpressProcess = Start-Process -FilePath $iexpress -ArgumentList @("/N", "BlackshardVmSetup.sed") `
+$iexpressProcess = Start-Process -FilePath $iexpress -ArgumentList @("/N", "blackshard-vm-setup.sed") `
     -WorkingDirectory $buildRoot -WindowStyle Hidden -Wait -PassThru
 if ($iexpressProcess.ExitCode -ne 0) {
     throw "IExpress failed with exit code $($iexpressProcess.ExitCode)."
 }
-if (-not (Test-Path -LiteralPath $outputPath -PathType Leaf)) {
-    throw "IExpress completed without producing $outputPath."
+if (-not (Test-Path -LiteralPath $packageOutputPath -PathType Leaf)) {
+    throw "IExpress completed without producing $packageOutputPath."
 }
+Copy-Item -LiteralPath $packageOutputPath -Destination $outputPath -Force
 
 $hash = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash
 Write-Host "[+] VM development installer created: $outputPath" -ForegroundColor Green

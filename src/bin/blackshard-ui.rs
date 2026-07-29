@@ -463,7 +463,7 @@ fn set_health_read_error(runtime: &SharedUiState, error: &io::Error) {
     };
 
     if error.kind() == io::ErrorKind::NotFound {
-        let detail = "the Blackshard protection service is not installed or has not started";
+        let detail = "the blackshard protection service is not installed or has not started";
         state.driver = DriverStatus::NotInstalled;
         state.protection = ProtectionStatus::Unavailable(detail.to_owned());
         state.attention = Some(detail.to_owned());
@@ -539,7 +539,7 @@ fn run_harmless_protection_test() -> Result<String, String> {
         .map_err(|error| format!("could not create the harmless test file: {error}"))?;
 
     let result = std::env::current_exe()
-        .map_err(|error| format!("could not locate the Blackshard executable: {error}"))
+        .map_err(|error| format!("could not locate the blackshard executable: {error}"))
         .and_then(|executable| {
             realtime::launch_hidden_probe(&executable, SELF_TEST_ARGUMENT, &path)
                 .map_err(|error| format!("could not launch the isolated test probe: {error}"))
@@ -607,7 +607,7 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
     };
 
     eframe::run_native(
-        "Blackshard",
+        "blackshard",
         options,
         Box::new(move |_creation_context| Box::new(BlackshardApp::with_machine_defaults(runtime))),
     )?;

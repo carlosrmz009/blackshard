@@ -86,13 +86,13 @@ else {
 }
 if (-not [string]::IsNullOrWhiteSpace($ValidatorPath)) {
     if (-not (Test-Path -LiteralPath $ValidatorPath -PathType Leaf)) {
-        throw "Blackshard validator was not found: $ValidatorPath"
+        throw "blackshard validator was not found: $ValidatorPath"
     }
     & $ValidatorPath --validate-definition-payload ([IO.Path]::GetFullPath($BundlePath))
     if ($LASTEXITCODE -ne 0) {
-        throw "Blackshard rejected the unsigned definition payload structure."
+        throw "blackshard rejected the unsigned definition payload structure."
     }
-    Write-Host "Blackshard payload validation: passed"
+    Write-Host "blackshard payload validation: passed"
 }
 $payloadHash = [Security.Cryptography.SHA256]::Create()
 try { $payloadDigest = $payloadHash.ComputeHash($payload) } finally { $payloadHash.Dispose() }
@@ -165,7 +165,7 @@ try {
     )
     if (-not [string]::IsNullOrWhiteSpace($ValidatorPath)) {
         if (-not (Test-Path -LiteralPath $ValidatorPath -PathType Leaf)) {
-            throw "Blackshard validator was not found: $ValidatorPath"
+            throw "blackshard validator was not found: $ValidatorPath"
         }
         foreach ($value in @($envelopeCandidate, $payloadCandidate, $publicKeyHex)) {
             if ($value.Contains('"')) { throw "Validator arguments must not contain quote characters." }
@@ -175,12 +175,12 @@ try {
         if (-not $validator.WaitForExit(15000)) {
             $validator.Kill()
             $validator.WaitForExit()
-            throw "Blackshard definition validation exceeded 15 seconds."
+            throw "blackshard definition validation exceeded 15 seconds."
         }
         if ($validator.ExitCode -ne 0) {
-            throw "Blackshard rejected the newly signed definition update (exit $($validator.ExitCode))."
+            throw "blackshard rejected the newly signed definition update (exit $($validator.ExitCode))."
         }
-        Write-Host "Blackshard client validation: passed"
+        Write-Host "blackshard client validation: passed"
     }
 
     $payloadOutput = Join-Path $outputFullPath $payloadFileName

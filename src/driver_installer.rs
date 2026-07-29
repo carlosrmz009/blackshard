@@ -1,6 +1,6 @@
 //! Privileged installer entry points for the signed minifilter package.
 //!
-//! These helpers are intentionally narrow. They accept only the Blackshard INF
+//! These helpers are intentionally narrow. They accept only the blackshard INF
 //! and rely on Windows Driver Store/code-integrity policy to authenticate the
 //! catalog and driver. The production bootstrapper performs stricter signing
 //! validation before it invokes this mode.
@@ -110,13 +110,13 @@ fn read_inf_altitude(path: &Path) -> Result<String, String> {
                 .all(|byte| byte.is_ascii_digit() || byte == b'.')
             || altitude.bytes().filter(|byte| *byte == b'.').count() > 1
         {
-            return Err("the Blackshard instance altitude is malformed".to_owned());
+            return Err("the blackshard instance altitude is malformed".to_owned());
         }
         matches.push(altitude.to_owned());
     }
     if matches.len() != 1 {
         return Err(format!(
-            "the driver INF must contain exactly one Blackshard instance altitude (found {})",
+            "the driver INF must contain exactly one blackshard instance altitude (found {})",
             matches.len()
         ));
     }

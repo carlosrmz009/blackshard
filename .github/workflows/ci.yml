@@ -89,7 +89,7 @@ jobs:
             "blackshard-amsi-x64.dll",
             "blackshard-amsi-x86.dll",
             "clamav-runtime.zip",
-            "BlackshardVmSetup.exe"
+            "blackshard-vm-setup.exe"
           )
 
           foreach ($file in $required) {
@@ -169,7 +169,7 @@ jobs:
 
           .\target\release\blackshard-service.exe --validate-definition-payload $compact
           if ($LASTEXITCODE -ne 0) {
-            throw "Blackshard rejected the compact MalwareBazaar historical corpus."
+            throw "blackshard rejected the compact MalwareBazaar historical corpus."
           }
 
   publish-testing-candidate:
@@ -196,7 +196,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: veryveryunstable
         run: |
-          $asset = Join-Path $PWD "release-assets/BlackshardVmSetup.exe"
+          $asset = Join-Path $PWD "release-assets/blackshard-vm-setup.exe"
           if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
             throw "Missing release asset: $asset"
           }
@@ -205,6 +205,19 @@ jobs:
           if ($mainHead -ne $env:GITHUB_SHA) {
             Write-Host "Skipping release upload because a newer main commit exists: $mainHead"
             exit 0
+          }
+
+          $publishedName = Split-Path -Leaf $asset
+          $legacyAssets = @(gh release view $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --json assets `
+            --jq ".assets[].name" | Where-Object {
+              $_ -ne $publishedName -and $_ -match "(?i)^blackshard(?:vmsetup|-vm-setup)\.exe$"
+            })
+          foreach ($legacyAsset in $legacyAssets) {
+            gh release delete-asset $env:RELEASE_TAG $legacyAsset `
+              --repo $env:GITHUB_REPOSITORY `
+              --yes 2>$null
           }
 
           gh release upload $env:RELEASE_TAG $asset `

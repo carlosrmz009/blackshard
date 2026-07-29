@@ -10,10 +10,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $driverName = "blackshard"
-$protectionServiceName = "BlackshardProtectionService"
+$protectionServiceName = "blackshard-protection-service"
 $driverPath = Join-Path $env:SystemRoot "System32\drivers\blackshard.sys"
+$agentDirectory = Join-Path $env:ProgramFiles "blackshard"
 $applicationNames = @("blackshard-service.exe", "blackshard-ui.exe")
-$healthPath = Join-Path $env:ProgramData "Blackshard\service-health.json"
+$healthPath = Join-Path $env:ProgramData "blackshard\service-health.json"
 $healthSchemaVersion = 4
 
 function Invoke-ServiceQuery {
@@ -70,9 +71,21 @@ if (Test-Path -LiteralPath $driverPath -PathType Leaf) {
 
 $applicationsPresent = $true
 $applicationsSigned = $true
-Write-Host "`n=== Blackshard application signatures ===" -ForegroundColor Cyan
+$applicationAclHealthy = $true
+if (Test-Path -LiteralPath $agentDirectory -PathType Container) {
+    $agentAcl = Get-Acl -LiteralPath $agentDirectory
+    $applicationAclHealthy = -not $agentAcl.AreAccessRulesProtected
+    Write-Host "`n=== blackshard application-directory ACL ===" -ForegroundColor Cyan
+    if ($applicationAclHealthy) {
+        Write-Host "Program Files inheritance is enabled, including Windows application-package read/execute access."
+    }
+    else {
+        Write-Host "Program Files inheritance is disabled. WinRT dependencies can fail with status 0xC0000022." -ForegroundColor Red
+    }
+}
+Write-Host "`n=== blackshard application signatures ===" -ForegroundColor Cyan
 foreach ($applicationName in $applicationNames) {
-    $installedPath = Join-Path $env:ProgramFiles "Blackshard\$applicationName"
+    $installedPath = Join-Path $env:ProgramFiles "blackshard\$applicationName"
     $localPath = Join-Path $PSScriptRoot $applicationName
     $applicationPath = if (Test-Path -LiteralPath $installedPath -PathType Leaf) {
         $installedPath
@@ -167,6 +180,7 @@ $productionHealthy = (
     $protectionService.Running -and
     $healthHealthy -and
     $applicationsPresent -and
+    $applicationAclHealthy -and
     $applicationsSigned
 )
 $developmentHealthy = (
@@ -175,7 +189,8 @@ $developmentHealthy = (
     $instancesHealthy -and
     $protectionService.Running -and
     $healthHealthy -and
-    $applicationsPresent
+    $applicationsPresent -and
+    $applicationAclHealthy
 )
 
 if (($DevelopmentVm -and $developmentHealthy) -or (-not $DevelopmentVm -and $productionHealthy)) {
@@ -183,13 +198,13 @@ if (($DevelopmentVm -and $developmentHealthy) -or (-not $DevelopmentVm -and $pro
         Write-Host "`n[PASS] The development-VM minifilter and protection service are healthy." -ForegroundColor Green
         Write-Host "Launch .\blackshard-ui.exe and run the harmless protection test. This result is not production qualification."
     } else {
-        Write-Host "`n[PASS] Both Blackshard services, filter attachment, service health, and application signature passed local checks." -ForegroundColor Green
+        Write-Host "`n[PASS] Both blackshard services, filter attachment, service health, and application signature passed local checks." -ForegroundColor Green
         Write-Host "Run the UI's harmless protection test. This diagnostic does not prove detection efficacy or release readiness."
     }
     exit 0
 }
 
-Write-Host "`n[FAIL] Blackshard did not pass all checks for this mode." -ForegroundColor Red
+Write-Host "`n[FAIL] blackshard did not pass all checks for this mode." -ForegroundColor Red
 if (-not $DevelopmentVm) {
     Write-Host "Use -DevelopmentVm only for the legacy unsigned/test-signed disposable-VM workflow."
 }

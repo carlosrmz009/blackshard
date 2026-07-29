@@ -1,4 +1,4 @@
-//! Authenticated, rollback-resistant update staging for Blackshard rule bundles.
+//! Authenticated, rollback-resistant update staging for blackshard rule bundles.
 //!
 //! This module deliberately does not perform network I/O. The caller is
 //! responsible for downloading the envelope and payload with a TLS-validating
@@ -50,7 +50,7 @@ const COPY_BUFFER_BYTES: usize = 256 * 1024;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Metadata signed by the Blackshard update publisher.
+/// Metadata signed by the blackshard update publisher.
 ///
 /// `payload_sha256` and the envelope signature are lower- or upper-case hex on
 /// input. Newly produced files should use lower-case hex for consistency.

@@ -12,7 +12,7 @@ if (-not (Test-Path -LiteralPath $driverPath)) {
     throw "blackshard.sys was not found beside this script."
 }
 
-$subject = "CN=Blackshard Development Test"
+$subject = "CN=blackshard development test"
 $certificate = Get-ChildItem -LiteralPath "Cert:\LocalMachine\My" |
     Where-Object Subject -eq $subject |
     Sort-Object NotAfter -Descending |
@@ -36,13 +36,13 @@ foreach ($store in @("Root", "TrustedPublisher")) {
     $exitCode = $LASTEXITCODE
     $output | Out-Host
     if ($exitCode -ne 0) {
-        throw "Windows could not trust the Blackshard development certificate in LocalMachine\$store (certutil exit code $exitCode)."
+        throw "Windows could not trust the blackshard development certificate in LocalMachine\$store (certutil exit code $exitCode)."
     }
     $trusted = Get-ChildItem -LiteralPath "Cert:\LocalMachine\$store" |
         Where-Object Thumbprint -eq $certificate.Thumbprint |
         Select-Object -First 1
     if (-not $trusted) {
-        throw "The Blackshard development certificate is absent from LocalMachine\$store after certutil reported success."
+        throw "The blackshard development certificate is absent from LocalMachine\$store after certutil reported success."
     }
 }
 

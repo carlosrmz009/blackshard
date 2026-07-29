@@ -69,7 +69,7 @@ $record = [ordered]@{
     }
     services = [ordered]@{
         minifilter = Invoke-Captured { sc.exe query blackshard }
-        protection_service = Invoke-Captured { sc.exe query BlackshardProtectionService }
+        protection_service = Invoke-Captured { sc.exe query blackshard-protection-service }
         filter_instances = Invoke-Captured { fltmc.exe instances -f blackshard }
     }
     verification = $verification

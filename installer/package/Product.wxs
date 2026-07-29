@@ -3,8 +3,8 @@
     xmlns="http://wixtoolset.org/schemas/v4/wxs"
     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
-      Name="Blackshard"
-      Manufacturer="Blackshard Project"
+      Name="blackshard"
+      Manufacturer="blackshard project"
       Version="$(var.ProductVersion)"
       UpgradeCode="{FCD7BF91-C8CB-40CD-99F7-2FDFD431C0A8}"
       Language="1033"
@@ -12,12 +12,12 @@
       Scope="perMachine">
 
     <SummaryInformation
-        Description="Blackshard Windows antivirus client"
-        Manufacturer="Blackshard Project" />
+        Description="blackshard Windows antivirus client"
+        Manufacturer="blackshard project" />
 
     <MajorUpgrade
         Schedule="afterInstallInitialize"
-        DowngradeErrorMessage="A newer version of Blackshard is already installed." />
+        DowngradeErrorMessage="A newer version of blackshard is already installed." />
 
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
@@ -30,13 +30,13 @@
         Sequence="execute" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Blackshard">
+      <Directory Id="INSTALLFOLDER" Name="blackshard">
         <Directory Id="DRIVERPACKAGEFOLDER" Name="DriverPackage" />
       </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="CommonAppDataFolder">
-      <Directory Id="BLACKSHARDDATAFOLDER" Name="Blackshard">
+      <Directory Id="BLACKSHARDDATAFOLDER" Name="blackshard">
         <Directory Id="DEFINITIONSFOLDER" Name="Definitions" />
         <Directory Id="QUARANTINEFOLDER" Name="Quarantine" />
         <Directory Id="STATEFOLDER" Name="State" />
@@ -48,7 +48,7 @@
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="PROGRAMMENUBLACKSHARDFOLDER" Name="Blackshard" />
+      <Directory Id="PROGRAMMENUBLACKSHARDFOLDER" Name="blackshard" />
     </StandardDirectory>
 
     <Component Id="ServiceExecutableComponent" Directory="INSTALLFOLDER" Guid="*">
@@ -59,9 +59,9 @@
           KeyPath="yes" />
       <ServiceInstall
           Id="BlackshardProtectionServiceInstall"
-          Name="BlackshardProtectionService"
-          DisplayName="Blackshard Protection Service"
-          Description="Provides Blackshard real-time malware scanning and quarantine services."
+          Name="blackshard-protection-service"
+          DisplayName="blackshard protection service"
+          Description="Provides blackshard real-time malware scanning and quarantine services."
           Arguments="--service"
           Account="LocalSystem"
           Type="ownProcess"
@@ -78,7 +78,7 @@
       </ServiceInstall>
       <ServiceControl
           Id="BlackshardProtectionServiceControl"
-          Name="BlackshardProtectionService"
+          Name="blackshard-protection-service"
           Start="install"
           Stop="both"
           Remove="uninstall"
@@ -112,7 +112,7 @@
       <RegistryValue
           Root="HKLM"
           Key="Software\Microsoft\AMSI\Providers\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
-          Value="Blackshard AMSI Provider"
+          Value="blackshard AMSI provider"
           Type="string"
           KeyPath="yes" />
     </Component>
@@ -136,7 +136,7 @@
       <RegistryValue
           Root="HKLM"
           Key="Software\Microsoft\AMSI\Providers\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
-          Value="Blackshard AMSI Provider"
+          Value="blackshard AMSI provider"
           Type="string"
           KeyPath="yes" />
     </Component>
@@ -217,7 +217,7 @@
       </CreateFolder>
       <RegistryValue
           Root="HKLM"
-          Key="Software\Blackshard"
+          Key="Software\blackshard"
           Name="Installed"
           Type="integer"
           Value="1"
@@ -227,19 +227,19 @@
     <Component Id="StartMenuShortcutComponent" Directory="PROGRAMMENUBLACKSHARDFOLDER" Guid="*">
       <Shortcut
           Id="BlackshardStartMenuShortcut"
-          Name="Blackshard"
-          Description="Open the Blackshard Windows client"
+          Name="blackshard"
+          Description="Open the blackshard Windows client"
           Target="[#BlackshardUiExecutable]"
           WorkingDirectory="INSTALLFOLDER">
         <!-- Must match notifications::APP_USER_MODEL_ID exactly. -->
         <ShortcutProperty
             Key="System.AppUserModel.ID"
-            Value="Blackshard.Security.Client" />
+            Value="blackshard.security.client" />
       </Shortcut>
       <RemoveFolder Id="RemoveProgramMenuBlackshardFolder" On="uninstall" />
       <RegistryValue
           Root="HKLM"
-          Key="Software\Blackshard"
+          Key="Software\blackshard"
           Name="StartMenuShortcut"
           Type="integer"
           Value="1"
@@ -255,13 +255,13 @@
       <RegistryValue
           Root="HKLM"
           Key="Software\Microsoft\Windows\CurrentVersion\Run"
-          Name="BlackshardNotificationAgent"
+          Name="blackshard-notification-agent"
           Type="string"
           Value="&quot;[#BlackshardServiceExecutable]&quot; --notification-agent"
           KeyPath="yes" />
     </Component>
 
-    <Feature Id="Complete" Title="Blackshard" Level="1">
+    <Feature Id="Complete" Title="blackshard" Level="1">
       <ComponentRef Id="ServiceExecutableComponent" />
       <ComponentRef Id="UiExecutableComponent" />
       <ComponentRef Id="AmsiX64Component" />

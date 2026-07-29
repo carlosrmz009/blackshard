@@ -1,6 +1,6 @@
 use std::path::Path;
 
-pub const APP_USER_MODEL_ID: &str = "Blackshard.Security.Client";
+pub const APP_USER_MODEL_ID: &str = "blackshard.security.client";
 
 #[derive(Debug, Clone, Copy)]
 pub enum NotificationSeverity {
@@ -47,14 +47,14 @@ pub fn notify_detection(threat_name: &str, path: &Path, isolated: bool) -> Resul
     let action = if isolated {
         "The file was moved to quarantine."
     } else {
-        "Blackshard detected the file but could not remove the original."
+        "blackshard detected the file but could not remove the original."
     };
     let message = format!("{threat_name}\n{}\n{action}", path.display());
     show_notification(
         if isolated {
-            "Blackshard blocked a threat"
+            "blackshard blocked a threat"
         } else {
-            "Blackshard needs your attention"
+            "blackshard needs your attention"
         },
         &message,
         if isolated {
@@ -71,6 +71,6 @@ mod tests {
 
     #[test]
     fn app_identity_is_stable_for_installer_registration() {
-        assert_eq!(APP_USER_MODEL_ID, "Blackshard.Security.Client");
+        assert_eq!(APP_USER_MODEL_ID, "blackshard.security.client");
     }
 }

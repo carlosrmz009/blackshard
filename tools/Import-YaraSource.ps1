@@ -62,7 +62,7 @@ try { $sourceText = $strictUtf8.GetString($sourceBytes) } catch { throw 'YARA so
 if ($sourceText.Contains([char]0)) { throw 'YARA source must not contain NUL bytes.' }
 
 $bundle = Get-Content -LiteralPath $BaseBundlePath -Raw | ConvertFrom-Json
-if ([int]$bundle.schema_version -ne 2) { throw 'Only Blackshard definition schema 2 can be extended.' }
+if ([int]$bundle.schema_version -ne 2) { throw 'Only blackshard definition schema 2 can be extended.' }
 foreach ($propertyName in @('exact_sha256', 'yara_bundles', 'similarity_profiles', 'sources')) {
     $property = $bundle.PSObject.Properties[$propertyName]
     if ($null -eq $property) {

@@ -126,7 +126,7 @@ $compileArguments = @(
     "/Fo:$object"
 )
 
-Write-Host "[*] Compiling Blackshard minifilter with WDK $wdkVersion..." -ForegroundColor Cyan
+Write-Host "[*] Compiling blackshard minifilter with WDK $wdkVersion..." -ForegroundColor Cyan
 & $compiler @compileArguments
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

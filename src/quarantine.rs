@@ -66,7 +66,7 @@ impl QuarantineStore {
         let base = std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        Self::new(base.join("Blackshard").join("Quarantine"))
+        Self::new(base.join("blackshard").join("Quarantine"))
     }
 
     pub fn root(&self) -> &Path {
@@ -132,7 +132,7 @@ impl QuarantineStore {
         if expected_size > MAX_QUARANTINE_SOURCE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the candidate exceeds Blackshard's hard quarantine size limit",
+                "the candidate exceeds blackshard's hard quarantine size limit",
             ));
         }
         if expected_sha256.len() != 64
@@ -373,10 +373,10 @@ impl QuarantineStore {
                     records.push(record)
                 }
                 Err(error) => {
-                    eprintln!("Blackshard ignored corrupt quarantine metadata {path:?}: {error}");
+                    eprintln!("blackshard ignored corrupt quarantine metadata {path:?}: {error}");
                 }
                 Ok(_) => {
-                    eprintln!("Blackshard ignored mismatched quarantine metadata {path:?}");
+                    eprintln!("blackshard ignored mismatched quarantine metadata {path:?}");
                 }
             }
         }
@@ -450,7 +450,7 @@ impl QuarantineStore {
             } else if &magic != CONTAINER_MAGIC_V2 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "invalid Blackshard quarantine container",
+                    "invalid blackshard quarantine container",
                 ));
             }
 

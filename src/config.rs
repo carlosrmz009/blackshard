@@ -72,7 +72,7 @@ impl Settings {
         let base = std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        base.join("Blackshard").join("settings.json")
+        base.join("blackshard").join("settings.json")
     }
 
     pub fn is_excluded(&self, path: &Path) -> bool {

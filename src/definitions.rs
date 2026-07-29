@@ -82,7 +82,7 @@ pub fn configured_trusted_public_key() -> Result<Option<[u8; 32]>, String> {
     Ok(Some(key))
 }
 
-/// Versioned, signed-payload format for Blackshard malware definitions.
+/// Versioned, signed-payload format for blackshard malware definitions.
 ///
 /// The signature and freshness metadata live in `SignedUpdateEnvelope`, not
 /// inside this object. All nested objects reject unknown fields so a publisher
@@ -970,7 +970,7 @@ impl DefinitionStore {
         std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("Blackshard")
+            .join("blackshard")
             .join("Definitions")
     }
 

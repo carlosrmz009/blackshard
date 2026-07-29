@@ -888,7 +888,7 @@ mod windows_transport {
         if caller.component == TrustedClientComponent::Unknown {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the caller is not an authorized installed Blackshard component",
+                "the caller is not an authorized installed blackshard component",
             ));
         }
         Ok(caller)
@@ -1084,7 +1084,7 @@ mod windows_transport {
             return false;
         };
         let marker = program_data
-            .join("BlackshardDevelopmentInstaller")
+            .join("blackshard-development-installer")
             .join("development-ipc-policy");
         fs::symlink_metadata(marker)
             .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
@@ -1452,7 +1452,7 @@ mod windows_transport {
                 let data_root = std::env::var_os("PROGRAMDATA")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                    .join("Blackshard");
+                    .join("blackshard");
                 let active =
                     crate::freshclam::downloader::active_database(&data_root).map_err(|error| {
                         RpcFailure {

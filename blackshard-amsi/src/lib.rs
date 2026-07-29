@@ -53,7 +53,7 @@ impl IAntimalwareProvider_Impl for BlackshardAmsiProvider {
     fn CloseSession(&self, _session: u64) {}
 
     fn DisplayName(&self) -> Result<PWSTR> {
-        let name = "Blackshard AMSI Provider\0"
+        let name = "blackshard AMSI provider\0"
             .encode_utf16()
             .collect::<Vec<_>>();
         unsafe {
@@ -109,7 +109,7 @@ impl IClassFactory_Impl for ProviderFactory {
 }
 
 #[no_mangle]
-/// Returns the COM class factory for the Blackshard AMSI provider.
+/// Returns the COM class factory for the blackshard AMSI provider.
 ///
 /// # Safety
 ///
