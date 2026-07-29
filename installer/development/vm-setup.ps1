@@ -444,6 +444,7 @@ if (-not (Test-Administrator)) {
     Invoke-SelfElevated
 }
 
+Write-Output "blackshard_ui:PROGRESS:2:Validating the virtual-machine safety boundary."
 Write-Output "blackshard_ui:STATUS:Validating the virtual-machine safety boundary."
 Assert-DisposableVirtualMachine
 
@@ -468,6 +469,7 @@ if ($ResumeAfterReboot) {
 Assert-SecureBootDisabled
 $testSigningActive = Test-TestSigningActive
 Write-Output "blackshard_ui:STATUS:Staging the protected installer payload."
+Write-Output "blackshard_ui:PROGRESS:10:Staging the protected installer payload."
 Copy-InstallerPayload
 try { Start-Transcript -LiteralPath $bootstrapLogPath -Append | Out-Null } catch {}
 try {
@@ -478,11 +480,13 @@ try {
     }
     Write-Host "[*] Enabling Windows test-signing mode for the disposable VM..." -ForegroundColor Yellow
     Write-Output "blackshard_ui:STATUS:Enabling Windows test-signing for the disposable VM."
+    Write-Output "blackshard_ui:PROGRESS:20:Enabling Windows test-signing for the disposable VM."
     & bcdedit.exe /set testsigning on | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "Windows could not enable test-signing. Disable Secure Boot in this disposable VM and retry."
     }
     Register-ResumeTask -RegisterInteractiveCompletion
+    Write-Output "blackshard_ui:PROGRESS:25:Restarting Windows to activate the development driver."
     Write-Output "blackshard_ui:REBOOT_PENDING"
     Write-Host "[+] Setup will automatically resume during the next VM boot." -ForegroundColor Green
     Show-SetupMessage -Message @"

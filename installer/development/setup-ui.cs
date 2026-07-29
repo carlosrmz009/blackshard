@@ -11,10 +11,10 @@ namespace blackshardDevelopmentSetup
 {
     internal sealed class SetupForm : Form
     {
-        private static readonly Color Background = Color.FromArgb(14, 16, 16);
-        private static readonly Color Surface = Color.FromArgb(25, 28, 28);
+        private static readonly Color Background = Color.Black;
+        private static readonly Color Surface = Color.FromArgb(25, 25, 25);
         private static readonly Color Muted = Color.FromArgb(145, 154, 154);
-        private static readonly Color Accent = Color.FromArgb(0, 255, 90);
+        private static readonly Color Accent = Color.Yellow;
         private static readonly Color Failure = Color.FromArgb(255, 76, 76);
 
         private readonly Label statusLabel;
@@ -25,6 +25,7 @@ namespace blackshardDevelopmentSetup
         private readonly Button copyButton;
         private readonly TextBox logBox;
         private readonly ProgressBar progress;
+        private RingProgress ringProgress;
         private Process setupProcess;
         private bool rebootPending;
         private bool installComplete;
@@ -179,8 +180,253 @@ namespace blackshardDevelopmentSetup
                 Location = new Point(24, 481)
             });
 
+            ApplyModernLayout();
             FormClosing += OnFormClosing;
             AppendLog("Waiting for confirmation. No system changes have been made.");
+        }
+
+        private void ApplyModernLayout()
+        {
+            Controls.Clear();
+            WindowState = FormWindowState.Maximized;
+            FormBorderStyle = FormBorderStyle.None;
+            MinimumSize = Size.Empty;
+            MaximumSize = Size.Empty;
+            BackColor = Color.Black;
+            KeyPreview = true;
+            Padding = new Padding(42);
+
+            var layout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 2,
+                RowCount = 1
+            };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45F));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55F));
+            Controls.Add(layout);
+
+            var left = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 1,
+                RowCount = 3,
+                Padding = new Padding(10, 0, 55, 0)
+            };
+            left.RowStyles.Add(new RowStyle(SizeType.Percent, 24F));
+            left.RowStyles.Add(new RowStyle(SizeType.Percent, 68F));
+            left.RowStyles.Add(new RowStyle(SizeType.Percent, 8F));
+            layout.Controls.Add(left, 0, 0);
+            left.Controls.Add(BuildInstallerBrand(), 0, 0);
+
+            ringProgress = new RingProgress
+            {
+                Dock = DockStyle.Fill,
+                ProgressValue = 0,
+                RingColor = Accent,
+                Margin = new Padding(30, 12, 30, 12)
+            };
+            left.Controls.Add(ringProgress, 0, 1);
+
+            confirmation.Dock = DockStyle.Fill;
+            confirmation.AutoSize = false;
+            confirmation.TextAlign = ContentAlignment.MiddleCenter;
+            confirmation.BackColor = Color.Black;
+            confirmation.Font = FontResolver.CreateDisplay(10F, FontStyle.Regular);
+            left.Controls.Add(confirmation, 0, 2);
+
+            var right = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 1,
+                RowCount = 3,
+                Padding = new Padding(25, 40, 30, 28)
+            };
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 23F));
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 67F));
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 10F));
+            layout.Controls.Add(right, 1, 0);
+
+            var actions = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(20, 35, 20, 35)
+            };
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48F));
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52F));
+            right.Controls.Add(actions, 0, 0);
+
+            installButton.Text = "install";
+            installButton.Dock = DockStyle.Fill;
+            installButton.Margin = new Padding(0, 0, 38, 0);
+            installButton.Font = FontResolver.CreateDisplay(28F, FontStyle.Regular);
+            installButton.FlatAppearance.BorderSize = 0;
+            ApplyRoundedButton(installButton, 30);
+            actions.Controls.Add(installButton, 0, 0);
+
+            copyButton.Text = "copy log";
+            copyButton.Dock = DockStyle.Fill;
+            copyButton.Margin = new Padding(0);
+            copyButton.Font = FontResolver.CreateDisplay(28F, FontStyle.Regular);
+            copyButton.BackColor = Color.White;
+            copyButton.ForeColor = Color.Black;
+            copyButton.FlatAppearance.BorderSize = 0;
+            ApplyRoundedButton(copyButton, 30);
+            actions.Controls.Add(copyButton, 1, 0);
+
+            openButton.Visible = false;
+            progress.Visible = false;
+
+            var logSurface = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Surface,
+                Padding = new Padding(24),
+                Margin = new Padding(0, 0, 0, 18)
+            };
+            right.Controls.Add(logSurface, 0, 1);
+            logBox.Dock = DockStyle.Fill;
+            logBox.BackColor = Surface;
+            logBox.ForeColor = Color.White;
+            logBox.BorderStyle = BorderStyle.None;
+            logBox.Font = FontResolver.CreateMono(10.5F, FontStyle.Regular);
+            logSurface.Controls.Add(logBox);
+
+            var statusArea = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 1,
+                RowCount = 2
+            };
+            statusArea.RowStyles.Add(new RowStyle(SizeType.Percent, 45F));
+            statusArea.RowStyles.Add(new RowStyle(SizeType.Percent, 55F));
+            statusLabel.Text = "ready to install";
+            statusLabel.Dock = DockStyle.Fill;
+            statusLabel.AutoSize = false;
+            statusLabel.TextAlign = ContentAlignment.BottomLeft;
+            statusLabel.Font = FontResolver.CreateMono(12F, FontStyle.Bold);
+            statusArea.Controls.Add(statusLabel, 0, 0);
+            detailLabel.Text = "Installs full protection in this disposable development VM.";
+            detailLabel.Dock = DockStyle.Fill;
+            detailLabel.AutoSize = false;
+            detailLabel.TextAlign = ContentAlignment.TopLeft;
+            detailLabel.Font = FontResolver.CreateDisplay(10F, FontStyle.Regular);
+            statusArea.Controls.Add(detailLabel, 0, 1);
+            right.Controls.Add(statusArea, 0, 2);
+
+            KeyDown += delegate(object sender, KeyEventArgs eventArgs)
+            {
+                if (eventArgs.KeyCode == Keys.Escape)
+                {
+                    Close();
+                }
+            };
+            UpdateInstallButtonAvailability();
+        }
+
+        private static Control BuildInstallerBrand()
+        {
+            var brand = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 2,
+                RowCount = 1
+            };
+            brand.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170F));
+            brand.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            var logoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo.png");
+            if (File.Exists(logoPath))
+            {
+                try
+                {
+                    using (var source = Image.FromFile(logoPath))
+                    {
+                        brand.Controls.Add(new PictureBox
+                        {
+                            Image = new Bitmap(source),
+                            Dock = DockStyle.Fill,
+                            SizeMode = PictureBoxSizeMode.Zoom,
+                            BackColor = Color.Black,
+                            Margin = new Padding(0, 0, 20, 0)
+                        }, 0, 0);
+                    }
+                }
+                catch
+                {
+                }
+            }
+            var text = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 1,
+                RowCount = 2
+            };
+            text.RowStyles.Add(new RowStyle(SizeType.Percent, 62F));
+            text.RowStyles.Add(new RowStyle(SizeType.Percent, 38F));
+            text.Controls.Add(new Label
+            {
+                Text = "blackshard",
+                Dock = DockStyle.Fill,
+                ForeColor = Color.White,
+                TextAlign = ContentAlignment.BottomLeft,
+                Font = FontResolver.CreateMono(35F, FontStyle.Bold)
+            }, 0, 0);
+            text.Controls.Add(new Label
+            {
+                Text = "prototype",
+                Dock = DockStyle.Fill,
+                ForeColor = Failure,
+                TextAlign = ContentAlignment.TopLeft,
+                Font = FontResolver.CreateMono(21F, FontStyle.Bold)
+            }, 0, 1);
+            brand.Controls.Add(text, 1, 0);
+            return brand;
+        }
+
+        private static void ApplyRoundedButton(Button button, int radius)
+        {
+            EventHandler reshape = delegate
+            {
+                if (button.Width <= 0 || button.Height <= 0)
+                {
+                    return;
+                }
+                using (var path = RoundedRectangle(
+                    new Rectangle(0, 0, button.Width, button.Height),
+                    radius
+                ))
+                {
+                    var previous = button.Region;
+                    button.Region = new Region(path);
+                    if (previous != null)
+                    {
+                        previous.Dispose();
+                    }
+                }
+            };
+            button.Resize += reshape;
+            reshape(button, EventArgs.Empty);
+        }
+
+        private static GraphicsPath RoundedRectangle(Rectangle bounds, int radius)
+        {
+            var diameter = radius * 2;
+            var path = new GraphicsPath();
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180F, 90F);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270F, 90F);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0F, 90F);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90F, 90F);
+            path.CloseFigure();
+            return path;
         }
 
         private static Button CreateButton(string text, Point location, Size size, bool primary)
@@ -205,9 +451,9 @@ namespace blackshardDevelopmentSetup
         {
             var enabled = confirmation.Checked && setupProcess == null && !rebootPending;
             installButton.Enabled = enabled;
-            installButton.BackColor = enabled ? Accent : Surface;
+            installButton.BackColor = enabled ? Accent : Color.FromArgb(48, 48, 48);
             installButton.ForeColor = enabled ? Background : Muted;
-            installButton.FlatAppearance.BorderColor = enabled ? Accent : Color.FromArgb(65, 72, 72);
+            installButton.FlatAppearance.BorderColor = enabled ? Accent : Color.FromArgb(48, 48, 48);
         }
 
         private void StartSetup(object sender, EventArgs eventArgs)
@@ -223,7 +469,9 @@ namespace blackshardDevelopmentSetup
             installButton.FlatAppearance.BorderColor = Color.FromArgb(65, 72, 72);
             confirmation.Enabled = false;
             progress.Style = ProgressBarStyle.Marquee;
-            SetStatus("INITIALIZING", "Validating the VM and preparing the protected installer payload.", Accent);
+            ringProgress.ProgressValue = 5;
+            ringProgress.RingColor = Accent;
+            SetStatus("initializing", "Validating the VM and preparing the protected installer payload.", Accent);
             AppendLog("Starting elevated blackshard setup engine...");
 
             var script = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "vm-setup.ps1");
@@ -278,14 +526,29 @@ namespace blackshardDevelopmentSetup
             if (line.StartsWith("blackshard_ui:STATUS:", StringComparison.Ordinal))
             {
                 var message = line.Substring("blackshard_ui:STATUS:".Length);
-                SetStatus("INSTALLING", message, Accent);
+                SetStatus("installing", message, Accent);
                 AppendLog(message);
+                return;
+            }
+            if (line.StartsWith("blackshard_ui:PROGRESS:", StringComparison.Ordinal))
+            {
+                var payload = line.Substring("blackshard_ui:PROGRESS:".Length);
+                var separator = payload.IndexOf(':');
+                int value;
+                if (separator > 0 && int.TryParse(payload.Substring(0, separator), out value))
+                {
+                    ringProgress.ProgressValue = value;
+                    var message = payload.Substring(separator + 1).Trim();
+                    SetStatus("installing", message, Accent);
+                    AppendLog(message);
+                }
                 return;
             }
             if (line == "blackshard_ui:REBOOT_PENDING")
             {
                 rebootPending = true;
-                SetStatus("REBOOT SCHEDULED", "Windows will restart and setup will resume automatically.", Accent);
+                ringProgress.ProgressValue = Math.Max(ringProgress.ProgressValue, 25);
+                SetStatus("reboot scheduled", "Windows will restart and setup will resume automatically.", Accent);
                 AppendLog("Restart scheduled. Setup will continue as LocalSystem during boot.");
                 return;
             }
@@ -298,7 +561,8 @@ namespace blackshardDevelopmentSetup
             if (line.StartsWith("blackshard_ui:ERROR:", StringComparison.Ordinal))
             {
                 failureDetail = line.Substring("blackshard_ui:ERROR:".Length).Trim();
-                SetStatus("INSTALLATION FAILED", "The setup engine reported an error. See the activity log below.", Failure);
+                ringProgress.RingColor = Failure;
+                SetStatus("installation failed", "The setup engine reported an error. See the activity log below.", Failure);
                 AppendLog("ERROR: " + failureDetail);
                 return;
             }
@@ -317,7 +581,8 @@ namespace blackshardDevelopmentSetup
 
             if (exitCode == 0 && (installComplete || File.Exists(@"C:\Program Files\blackshard\blackshard-ui.exe")) && !rebootPending)
             {
-                SetStatus("PROTECTION ONLINE", "Installation and verification completed.", Accent);
+                ringProgress.ProgressValue = 100;
+                SetStatus("protection online", "Installation and verification completed.", Accent);
                 AppendLog("Opening the blackshard completion experience.");
                 LaunchCompletionExperience();
                 Close();
@@ -325,18 +590,19 @@ namespace blackshardDevelopmentSetup
             }
             else if (exitCode == 0 && rebootPending)
             {
-                SetStatus("REBOOT SCHEDULED", "Leave this window open; Windows will restart and setup will continue during boot.", Accent);
+                SetStatus("reboot scheduled", "Windows will restart and setup will continue during boot.", Accent);
             }
             else
             {
+                ringProgress.RingColor = Failure;
                 var detail = !string.IsNullOrWhiteSpace(immediateError)
                     ? immediateError
                     : !string.IsNullOrWhiteSpace(failureDetail)
                         ? "The setup engine reported an error. Review and copy the activity log below."
                         : "Setup exited with code " + exitCode + ". Review and copy the activity log below.";
-                SetStatus("INSTALLATION FAILED", detail, Failure);
+                SetStatus("installation failed", detail, Failure);
                 AppendLog("Setup failed. Persistent logs: %TEMP%\\blackshard-vm-setup.log and C:\\ProgramData\\blackshard-development-installer\\setup.log");
-                installButton.Text = "RETRY INSTALLATION";
+                installButton.Text = "retry";
             }
             confirmation.Enabled = true;
             UpdateInstallButtonAvailability();
