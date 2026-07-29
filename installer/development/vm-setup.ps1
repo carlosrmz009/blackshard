@@ -19,6 +19,8 @@ $uninstallRegistryPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninst
 $runOnceRegistryPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
 $startMenuShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Blackshard.lnk"
 $bootstrapLogPath = Join-Path $env:TEMP "BlackshardVmSetup.log"
+$immediateInstallTimeoutSeconds = 300
+$serviceReadinessTimeoutSeconds = 180
 
 function Test-SystemAccount {
     return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq "S-1-5-18"
@@ -237,7 +239,12 @@ function Install-AllComponents {
     $installer = Join-Path $stageRoot "install.ps1"
     $verifier = Join-Path $stageRoot "verify.ps1"
     & $installer
-    & $verifier -DevelopmentVm
+    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    & $powerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $verifier `
+        -DevelopmentVm -WaitSeconds $serviceReadinessTimeoutSeconds
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blackshard components were installed, but runtime verification failed (exit code $LASTEXITCODE)."
+    }
     Install-ShortcutsAndRegistration
 
     New-Item -Path $runOnceRegistryPath -Force | Out-Null
@@ -258,7 +265,7 @@ function Start-ImmediateSystemInstall {
     Register-ResumeTask
     Start-ScheduledTask -TaskName $taskName
     $marker = $successPath
-    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+    for ($attempt = 0; $attempt -lt $immediateInstallTimeoutSeconds; $attempt++) {
         if (Test-Path -LiteralPath $marker -PathType Leaf) {
             Write-Output "BLACKSHARD_UI:INSTALL_COMPLETE"
             Show-SetupMessage -Message @"
@@ -286,7 +293,7 @@ The LocalSystem protection service and minifilter are now active. Open Blackshar
     } else {
         "The LocalSystem worker did not create its log."
     }
-    throw "The SYSTEM installation did not finish within two minutes (task state: $taskState; last result: $lastResult).`n`n$tail`n`nFull worker log: $logPath"
+    throw "The SYSTEM installation did not finish within $immediateInstallTimeoutSeconds seconds (task state: $taskState; last result: $lastResult).`n`n$tail`n`nFull worker log: $logPath"
 }
 
 function Remove-AllComponents {

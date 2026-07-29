@@ -1,7 +1,9 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
 param(
-    [switch]$DevelopmentVm
+    [switch]$DevelopmentVm,
+    [ValidateRange(0, 600)]
+    [int]$WaitSeconds = 0
 )
 
 Set-StrictMode -Version Latest
@@ -12,6 +14,7 @@ $protectionServiceName = "BlackshardProtectionService"
 $driverPath = Join-Path $env:SystemRoot "System32\drivers\blackshard.sys"
 $applicationNames = @("blackshard-service.exe", "blackshard-ui.exe")
 $healthPath = Join-Path $env:ProgramData "Blackshard\service-health.json"
+$healthSchemaVersion = 4
 
 function Invoke-ServiceQuery {
     param(
@@ -96,24 +99,47 @@ foreach ($applicationName in $applicationNames) {
 
 $healthHealthy = $false
 Write-Host "`n=== Protection-service health ===" -ForegroundColor Cyan
-if (Test-Path -LiteralPath $healthPath -PathType Leaf) {
+$health = $null
+$healthError = $null
+$healthDeadline = [DateTimeOffset]::UtcNow.AddSeconds($WaitSeconds)
+do {
+    $healthError = $null
+    if (-not (Test-Path -LiteralPath $healthPath -PathType Leaf)) {
+        $healthError = "Health file not found: $healthPath"
+    }
+    else {
+        try {
+            $candidate = Get-Content -LiteralPath $healthPath -Raw | ConvertFrom-Json
+            $updatedAt = [DateTimeOffset]::Parse([string]$candidate.updated_at)
+            $ageSeconds = ([DateTimeOffset]::UtcNow - $updatedAt.ToUniversalTime()).TotalSeconds
+            $healthHealthy = (
+                [int]$candidate.schema_version -eq $healthSchemaVersion -and
+                [string]$candidate.lifecycle -eq "running" -and
+                [string]$candidate.connection -eq "connected" -and
+                [string]$candidate.readiness -eq "Ready" -and
+                [bool]$candidate.real_time_enabled -and
+                -not [bool]$candidate.external_rules_suppressed -and
+                $ageSeconds -ge -5 -and
+                $ageSeconds -le 15
+            )
+            $health = $candidate
+        }
+        catch {
+            $healthError = "Could not validate $healthPath`: $($_.Exception.Message)"
+            $healthHealthy = $false
+        }
+    }
+    if ($healthHealthy -or [DateTimeOffset]::UtcNow -ge $healthDeadline) {
+        break
+    }
+    Start-Sleep -Seconds 1
+} while ($true)
+
+if ($null -ne $health) {
     try {
-        $health = Get-Content -LiteralPath $healthPath -Raw | ConvertFrom-Json
         $health | Format-List | Out-Host
-        $updatedAt = [DateTimeOffset]::Parse([string]$health.updated_at)
-        $ageSeconds = ([DateTimeOffset]::UtcNow - $updatedAt.ToUniversalTime()).TotalSeconds
-        $healthHealthy = (
-            [int]$health.schema_version -eq 3 -and
-            [string]$health.lifecycle -eq "running" -and
-            [string]$health.connection -eq "connected" -and
-            [string]$health.readiness -eq "Ready" -and
-            [bool]$health.real_time_enabled -and
-            -not [bool]$health.external_rules_suppressed -and
-            $ageSeconds -ge -5 -and
-            $ageSeconds -le 15
-        )
         if (-not $healthHealthy) {
-            Write-Host "Health is stale or does not report running, connected real-time protection." -ForegroundColor Red
+            Write-Host "Health did not report current, connected real-time protection within $WaitSeconds seconds." -ForegroundColor Red
         }
         $driverBypasses = [uint64]$health.counters.service_unavailable_bypasses +
             [uint64]$health.counters.object_resolution_bypasses +
@@ -128,8 +154,9 @@ if (Test-Path -LiteralPath $healthPath -PathType Leaf) {
         Write-Host "Could not validate $healthPath`: $($_.Exception.Message)" -ForegroundColor Red
         $healthHealthy = $false
     }
-} else {
-    Write-Host "Health file not found: $healthPath" -ForegroundColor Red
+}
+elseif ($null -ne $healthError) {
+    Write-Host $healthError -ForegroundColor Red
 }
 
 $productionHealthy = (
