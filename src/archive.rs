@@ -449,8 +449,7 @@ mod tests {
 
     #[test]
     fn exact_signature_is_found_inside_zip() {
-        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
-        let zip = make_zip(&[("invoice.txt", eicar)]);
+        let zip = make_zip(&[("invoice.txt", crate::self_test::PAYLOAD)]);
         let engine = DetectionEngine::builtin().unwrap();
         let result = inspect_zip(&zip, |bytes| engine.scan_leaf_bytes(bytes));
         assert_eq!(result.scanned_entries, 1);
@@ -494,13 +493,12 @@ mod tests {
 
     #[test]
     fn office_zip_recurses_into_bounded_ole_streams() {
-        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
         let mut compound = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
         compound.create_storage("/VBA").unwrap();
         compound
             .create_stream("/VBA/Module1")
             .unwrap()
-            .write_all(eicar)
+            .write_all(crate::self_test::PAYLOAD)
             .unwrap();
         let ole = compound.into_inner().into_inner();
         let zip = make_zip(&[("word/vbaProject.bin", &ole)]);
@@ -521,9 +519,8 @@ mod tests {
 
     #[test]
     fn exact_signature_is_found_inside_gzip() {
-        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(eicar).unwrap();
+        encoder.write_all(crate::self_test::PAYLOAD).unwrap();
         let gzip = encoder.finish().unwrap();
         let engine = DetectionEngine::builtin().unwrap();
         let result = inspect_gzip(&gzip, |bytes| engine.scan_leaf_bytes(bytes));

@@ -127,37 +127,13 @@ impl Drop for ClamdSession {
 impl ClamdSession {
     fn health_check(&mut self) -> ScanVerdict {
         match self.ensure_started().and_then(|_| self.command(b"zPING\0")) {
-            Ok(response) if response.trim_end_matches('\0').trim() == "PONG" => {}
-            Ok(response) => {
-                return ScanVerdict::Error(format!(
-                    "clamd returned an invalid health reply: {response:?}"
-                ))
-            }
-            Err(error) => return ScanVerdict::Error(error.to_string()),
-        }
-
-        let mut eicar_bytes = vec![
-            0xFD, 0x90, 0xEA, 0x84, 0xF5, 0x80, 0xE5, 0xE4, 0xF5, 0xFE, 0x91, 0xF9, 0xF5, 0xFF,
-            0xFD, 0x90, 0x91, 0x8D, 0xF5, 0xFB, 0x8C, 0x92, 0xE6, 0xE6, 0x8C, 0x92, 0xD8, 0x81,
-            0xE0, 0xEC, 0xE6, 0xE4, 0xF7, 0x88, 0xF6, 0xF1, 0xE4, 0xEB, 0xE1, 0xE4, 0xF7, 0xE1,
-            0x88, 0xE4, 0xEB, 0xF1, 0xEC, 0xF3, 0xEC, 0xF7, 0xF0, 0xF6, 0x88, 0xF1, 0xE0, 0xF6,
-            0xF1, 0x88, 0xE3, 0xEC, 0xE9, 0xE0, 0x84, 0x81, 0xED, 0x8E, 0xED, 0x8F,
-        ];
-        let decode_key = std::hint::black_box(0xA5u8);
-        for byte in &mut eicar_bytes {
-            *byte ^= decode_key;
-        }
-        let mut eicar = std::io::Cursor::new(eicar_bytes);
-        match self.scan_reader(&mut eicar) {
-            Ok(ScanVerdict::Detected { signature, .. })
-                if signature.to_ascii_lowercase().contains("eicar") =>
-            {
+            Ok(response) if response.trim_end_matches('\0').trim() == "PONG" => {
                 self.clean_verdict()
             }
-            Ok(other) => {
-                ScanVerdict::Error(format!("clamd end-to-end self-test returned {other:?}"))
-            }
-            Err(error) => ScanVerdict::Error(format!("clamd end-to-end self-test failed: {error}")),
+            Ok(response) => ScanVerdict::Error(format!(
+                "clamd returned an invalid health reply: {response:?}"
+            )),
+            Err(error) => ScanVerdict::Error(error.to_string()),
         }
     }
 

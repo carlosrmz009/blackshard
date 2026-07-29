@@ -1037,19 +1037,10 @@ fn shared_system_amsi() -> Result<Arc<AmsiScanner>, String> {
 mod tests {
     use super::*;
 
-    fn eicar() -> Vec<u8> {
-        [
-            "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-",
-            "ANTIVIRUS-TEST-FILE!$H+H*",
-        ]
-        .concat()
-        .into_bytes()
-    }
-
     #[test]
-    fn eicar_is_malicious_and_quarantinable() {
+    fn harmless_self_test_is_malicious_and_quarantinable() {
         let engine = DetectionEngine::builtin().unwrap();
-        let report = engine.scan_bytes(&eicar());
+        let report = engine.scan_bytes(crate::self_test::PAYLOAD);
         assert_eq!(report.verdict, DetectionVerdict::Malicious);
         assert!(report.should_quarantine());
         assert!(report.automatic_quarantine_eligible);
