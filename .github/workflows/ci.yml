@@ -239,13 +239,46 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Fuzz byte scanner
+        id: fuzz_byte_scanner
+        continue-on-error: true
         shell: cmd
         run: |
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
-          cargo +nightly fuzz run scan_bytes -- -runs=10000 -max_len=1048576
+          cargo +nightly fuzz run scan_bytes -- -runs=10000 -max_len=1048576 -timeout=10 -print_final_stats=1
 
       - name: Fuzz VBA decompressor
+        id: fuzz_vba_decompressor
+        continue-on-error: true
         shell: cmd
         run: |
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
-          cargo +nightly fuzz run vba_decompress -- -runs=10000 -max_len=1048576
+          cargo +nightly fuzz run vba_decompress -- -runs=10000 -max_len=1048576 -timeout=10 -print_final_stats=1
+
+      - name: Upload fuzz failure reproducers
+        if: >-
+          always() &&
+          (steps.fuzz_byte_scanner.outcome == 'failure' ||
+          steps.fuzz_vba_decompressor.outcome == 'failure')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Report fuzz failure
+        if: >-
+          always() &&
+          (steps.fuzz_byte_scanner.outcome == 'failure' ||
+          steps.fuzz_vba_decompressor.outcome == 'failure')
+        shell: pwsh
+        run: |
+          $failedTargets = @()
+          if ("${{ steps.fuzz_byte_scanner.outcome }}" -eq "failure") {
+            $failedTargets += "scan_bytes"
+          }
+          if ("${{ steps.fuzz_vba_decompressor.outcome }}" -eq "failure") {
+            $failedTargets += "vba_decompress"
+          }
+
+          throw "Fuzzing failed for: $($failedTargets -join ', '). Download the fuzz-failure artifact for reproducers."
