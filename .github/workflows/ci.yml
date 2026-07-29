@@ -2,7 +2,35 @@ name: security-ci
 
 on:
   push:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/ci.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "blackshard-amsi/**"
+      - "src/**"
+      - "fuzz/**"
+      - "!fuzz/**/*.md"
+      - "installer/**"
+      - "!installer/**/*.md"
+      - "tools/**"
+      - "*.bat"
+      - "*.ps1"
   pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/ci.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "blackshard-amsi/**"
+      - "src/**"
+      - "fuzz/**"
+      - "!fuzz/**/*.md"
+      - "installer/**"
+      - "!installer/**/*.md"
+      - "tools/**"
+      - "*.bat"
+      - "*.ps1"
   workflow_dispatch:
   schedule:
     - cron: "17 4 * * *"
