@@ -14,6 +14,11 @@ const SOURCE_URL: &str = "https://bazaar.abuse.ch/export/";
 const MAX_EXPORT_BYTES: u64 = 768 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+struct ParsedExport {
+    digests: Vec<[u8; 32]>,
+    content_sha256: String,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("definition compiler failed: {error}");
@@ -49,22 +54,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut bundle = DefinitionBundle::from_json(&std::fs::read(&base_bundle_path)?)?;
     bundle.bundle_id = bundle_id;
 
-    let (digests, content_sha256) = read_export(&export_path)?;
+    let parsed_export = read_export(&export_path)?;
     bundle.sources.retain(|source| source.provider != PROVIDER);
     bundle.sources.push(DefinitionProvenance {
         provider: PROVIDER.to_owned(),
         source_url: SOURCE_URL.to_owned(),
         retrieved_at: Utc::now(),
-        content_sha256,
+        content_sha256: parsed_export.content_sha256,
         license:
             "abuse.ch community export fair use and terms apply; review required before redistribution"
                 .to_owned(),
     });
 
-    let count = digests.len();
+    let count = parsed_export.digests.len();
     let payload = DefinitionPayload::to_compact_bytes(
         bundle,
-        digests,
+        parsed_export.digests,
         "MalwareBazaar.Historical".to_owned(),
         None,
     )?;
@@ -77,7 +82,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_export(path: &Path) -> Result<(Vec<[u8; 32]>, String), Box<dyn Error>> {
+fn read_export(path: &Path) -> Result<ParsedExport, Box<dyn Error>> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EXPORT_BYTES {
         return Err(format!(
@@ -115,7 +120,10 @@ fn read_export(path: &Path) -> Result<(Vec<[u8; 32]>, String), Box<dyn Error>> {
     }
     digests.sort_unstable();
     digests.dedup();
-    Ok((digests, hex::encode(source_hash.finalize())))
+    Ok(ParsedExport {
+        digests,
+        content_sha256: hex::encode(source_hash.finalize()),
+    })
 }
 
 fn first_isolated_sha256(line: &[u8]) -> Option<[u8; 32]> {

@@ -58,10 +58,11 @@ pub struct DetectionReport {
     /// signature. YARA/heuristic matches can still report malicious or
     /// suspicious findings, but cannot trigger destructive automatic action.
     pub automatic_quarantine_eligible: bool,
-    /// True for a trusted exact signature or a Windows AMSI provider/policy
-    /// detection. Publisher-defined YARA classifications remain alert-only
-    /// until independently corroborated. Unlike quarantine, an execution deny
-    /// is reversible and does not mutate the candidate.
+    /// True for a trusted labelled exact signature, a signed historical hash
+    /// reputation match, or a Windows AMSI provider/policy detection.
+    /// Publisher-defined YARA classifications remain alert-only until
+    /// independently corroborated. Unlike quarantine, an execution deny is
+    /// reversible and does not mutate the candidate.
     pub execution_block_eligible: bool,
 }
 
@@ -878,6 +879,14 @@ impl EvidenceCascade {
                 .evidence
                 .iter()
                 .any(|evidence| evidence.code == "signature.exact_sha256");
+        let reputation_block_eligible = self.static_report.verdict == StaticVerdict::Malicious
+            && !self.static_report.truncated
+            && self.static_report.sha256.is_some()
+            && self
+                .static_report
+                .evidence
+                .iter()
+                .any(|evidence| evidence.code == "signature.reputation_sha256");
 
         let malicious_rule = self
             .rule_matches
@@ -912,7 +921,8 @@ impl EvidenceCascade {
             .as_ref()
             .is_some_and(AmsiScanReport::should_block_execution);
 
-        let mut block_eligible = automatic_quarantine_eligible || amsi_policy_block;
+        let mut block_eligible =
+            automatic_quarantine_eligible || reputation_block_eligible || amsi_policy_block;
         let mut threat_name = None;
         let mut confidence = self.static_report.confidence;
         let mut risk_score = self.static_report.risk_score;

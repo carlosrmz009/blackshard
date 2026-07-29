@@ -110,6 +110,7 @@ jobs:
         run: |
           $first = Join-Path $env:RUNNER_TEMP "malwarebazaar-first.bundle"
           $second = Join-Path $env:RUNNER_TEMP "malwarebazaar-second.bundle"
+          $compact = Join-Path $env:RUNNER_TEMP "malwarebazaar-full.bundle"
 
           .\tools\Import-MalwareBazaar.ps1 `
             -OutputPath $first `
@@ -127,6 +128,20 @@ jobs:
           $bundle = Get-Content -LiteralPath $second -Raw | ConvertFrom-Json
           if ($bundle.exact_sha256.Count -ne 2 -or $bundle.sources.Count -ne 1) {
             throw "MalwareBazaar importer did not preserve its deduplicated candidate records."
+          }
+
+          .\tools\Import-MalwareBazaar.ps1 `
+            -BaseBundlePath $second `
+            -OutputPath $compact `
+            -BundleId malwarebazaar-ci-full `
+            -FullHistory `
+            -FullExportPath .\tools\testdata\malwarebazaar-full.csv `
+            -DefinitionCompilerPath .\target\release\blackshard-definition-compiler.exe `
+            -AcceptAbuseChTerms
+
+          .\target\release\blackshard-service.exe --validate-definition-payload $compact
+          if ($LASTEXITCODE -ne 0) {
+            throw "Blackshard rejected the compact MalwareBazaar historical corpus."
           }
 
   dependency-audit:

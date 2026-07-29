@@ -1598,6 +1598,8 @@ mod tests {
             .unwrap();
         let report = loaded.engine.scan_bytes(target);
         assert_eq!(report.verdict, DetectionVerdict::Malicious);
+        assert!(!report.should_quarantine());
+        assert!(report.should_block());
         assert!(report
             .static_report
             .expect("static report")

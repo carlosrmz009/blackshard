@@ -203,6 +203,7 @@ impl std::error::Error for ConfigError {}
 pub struct ExactSignature {
     pub name: String,
     pub family: Option<String>,
+    pub automatic_quarantine_eligible: bool,
 }
 
 /// Exact SHA-256 signatures trusted by the engine owner.
@@ -265,6 +266,7 @@ impl SignatureDatabase {
             ExactSignature {
                 name: name.into(),
                 family,
+                automatic_quarantine_eligible: true,
             },
         ))
     }
@@ -280,7 +282,7 @@ impl SignatureDatabase {
         self.compact_sha256[start..end]
             .binary_search(digest)
             .ok()
-            .and_then(|_| self.compact_signature.as_ref())
+            .and(self.compact_signature.as_ref())
     }
 
     /// Installs a sorted, duplicate-free compact corpus. A 16-bit prefix
@@ -317,6 +319,7 @@ impl SignatureDatabase {
         self.compact_signature = Some(ExactSignature {
             name: name.into(),
             family,
+            automatic_quarantine_eligible: false,
         });
         Ok(())
     }
@@ -512,7 +515,11 @@ impl ScanEngine {
                     .unwrap_or_default();
                 push_evidence(
                     &mut evidence,
-                    "signature.exact_sha256",
+                    if signature.automatic_quarantine_eligible {
+                        "signature.exact_sha256"
+                    } else {
+                        "signature.reputation_sha256"
+                    },
                     EvidenceSeverity::Critical,
                     100,
                     format!("matched exact signature {}{family}", signature.name),
@@ -1432,6 +1439,38 @@ mod tests {
         assert!(signatures
             .replace_compact_sha256(vec![last, first], "invalid", None)
             .is_err());
+    }
+
+    #[test]
+    fn compact_corpus_handles_malwarebazaar_scale() {
+        const COUNT: usize = 1_200_000;
+        let mut digests = Vec::with_capacity(COUNT);
+        for index in 0..COUNT {
+            let scaled = ((index as u128) * (u64::MAX as u128) / (COUNT as u128)) as u64;
+            let mut digest = [0u8; 32];
+            digest[..8].copy_from_slice(&scaled.to_be_bytes());
+            digests.push(digest);
+        }
+        let probes = (0..10_000)
+            .map(|index| digests[(index * 997) % COUNT])
+            .collect::<Vec<_>>();
+        let mut signatures = SignatureDatabase::empty();
+        signatures
+            .replace_compact_sha256(digests, "MalwareBazaar.Historical", None)
+            .unwrap();
+        assert_eq!(signatures.len(), COUNT);
+
+        let started = std::time::Instant::now();
+        for probe in probes {
+            assert!(signatures.lookup(&probe).is_some());
+            let mut miss = probe;
+            miss[31] = 1;
+            assert!(signatures.lookup(&miss).is_none());
+        }
+        eprintln!(
+            "20,000 compact lookups across {COUNT} hashes completed in {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

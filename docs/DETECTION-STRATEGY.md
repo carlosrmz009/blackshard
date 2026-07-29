@@ -25,22 +25,26 @@ A future learned PE model must be distributed as signed, versioned data; expose 
 
 - Blackshard's Ed25519-signed online bundle is the only direct client trust path.
 - Every development-package build resolves the latest stable official ClamAV Windows x64 release without a version pin, verifies GitHub's published archive SHA-256 and the detached release signature with the current Cisco Talos key published in the official ClamAV documentation, and records the resolved version and signing fingerprint in `clamav-runtime.json`. Official `freshclam` and `sigtool` verify and atomically activate versioned databases every four hours without user intervention. One `clamd` child remains resident inside the worker job so definitions are compiled once; Blackshard streams bytes from the identity-validated open handle using `INSTREAM` instead of exposing a replaceable pathname.
-- `Import-MalwareBazaar.ps1` uses the authenticated abuse.ch Community API to import only family-labelled recent detections as exact SHA-256 candidate definitions. It never downloads malware samples, deduplicates against an optional base bundle, records response provenance, enforces the 100,000-record client limit, and cannot affect endpoints until the resulting candidate is reviewed and published through Blackshard's signed definition-update workflow.
+- MalwareBazaar contributes both the authenticated full historical SHA-256 export and up to 168 hours of recent family labels. Schema-3 definition payloads store the complete sorted corpus as raw 32-byte digests and build a 65,536-bucket prefix directory at load time; this avoids per-record strings and limits lookups to one small bucket. Recent labelled records remain in the schema-2 header and override the generic historical label. A historical-only match may reversibly block execution but cannot authorize automatic quarantine; the source itself warns that inclusion is not an absolute guarantee. No malware samples are downloaded.
 - YARA Forge core releases are useful upstream material, not automatic policy. Each included subset needs provenance/license review, YARA-X compilation, policy assignment, match-rate analysis, and clean-corpus qualification.
 - Public multi-engine or sample-upload services are not silently queried. Uploading user files creates privacy, confidentiality, API-license, availability, and attacker-oracle risks.
 
-To prepare a MalwareBazaar candidate, obtain an abuse.ch Auth-Key, keep it out of source control, and run:
+To prepare a complete MalwareBazaar candidate, obtain an abuse.ch Auth-Key, keep it out of source control, and build the publisher-only compiler:
 
 ```powershell
 $env:MALWAREBAZAAR_AUTH_KEY = '<auth-key>'
-.\tools\Import-MalwareBazaar.ps1 `
-    -BaseBundlePath .\publisher\current.bundle `
-    -OutputPath .\publisher\candidates\malwarebazaar.bundle `
+cargo build --release --bin blackshard-definition-compiler
+
+.\tools\Build-StaticDefinitionFeed.ps1 `
+    <# existing feed, signing-key, ClamAV, sequence, and URL arguments #> `
+    -IncludeMalwareBazaar `
+    -AcceptClamAvGpl2 `
     -AcceptAbuseChTerms
 ```
 
-The default import window is the API maximum of 168 hours. Re-running against an unchanged window is idempotent and succeeds with zero new records when the base bundle already contains the hashes.
-`Build-StaticDefinitionFeed.ps1 -IncludeMalwareBazaar -AcceptAbuseChTerms` adds the same import before the existing validation, signing, and publication step.
+Each publication rebuilds recent labels first, downloads the hourly full hash export, sorts and deduplicates it with the native compiler, validates the compact payload with the real Blackshard service, and only then signs and publishes it. `Update-DefinitionFeed.ps1` adds an exclusive publisher lock and derives the next monotonic sequence automatically, so it can be invoked hourly by the production scheduler. Client update checks remain jittered every four hours to avoid synchronized load.
+
+The full compact payload supports up to 8,000,000 SHA-256 records and 256 MiB. At 1.2 million hashes, raw digest storage is approximately 36.6 MiB plus a 256 KiB prefix directory. The exact-hash lookup happens only after Blackshard has already computed the file's full SHA-256, so it adds no file reads and no background per-file database scan.
 
 ## Required parity evidence
 
