@@ -65,6 +65,13 @@ if (-not $csc) {
 }
 
 $uiSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "development\setup-ui.cs") "VM setup UI source"
+$fontRoot = Join-Path $PSScriptRoot "..\assets\fonts"
+$interRegular = Resolve-RequiredFile (Join-Path $fontRoot "Inter-Regular.ttf") "Inter Regular font"
+$interBold = Resolve-RequiredFile (Join-Path $fontRoot "Inter-Bold.ttf") "Inter Bold font"
+$jetBrainsMonoRegular = Resolve-RequiredFile (Join-Path $fontRoot "JetBrainsMono-Regular.ttf") "JetBrains Mono Regular font"
+$jetBrainsMonoBold = Resolve-RequiredFile (Join-Path $fontRoot "JetBrainsMono-Bold.ttf") "JetBrains Mono Bold font"
+$interLicense = Resolve-RequiredFile (Join-Path $fontRoot "LICENSE-Inter.txt") "Inter license"
+$jetBrainsMonoLicense = Resolve-RequiredFile (Join-Path $fontRoot "LICENSE-JetBrainsMono.txt") "JetBrains Mono license"
 $uiExecutable = Join-Path $buildRoot "blackshard-setup-ui.exe"
 $uiManifest = Join-Path $buildRoot "blackshard-setup-ui.manifest"
 $manifest = @"
@@ -96,6 +103,12 @@ $compiler = Start-Process -FilePath $csc -ArgumentList @(
     "/reference:System.dll",
     "/reference:System.Drawing.dll",
     "/reference:System.Windows.Forms.dll",
+    ('/resource:"{0}",blackshard.fonts.Inter.Regular.ttf' -f $interRegular),
+    ('/resource:"{0}",blackshard.fonts.Inter.Bold.ttf' -f $interBold),
+    ('/resource:"{0}",blackshard.fonts.JetBrainsMono.Regular.ttf' -f $jetBrainsMonoRegular),
+    ('/resource:"{0}",blackshard.fonts.JetBrainsMono.Bold.ttf' -f $jetBrainsMonoBold),
+    ('/resource:"{0}",blackshard.fonts.Inter.LICENSE.txt' -f $interLicense),
+    ('/resource:"{0}",blackshard.fonts.JetBrainsMono.LICENSE.txt' -f $jetBrainsMonoLicense),
     ('/out:"{0}"' -f $uiExecutable),
     ('"{0}"' -f $uiSource)
 ) -WorkingDirectory $buildRoot -WindowStyle Hidden -Wait -PassThru

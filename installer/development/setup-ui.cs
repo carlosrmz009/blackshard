@@ -1,8 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
@@ -735,25 +739,91 @@ namespace blackshardDevelopmentSetup
 
     internal static class FontResolver
     {
+        private static readonly PrivateFontCollection Fonts = new PrivateFontCollection();
+        private static readonly List<IntPtr> FontMemory = new List<IntPtr>();
+        private static readonly FontFamily DisplayFamily;
+        private static readonly FontFamily MonoFamily;
+
+        static FontResolver()
+        {
+            Load("blackshard.fonts.Inter.Regular.ttf");
+            Load("blackshard.fonts.Inter.Bold.ttf");
+            Load("blackshard.fonts.JetBrainsMono.Regular.ttf");
+            Load("blackshard.fonts.JetBrainsMono.Bold.ttf");
+            DisplayFamily = Find("Inter");
+            MonoFamily = Find("JetBrains Mono");
+        }
+
         internal static Font CreateDisplay(float size, FontStyle style)
         {
-            return Create("Helvetica Now Display", "Arial", size, style);
+            return Create(DisplayFamily, size, style);
         }
 
         internal static Font CreateMono(float size, FontStyle style)
         {
-            return Create("JetBrains Mono", "Consolas", size, style);
+            return Create(MonoFamily, size, style);
         }
 
-        private static Font Create(string preferred, string fallback, float size, FontStyle style)
+        private static Font Create(FontFamily family, float size, FontStyle style)
         {
-            var font = new Font(preferred, size, style, GraphicsUnit.Point);
-            if (!font.Name.Equals(preferred, StringComparison.OrdinalIgnoreCase))
+            if (!family.IsStyleAvailable(style))
             {
-                font.Dispose();
-                font = new Font(fallback, size, style, GraphicsUnit.Point);
+                throw new InvalidOperationException(
+                    "Embedded font style " + style + " is unavailable for " + family.Name + "."
+                );
             }
-            return font;
+            return new Font(family, size, style, GraphicsUnit.Point);
+        }
+
+        private static void Load(string resourceName)
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            using (var stream = assembly.GetManifestResourceStream(resourceName))
+            {
+                if (stream == null)
+                {
+                    throw new InvalidOperationException("Embedded font resource is missing: " + resourceName);
+                }
+                if (stream.Length > int.MaxValue)
+                {
+                    throw new InvalidOperationException("Embedded font resource is too large: " + resourceName);
+                }
+                var data = new byte[(int)stream.Length];
+                var offset = 0;
+                while (offset < data.Length)
+                {
+                    var read = stream.Read(data, offset, data.Length - offset);
+                    if (read == 0)
+                    {
+                        throw new EndOfStreamException("Embedded font resource is incomplete: " + resourceName);
+                    }
+                    offset += read;
+                }
+                var memory = Marshal.AllocCoTaskMem(data.Length);
+                Marshal.Copy(data, 0, memory, data.Length);
+                try
+                {
+                    Fonts.AddMemoryFont(memory, data.Length);
+                    FontMemory.Add(memory);
+                }
+                catch
+                {
+                    Marshal.FreeCoTaskMem(memory);
+                    throw;
+                }
+            }
+        }
+
+        private static FontFamily Find(string name)
+        {
+            foreach (var family in Fonts.Families)
+            {
+                if (family.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return family;
+                }
+            }
+            throw new InvalidOperationException("Embedded font family is unavailable: " + name);
         }
     }
 
