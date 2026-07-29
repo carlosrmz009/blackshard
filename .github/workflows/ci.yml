@@ -144,6 +144,45 @@ jobs:
             throw "Blackshard rejected the compact MalwareBazaar historical corpus."
           }
 
+  publish-testing-candidate:
+    name: Publish testing candidate
+    needs: rust
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: testing-candidate-release
+      cancel-in-progress: true
+
+    steps:
+      - name: Download development test package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: blackshard-development-x64
+          path: release-assets
+
+      - name: Replace testing candidate installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: veryveryunstable
+        run: |
+          $asset = Join-Path $PWD "release-assets/BlackshardVmSetup.exe"
+          if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+            throw "Missing release asset: $asset"
+          }
+
+          $mainHead = gh api "repos/$env:GITHUB_REPOSITORY/commits/main" --jq .sha
+          if ($mainHead -ne $env:GITHUB_SHA) {
+            Write-Host "Skipping release upload because a newer main commit exists: $mainHead"
+            exit 0
+          }
+
+          gh release upload $env:RELEASE_TAG $asset `
+            --repo $env:GITHUB_REPOSITORY `
+            --clobber
+
   dependency-audit:
     runs-on: ubuntu-latest
 
