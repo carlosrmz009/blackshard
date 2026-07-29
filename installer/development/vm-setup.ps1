@@ -233,10 +233,8 @@ function Remove-ResumeTask {
 
 function Register-CompletionRunOnce {
     New-Item -Path $runOnceRegistryPath -Force | Out-Null
-    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $completionScript = Join-Path $stageRoot "vm-setup.ps1"
-    $completionCommand = '"{0}" -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -CompleteForUser' -f `
-        $powerShell, $completionScript
+    $monitor = Join-Path $stageRoot "blackshard-setup-ui.exe"
+    $completionCommand = '"{0}" --resume-monitor' -f $monitor
     New-ItemProperty -Path $runOnceRegistryPath -Name $runOnceValueName `
         -Value $completionCommand -PropertyType String -Force | Out-Null
 }
@@ -283,24 +281,41 @@ function Install-AllComponents {
     Set-Content -LiteralPath (Join-Path $stageRoot "development-ipc-policy") `
         -Value "Disposable VM development policy. Unsigned clients are restricted to this protected installation directory." `
         -Encoding UTF8 -Force
+    Write-Output "blackshard_ui:PROGRESS:15:Preparing the protected installation."
     Write-Output "blackshard_ui:STATUS:Trusting the VM development certificate and signing the minifilter."
+    Write-Output "blackshard_ui:PROGRESS:25:Trusting the VM certificate and signing the minifilter."
     & (Join-Path $stageRoot "enable-test-signing.ps1") -SkipBootConfiguration
     Write-Output "blackshard_ui:STATUS:Installing the kernel minifilter and LocalSystem protection service."
+    Write-Output "blackshard_ui:PROGRESS:45:Installing the protection service, UI, and minifilter."
     $installer = Join-Path $stageRoot "install.ps1"
     $verifier = Join-Path $stageRoot "verify.ps1"
     & $installer
+    Write-Output "blackshard_ui:PROGRESS:70:Validating real-time protection and malware intelligence."
     $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     & $powerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $verifier `
         -DevelopmentVm -WaitSeconds $serviceReadinessTimeoutSeconds
     if ($LASTEXITCODE -ne 0) {
         throw "blackshard components were installed, but runtime verification failed (exit code $LASTEXITCODE)."
     }
+    Write-Output "blackshard_ui:PROGRESS:90:Creating shortcuts and registering blackshard."
     Install-ShortcutsAndRegistration
+    foreach ($completionArtifact in @(
+        $installedUi,
+        $installedOobe,
+        $installedIcon,
+        $startMenuShortcut,
+        $desktopShortcut
+    )) {
+        if (-not (Test-Path -LiteralPath $completionArtifact -PathType Leaf)) {
+            throw "Installation completion artifact is missing: $completionArtifact"
+        }
+    }
 
     Set-Content -LiteralPath $successPath `
         -Value ("Installed and verified at {0:o}" -f (Get-Date)) -Encoding UTF8
     Remove-Item -LiteralPath $failurePath -Force -ErrorAction SilentlyContinue
     Remove-ResumeTask
+    Write-Output "blackshard_ui:PROGRESS:100:Installation completed successfully."
     Write-Output "blackshard_ui:INSTALL_COMPLETE"
 
     Write-Host "[+] blackshard UI, LocalSystem service, and minifilter are installed and verified." -ForegroundColor Green
@@ -371,10 +386,6 @@ function Show-UserCompletion {
             -Title "blackshard VM setup" -ErrorMessage $true
         return
     }
-
-    Get-Process -Name "blackshard-setup-ui" -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 350
 
     Add-Type -AssemblyName PresentationCore
     Add-Type -AssemblyName PresentationFramework
