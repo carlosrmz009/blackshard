@@ -2,6 +2,8 @@ name: security-ci
 
 on:
   push:
+    branches:
+      - main
     paths:
       - ".cargo/**"
       - ".github/workflows/ci.yml"
