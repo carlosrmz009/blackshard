@@ -108,8 +108,8 @@ impl IClassFactory_Impl for ProviderFactory {
     }
 }
 
+#[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-
 pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
     riid: *const GUID,
