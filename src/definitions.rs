@@ -27,10 +27,15 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub const DEFINITION_SCHEMA_VERSION: u32 = 2;
+pub const COMPACT_DEFINITION_SCHEMA_VERSION: u32 = 3;
 
 /// A hard pre-parse bound. JSON has meaningful allocation amplification, so
 /// this intentionally remains much smaller than the updater's generic limit.
 pub const MAX_DEFINITION_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
+/// Compact payloads store SHA-256 digests as raw bytes, allowing millions of
+/// exact signatures without JSON allocation amplification.
+pub const MAX_DEFINITION_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_COMPACT_SHA256_SIGNATURES: usize = 8_000_000;
 pub const MAX_EXACT_SIGNATURES: usize = 100_000;
 pub const MAX_YARA_BUNDLES: usize = 64;
 pub const MAX_YARA_SOURCE_BYTES: usize = 1024 * 1024;
@@ -46,6 +51,8 @@ const MAX_NAMESPACE_BYTES: usize = 64;
 const MAX_RULE_IDENTIFIER_BYTES: usize = 128;
 const MAX_DESCRIPTION_BYTES: usize = 512;
 const BUILTIN_NAMESPACE: &str = "blackshard_builtin";
+const COMPACT_PAYLOAD_MAGIC: &[u8; 16] = b"BLACKSHARD-CDB3\0";
+const COMPACT_PAYLOAD_PREFIX_BYTES: usize = 16 + 4 + 8;
 const TRUSTED_PUBLIC_KEY_HEX: Option<&str> = option_env!("BLACKSHARD_DEFINITION_PUBLIC_KEY_HEX");
 
 /// Returns the release publisher's compile-time Ed25519 verification key.
@@ -143,6 +150,207 @@ pub struct DefinitionProvenance {
     pub retrieved_at: DateTime<Utc>,
     pub content_sha256: String,
     pub license: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompactDefinitionHeader {
+    schema_version: u32,
+    bundle: DefinitionBundle,
+    compact_sha256: CompactHashHeader,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompactHashHeader {
+    count: u64,
+    threat_name: String,
+    family: Option<String>,
+}
+
+/// A validated definition payload. Schema-2 JSON remains supported while the
+/// schema-3 container adds one sorted, compact SHA-256 corpus.
+#[derive(Debug, Clone)]
+pub struct DefinitionPayload {
+    pub bundle: DefinitionBundle,
+    pub compact_sha256: Vec<[u8; 32]>,
+    pub compact_threat_name: Option<String>,
+    pub compact_family: Option<String>,
+}
+
+impl DefinitionPayload {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DefinitionError> {
+        if !bytes.starts_with(COMPACT_PAYLOAD_MAGIC) {
+            return Ok(Self {
+                bundle: DefinitionBundle::from_json(bytes)?,
+                compact_sha256: Vec::new(),
+                compact_threat_name: None,
+                compact_family: None,
+            });
+        }
+        if bytes.len() > MAX_DEFINITION_PAYLOAD_BYTES {
+            return Err(DefinitionError::BundleTooLarge {
+                actual: bytes.len(),
+                maximum: MAX_DEFINITION_PAYLOAD_BYTES,
+            });
+        }
+        if bytes.len() < COMPACT_PAYLOAD_PREFIX_BYTES {
+            return Err(DefinitionError::Serialization(
+                "compact payload prefix is truncated".to_owned(),
+            ));
+        }
+
+        let header_length =
+            u32::from_be_bytes(bytes[16..20].try_into().expect("fixed header slice")) as usize;
+        let count_u64 = u64::from_be_bytes(bytes[20..28].try_into().expect("fixed count slice"));
+        let count = usize::try_from(count_u64).map_err(|_| DefinitionError::LimitExceeded {
+            field: "compact_sha256".to_owned(),
+            actual: usize::MAX,
+            maximum: MAX_COMPACT_SHA256_SIGNATURES,
+        })?;
+        if count > MAX_COMPACT_SHA256_SIGNATURES {
+            return Err(DefinitionError::LimitExceeded {
+                field: "compact_sha256".to_owned(),
+                actual: count,
+                maximum: MAX_COMPACT_SHA256_SIGNATURES,
+            });
+        }
+        if header_length > MAX_DEFINITION_BUNDLE_BYTES {
+            return Err(DefinitionError::BundleTooLarge {
+                actual: header_length,
+                maximum: MAX_DEFINITION_BUNDLE_BYTES,
+            });
+        }
+        let digest_bytes = count.checked_mul(32).ok_or_else(|| {
+            DefinitionError::Serialization("compact digest length overflowed".to_owned())
+        })?;
+        let expected_length = COMPACT_PAYLOAD_PREFIX_BYTES
+            .checked_add(header_length)
+            .and_then(|value| value.checked_add(digest_bytes))
+            .ok_or_else(|| {
+                DefinitionError::Serialization("compact payload length overflowed".to_owned())
+            })?;
+        if bytes.len() != expected_length {
+            return Err(DefinitionError::Serialization(format!(
+                "compact payload length is {}, expected {expected_length}",
+                bytes.len()
+            )));
+        }
+
+        let header_end = COMPACT_PAYLOAD_PREFIX_BYTES + header_length;
+        let header: CompactDefinitionHeader =
+            serde_json::from_slice(&bytes[COMPACT_PAYLOAD_PREFIX_BYTES..header_end])
+                .map_err(|error| DefinitionError::Serialization(error.to_string()))?;
+        if header.schema_version != COMPACT_DEFINITION_SCHEMA_VERSION {
+            return Err(DefinitionError::UnsupportedSchema {
+                found: header.schema_version,
+            });
+        }
+        if header.compact_sha256.count != count_u64 {
+            return Err(DefinitionError::InvalidField {
+                field: "compact_sha256.count".to_owned(),
+                reason: "header count does not match the binary record count".to_owned(),
+            });
+        }
+        header.bundle.validate()?;
+        validate_text(
+            "compact_sha256.threat_name",
+            &header.compact_sha256.threat_name,
+            MAX_THREAT_NAME_BYTES,
+        )?;
+        if let Some(family) = &header.compact_sha256.family {
+            validate_text("compact_sha256.family", family, MAX_FAMILY_BYTES)?;
+        }
+        if count == 0 {
+            return Err(DefinitionError::InvalidField {
+                field: "compact_sha256".to_owned(),
+                reason: "compact corpus must not be empty".to_owned(),
+            });
+        }
+
+        let mut digests = Vec::with_capacity(count);
+        for chunk in bytes[header_end..].chunks_exact(32) {
+            digests.push(chunk.try_into().expect("fixed digest slice"));
+        }
+        if digests.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(DefinitionError::InvalidField {
+                field: "compact_sha256".to_owned(),
+                reason: "digests must be strictly sorted and unique".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            bundle: header.bundle,
+            compact_sha256: digests,
+            compact_threat_name: Some(header.compact_sha256.threat_name),
+            compact_family: header.compact_sha256.family,
+        })
+    }
+
+    pub fn to_compact_bytes(
+        bundle: DefinitionBundle,
+        digests: Vec<[u8; 32]>,
+        threat_name: String,
+        family: Option<String>,
+    ) -> Result<Vec<u8>, DefinitionError> {
+        bundle.validate()?;
+        if digests.is_empty() || digests.len() > MAX_COMPACT_SHA256_SIGNATURES {
+            return Err(DefinitionError::LimitExceeded {
+                field: "compact_sha256".to_owned(),
+                actual: digests.len(),
+                maximum: MAX_COMPACT_SHA256_SIGNATURES,
+            });
+        }
+        if digests.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(DefinitionError::InvalidField {
+                field: "compact_sha256".to_owned(),
+                reason: "digests must be strictly sorted and unique".to_owned(),
+            });
+        }
+        validate_text(
+            "compact_sha256.threat_name",
+            &threat_name,
+            MAX_THREAT_NAME_BYTES,
+        )?;
+        if let Some(value) = &family {
+            validate_text("compact_sha256.family", value, MAX_FAMILY_BYTES)?;
+        }
+
+        let header = CompactDefinitionHeader {
+            schema_version: COMPACT_DEFINITION_SCHEMA_VERSION,
+            compact_sha256: CompactHashHeader {
+                count: digests.len() as u64,
+                threat_name,
+                family,
+            },
+            bundle,
+        };
+        let header_bytes = serde_json::to_vec(&header)
+            .map_err(|error| DefinitionError::Serialization(error.to_string()))?;
+        if header_bytes.len() > MAX_DEFINITION_BUNDLE_BYTES {
+            return Err(DefinitionError::BundleTooLarge {
+                actual: header_bytes.len(),
+                maximum: MAX_DEFINITION_BUNDLE_BYTES,
+            });
+        }
+        let capacity =
+            COMPACT_PAYLOAD_PREFIX_BYTES + header_bytes.len() + digests.len().saturating_mul(32);
+        if capacity > MAX_DEFINITION_PAYLOAD_BYTES {
+            return Err(DefinitionError::BundleTooLarge {
+                actual: capacity,
+                maximum: MAX_DEFINITION_PAYLOAD_BYTES,
+            });
+        }
+        let mut payload = Vec::with_capacity(capacity);
+        payload.extend_from_slice(COMPACT_PAYLOAD_MAGIC);
+        payload.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&(digests.len() as u64).to_be_bytes());
+        payload.extend_from_slice(&header_bytes);
+        for digest in digests {
+            payload.extend_from_slice(&digest);
+        }
+        Ok(payload)
+    }
 }
 
 impl DefinitionBundle {
@@ -743,7 +951,7 @@ pub struct DefinitionStore {
 impl DefinitionStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, UpdateError> {
         Ok(Self {
-            updates: UpdateStore::new(root, MAX_DEFINITION_BUNDLE_BYTES as u64)?,
+            updates: UpdateStore::new(root, MAX_DEFINITION_PAYLOAD_BYTES as u64)?,
         })
     }
 
@@ -879,7 +1087,7 @@ fn load_active_candidate(
     trusted_public_key: &[u8; 32],
     scan_config: ScanConfig,
 ) -> Result<(DetectionEngine, String), CandidateFailure> {
-    let payload = read_bounded_regular(&active.payload_path, MAX_DEFINITION_BUNDLE_BYTES)
+    let payload = read_bounded_regular(&active.payload_path, MAX_DEFINITION_PAYLOAD_BYTES)
         .map_err(|error| CandidateFailure::new(DefinitionIssueStage::Storage, error.to_string()))?;
     let envelope_bytes = read_bounded_regular(&active.envelope_path, MAX_ENVELOPE_BYTES)
         .map_err(|error| CandidateFailure::new(DefinitionIssueStage::Storage, error.to_string()))?;
@@ -893,7 +1101,7 @@ fn load_active_candidate(
         &payload,
         installed_before_candidate,
         now,
-        MAX_DEFINITION_BUNDLE_BYTES as u64,
+        MAX_DEFINITION_PAYLOAD_BYTES as u64,
         trusted_public_key,
     )
     .map_err(|error| {
@@ -914,11 +1122,11 @@ fn load_active_candidate(
         ));
     }
 
-    let bundle = DefinitionBundle::from_json(&payload).map_err(|error| {
+    let definitions = DefinitionPayload::from_bytes(&payload).map_err(|error| {
         CandidateFailure::new(DefinitionIssueStage::Validation, error.to_string())
     })?;
-    let bundle_id = bundle.bundle_id.clone();
-    let engine = build_authenticated_engine(bundle, scan_config).map_err(|error| {
+    let bundle_id = definitions.bundle.bundle_id.clone();
+    let engine = build_authenticated_engine(definitions, scan_config).map_err(|error| {
         CandidateFailure::new(DefinitionIssueStage::Compilation, error.to_string())
     })?;
     Ok((engine, bundle_id))
@@ -934,9 +1142,15 @@ fn build_builtin_engine(scan_config: ScanConfig) -> Result<DetectionEngine, Defi
 /// This function is deliberately private: only bytes re-authenticated by
 /// `load_active_candidate` may reach it.
 fn build_authenticated_engine(
-    bundle: DefinitionBundle,
+    definitions: DefinitionPayload,
     scan_config: ScanConfig,
 ) -> Result<DetectionEngine, DefinitionError> {
+    let DefinitionPayload {
+        bundle,
+        compact_sha256,
+        compact_threat_name,
+        compact_family,
+    } = definitions;
     // Validate again so future internal callers cannot accidentally construct
     // an unchecked bundle and bypass the public parser.
     bundle.validate()?;
@@ -980,6 +1194,18 @@ fn build_authenticated_engine(
                 value: signature.sha256,
             });
         }
+    }
+    if !compact_sha256.is_empty() {
+        signatures
+            .replace_compact_sha256(
+                compact_sha256,
+                compact_threat_name.expect("validated compact signature name"),
+                compact_family,
+            )
+            .map_err(|error| DefinitionError::InvalidField {
+                field: "compact_sha256".to_owned(),
+                reason: error.to_string(),
+            })?;
     }
 
     let rule_bundles = bundle
@@ -1338,6 +1564,65 @@ mod tests {
         assert!(matches!(
             DefinitionBundle::from_json(&oversized),
             Err(DefinitionError::BundleTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn compact_payload_round_trips_and_loads_through_signed_store() {
+        let target = b"historical compact malware fixture";
+        let digest: [u8; 32] = Sha256::digest(target).into();
+        let bundle = exact_bundle("compact-1", b"separate labelled fixture");
+        let payload = DefinitionPayload::to_compact_bytes(
+            bundle,
+            vec![digest],
+            "MalwareBazaar.Historical".to_owned(),
+            None,
+        )
+        .unwrap();
+        let parsed = DefinitionPayload::from_bytes(&payload).unwrap();
+        assert_eq!(parsed.compact_sha256, vec![digest]);
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = DefinitionStore::new(directory.path()).unwrap();
+        store
+            .update_store()
+            .stage_and_activate(
+                &envelope(1, &payload),
+                &payload,
+                now(),
+                &signing_key().verifying_key().to_bytes(),
+            )
+            .unwrap();
+        let loaded = store
+            .load_with_defaults(now(), &signing_key().verifying_key().to_bytes())
+            .unwrap();
+        let report = loaded.engine.scan_bytes(target);
+        assert_eq!(report.verdict, DetectionVerdict::Malicious);
+        assert!(report
+            .static_report
+            .expect("static report")
+            .evidence
+            .iter()
+            .any(|evidence| evidence.description.contains("MalwareBazaar.Historical")));
+    }
+
+    #[test]
+    fn compact_payload_rejects_truncation_and_unsorted_digests() {
+        let bundle = exact_bundle("compact-invalid", b"labelled");
+        let mut payload = DefinitionPayload::to_compact_bytes(
+            bundle,
+            vec![[0x10; 32], [0x20; 32]],
+            "MalwareBazaar.Historical".to_owned(),
+            None,
+        )
+        .unwrap();
+        assert!(DefinitionPayload::from_bytes(&payload[..payload.len() - 1]).is_err());
+
+        let digest_start = payload.len() - 64;
+        payload[digest_start..].rotate_left(32);
+        assert!(matches!(
+            DefinitionPayload::from_bytes(&payload),
+            Err(DefinitionError::InvalidField { .. })
         ));
     }
 

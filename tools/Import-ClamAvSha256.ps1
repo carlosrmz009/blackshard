@@ -29,7 +29,7 @@ if ($BundleId -notmatch '^[A-Za-z0-9._-]{1,128}$') {
 
 $maximumSignatures = 100000
 $bundle = if ([string]::IsNullOrWhiteSpace($BaseBundlePath)) {
-    [ordered]@{
+    [pscustomobject][ordered]@{
         schema_version      = 2
         bundle_id          = $BundleId
         exact_sha256       = @()

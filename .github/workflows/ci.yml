@@ -35,6 +35,8 @@ jobs:
 
       - name: Build minifilter and development distribution
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: .\deploy.ps1
 
       - name: Build one-click VM development installer
@@ -101,6 +103,30 @@ jobs:
 
           if ($failed) {
             exit 1
+          }
+
+      - name: Test MalwareBazaar candidate import
+        shell: pwsh
+        run: |
+          $first = Join-Path $env:RUNNER_TEMP "malwarebazaar-first.bundle"
+          $second = Join-Path $env:RUNNER_TEMP "malwarebazaar-second.bundle"
+
+          .\tools\Import-MalwareBazaar.ps1 `
+            -OutputPath $first `
+            -BundleId malwarebazaar-ci-1 `
+            -ApiResponsePath .\tools\testdata\malwarebazaar-recent-detections.json `
+            -AcceptAbuseChTerms
+
+          .\tools\Import-MalwareBazaar.ps1 `
+            -BaseBundlePath $first `
+            -OutputPath $second `
+            -BundleId malwarebazaar-ci-2 `
+            -ApiResponsePath .\tools\testdata\malwarebazaar-recent-detections.json `
+            -AcceptAbuseChTerms
+
+          $bundle = Get-Content -LiteralPath $second -Raw | ConvertFrom-Json
+          if ($bundle.exact_sha256.Count -ne 2 -or $bundle.sources.Count -ne 1) {
+            throw "MalwareBazaar importer did not preserve its deduplicated candidate records."
           }
 
   dependency-audit:

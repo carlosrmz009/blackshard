@@ -71,9 +71,29 @@ if ([string]::IsNullOrWhiteSpace($OpenSslPath)) {
 if (-not (Test-Path -LiteralPath $OpenSslPath -PathType Leaf)) { throw "OpenSSL was not found: $OpenSslPath" }
 
 $payload = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($BundlePath))
-if ($payload.Length -gt 16MB) { throw "Definition bundle exceeds the 16 MiB client limit." }
-$parsedBundle = [Text.Encoding]::UTF8.GetString($payload) | ConvertFrom-Json
-if ([int]$parsedBundle.schema_version -ne 2) { throw "Definition bundle schema must be 2." }
+$compactMagic = [Text.Encoding]::ASCII.GetBytes("BLACKSHARD-CDB3`0")
+$isCompact = $payload.Length -ge $compactMagic.Length
+for ($index = 0; $isCompact -and $index -lt $compactMagic.Length; $index++) {
+    if ($payload[$index] -ne $compactMagic[$index]) { $isCompact = $false }
+}
+if ($isCompact) {
+    if ($payload.Length -gt 256MB) { throw "Compact definition payload exceeds the 256 MiB client limit." }
+}
+else {
+    if ($payload.Length -gt 16MB) { throw "JSON definition bundle exceeds the 16 MiB client limit." }
+    $parsedBundle = [Text.Encoding]::UTF8.GetString($payload) | ConvertFrom-Json
+    if ([int]$parsedBundle.schema_version -ne 2) { throw "JSON definition bundle schema must be 2." }
+}
+if (-not [string]::IsNullOrWhiteSpace($ValidatorPath)) {
+    if (-not (Test-Path -LiteralPath $ValidatorPath -PathType Leaf)) {
+        throw "Blackshard validator was not found: $ValidatorPath"
+    }
+    & $ValidatorPath --validate-definition-payload ([IO.Path]::GetFullPath($BundlePath))
+    if ($LASTEXITCODE -ne 0) {
+        throw "Blackshard rejected the unsigned definition payload structure."
+    }
+    Write-Host "Blackshard payload validation: passed"
+}
 $payloadHash = [Security.Cryptography.SHA256]::Create()
 try { $payloadDigest = $payloadHash.ComputeHash($payload) } finally { $payloadHash.Dispose() }
 $payloadDigestHex = -join ($payloadDigest | ForEach-Object { $_.ToString('x2') })

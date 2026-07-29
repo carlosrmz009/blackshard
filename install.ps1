@@ -168,7 +168,7 @@ if (Test-Path -LiteralPath $clamRuntimeDirectory -PathType Container) {
     Remove-Item -LiteralPath $clamRuntimeDirectory -Recurse -Force
 }
 Expand-Archive -LiteralPath $sourceClamRuntime -DestinationPath $clamRuntimeDirectory -Force
-foreach ($requiredClamFile in @("clamd.exe", "clamscan.exe", "freshclam.exe", "sigtool.exe")) {
+foreach ($requiredClamFile in @("clamd.exe", "clamscan.exe", "freshclam.exe", "sigtool.exe", "clamav-runtime.json")) {
     if (-not (Test-Path -LiteralPath (Join-Path $clamRuntimeDirectory $requiredClamFile) -PathType Leaf)) {
         throw "The packaged ClamAV runtime is incomplete: missing $requiredClamFile."
     }

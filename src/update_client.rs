@@ -9,7 +9,7 @@
 //! HTTPS origin.
 
 use crate::definitions::{
-    DefinitionBundle, DefinitionSource, DefinitionStore, MAX_DEFINITION_BUNDLE_BYTES,
+    DefinitionPayload, DefinitionSource, DefinitionStore, MAX_DEFINITION_PAYLOAD_BYTES,
 };
 use crate::updater::{
     verify_manifest, verify_update, ActiveUpdate, SignedUpdateEnvelope, UpdateError,
@@ -84,7 +84,7 @@ impl UpdateClientConfig {
             manifest_url: manifest_url.into(),
             allowed_payload_origins: Vec::new(),
             maximum_envelope_bytes: MAX_ENVELOPE_BYTES,
-            maximum_payload_bytes: MAX_DEFINITION_BUNDLE_BYTES as u64,
+            maximum_payload_bytes: MAX_DEFINITION_PAYLOAD_BYTES as u64,
             timeouts: HttpTimeouts::default(),
             scheduler: UpdateScheduler::default(),
             check_on_start: true,
@@ -431,10 +431,10 @@ impl TryFrom<&UpdateClientConfig> for ValidatedConfig {
             ));
         }
         if config.maximum_payload_bytes == 0
-            || config.maximum_payload_bytes > MAX_DEFINITION_BUNDLE_BYTES as u64
+            || config.maximum_payload_bytes > MAX_DEFINITION_PAYLOAD_BYTES as u64
         {
             return Err(UpdateClientError::Configuration(
-                "payload limit must fit the definition bundle limit",
+                "payload limit must fit the definition payload limit",
             ));
         }
         validate_timeouts(config.timeouts)?;
@@ -817,7 +817,7 @@ fn perform_update(
         config.maximum_payload_bytes,
         trusted_public_key,
     )?;
-    DefinitionBundle::from_json(&payload)
+    DefinitionPayload::from_bytes(&payload)
         .map_err(|error| UpdateClientError::Definitions(error.to_string()))?;
     ensure_running(stopping)?;
 
@@ -1314,10 +1314,10 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.maximum_envelope_bytes = MAX_ENVELOPE_BYTES;
-        config.maximum_payload_bytes = MAX_DEFINITION_BUNDLE_BYTES as u64 + 1;
+        config.maximum_payload_bytes = MAX_DEFINITION_PAYLOAD_BYTES as u64 + 1;
         assert!(config.validate().is_err());
 
-        config.maximum_payload_bytes = MAX_DEFINITION_BUNDLE_BYTES as u64;
+        config.maximum_payload_bytes = MAX_DEFINITION_PAYLOAD_BYTES as u64;
         config.timeouts.receive = Duration::from_secs(61);
         assert!(config.validate().is_err());
     }
@@ -1386,7 +1386,7 @@ mod tests {
         assert!(authenticate_manifest(
             &envelope,
             now,
-            MAX_DEFINITION_BUNDLE_BYTES as u64,
+            MAX_DEFINITION_PAYLOAD_BYTES as u64,
             &key.verifying_key().to_bytes(),
         )
         .is_ok());
@@ -1395,7 +1395,7 @@ mod tests {
         assert!(authenticate_manifest(
             &envelope,
             now,
-            MAX_DEFINITION_BUNDLE_BYTES as u64,
+            MAX_DEFINITION_PAYLOAD_BYTES as u64,
             &key.verifying_key().to_bytes(),
         )
         .is_err());

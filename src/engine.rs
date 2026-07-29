@@ -213,6 +213,9 @@ pub struct ExactSignature {
 #[derive(Debug, Clone)]
 pub struct SignatureDatabase {
     exact_sha256: BTreeMap<[u8; 32], ExactSignature>,
+    compact_sha256: Vec<[u8; 32]>,
+    compact_prefix_offsets: Vec<u32>,
+    compact_signature: Option<ExactSignature>,
 }
 
 impl Default for SignatureDatabase {
@@ -236,15 +239,18 @@ impl SignatureDatabase {
     pub fn empty() -> Self {
         Self {
             exact_sha256: BTreeMap::new(),
+            compact_sha256: Vec::new(),
+            compact_prefix_offsets: Vec::new(),
+            compact_signature: None,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.exact_sha256.len()
+        self.exact_sha256.len() + self.compact_sha256.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.exact_sha256.is_empty()
+        self.exact_sha256.is_empty() && self.compact_sha256.is_empty()
     }
 
     pub fn insert_sha256_hex(
@@ -264,7 +270,55 @@ impl SignatureDatabase {
     }
 
     pub fn lookup(&self, digest: &[u8; 32]) -> Option<&ExactSignature> {
-        self.exact_sha256.get(digest)
+        if let Some(signature) = self.exact_sha256.get(digest) {
+            return Some(signature);
+        }
+        let prefix = usize::from(u16::from_be_bytes([digest[0], digest[1]]));
+        let offsets = self.compact_prefix_offsets.get(prefix..=prefix + 1)?;
+        let start = offsets[0] as usize;
+        let end = offsets[1] as usize;
+        self.compact_sha256[start..end]
+            .binary_search(digest)
+            .ok()
+            .and_then(|_| self.compact_signature.as_ref())
+    }
+
+    /// Installs a sorted, duplicate-free compact corpus. A 16-bit prefix
+    /// directory limits a miss to a tiny bucket while storing only the raw
+    /// 32-byte digests plus 256 KiB of indexing overhead.
+    pub fn replace_compact_sha256(
+        &mut self,
+        digests: Vec<[u8; 32]>,
+        name: impl Into<String>,
+        family: Option<String>,
+    ) -> Result<(), SignatureError> {
+        if digests.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(SignatureError(
+                "compact SHA-256 corpus must be strictly sorted and unique".to_owned(),
+            ));
+        }
+        if digests.len() > u32::MAX as usize {
+            return Err(SignatureError(
+                "compact SHA-256 corpus exceeds the index capacity".to_owned(),
+            ));
+        }
+
+        let mut offsets = vec![0u32; 65_537];
+        for digest in &digests {
+            let prefix = usize::from(u16::from_be_bytes([digest[0], digest[1]]));
+            offsets[prefix + 1] += 1;
+        }
+        for index in 1..offsets.len() {
+            offsets[index] += offsets[index - 1];
+        }
+
+        self.compact_sha256 = digests;
+        self.compact_prefix_offsets = offsets;
+        self.compact_signature = Some(ExactSignature {
+            name: name.into(),
+            family,
+        });
+        Ok(())
     }
 }
 
@@ -1351,6 +1405,33 @@ mod tests {
             engine.scan_bytes(&eicar_bytes()).verdict,
             Verdict::Malicious
         );
+    }
+
+    #[test]
+    fn compact_signatures_use_prefix_buckets_and_exact_labels_override() {
+        let first = [0x00; 32];
+        let middle = [0x7a; 32];
+        let last = [0xff; 32];
+        let mut signatures = SignatureDatabase::empty();
+        signatures
+            .replace_compact_sha256(vec![first, middle, last], "MalwareBazaar.Historical", None)
+            .unwrap();
+        assert_eq!(
+            signatures.lookup(&middle).map(|value| value.name.as_str()),
+            Some("MalwareBazaar.Historical")
+        );
+        assert!(signatures.lookup(&[0x7b; 32]).is_none());
+
+        signatures
+            .insert_sha256_hex(&hex_sha256(&middle), "MalwareBazaar.Labelled", None)
+            .unwrap();
+        assert_eq!(
+            signatures.lookup(&middle).map(|value| value.name.as_str()),
+            Some("MalwareBazaar.Labelled")
+        );
+        assert!(signatures
+            .replace_compact_sha256(vec![last, first], "invalid", None)
+            .is_err());
     }
 
     #[test]

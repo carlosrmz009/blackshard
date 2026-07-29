@@ -452,7 +452,7 @@ mod tests {
 
     fn versions() -> ClamAvVersions {
         ClamAvVersions {
-            engine_version: "ClamAV 1.5.2".to_owned(),
+            engine_version: "ClamAV 1.5.3".to_owned(),
             database_version: "28070".to_owned(),
         }
     }
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(
             parse_scan_response("stream: OK", &versions()).unwrap(),
             ScanVerdict::Clean {
-                engine_version: "ClamAV 1.5.2".to_owned(),
+                engine_version: "ClamAV 1.5.3".to_owned(),
                 database_version: "28070".to_owned(),
             }
         );
@@ -470,7 +470,7 @@ mod tests {
             parse_scan_response("stream: Win.Test FOUND", &versions()).unwrap(),
             ScanVerdict::Detected {
                 signature: "Win.Test".to_owned(),
-                engine_version: "ClamAV 1.5.2".to_owned(),
+                engine_version: "ClamAV 1.5.3".to_owned(),
                 database_version: "28070".to_owned(),
             }
         );
@@ -487,8 +487,8 @@ mod tests {
     #[test]
     fn version_reply_is_bounded_to_engine_and_database_fields() {
         assert_eq!(
-            parse_version_response("ClamAV 1.5.2/28070/Fri Jul 24").unwrap(),
-            ("ClamAV 1.5.2".to_owned(), "28070".to_owned())
+            parse_version_response("ClamAV 1.5.3/28070/Fri Jul 24").unwrap(),
+            ("ClamAV 1.5.3".to_owned(), "28070".to_owned())
         );
         assert!(parse_version_response("invalid").is_err());
     }

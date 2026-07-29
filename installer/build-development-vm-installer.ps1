@@ -36,7 +36,7 @@ $UiPath = Resolve-RequiredFile $UiPath "Blackshard desktop UI"
 $DriverPath = Resolve-RequiredFile $DriverPath "Blackshard development driver"
 $AmsiX64Path = Resolve-RequiredFile $AmsiX64Path "Blackshard x64 AMSI provider"
 $AmsiX86Path = Resolve-RequiredFile $AmsiX86Path "Blackshard x86 AMSI provider"
-$ClamRuntimePath = Resolve-RequiredFile $ClamRuntimePath "Pinned ClamAV runtime archive"
+$ClamRuntimePath = Resolve-RequiredFile $ClamRuntimePath "Verified latest ClamAV runtime archive"
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 

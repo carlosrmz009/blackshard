@@ -20,6 +20,7 @@ const FRESHCLAM_UPDATE_ARGUMENT: &str = "--freshclam-update";
 const CLAMAV_SCAN_ARGUMENT: &str = "--clamav-scan";
 const CLAMAV_HEALTH_ARGUMENT: &str = "--clamav-health";
 const VALIDATE_RELEASE_CONFIGURATION_ARGUMENT: &str = "--validate-release-configuration";
+const VALIDATE_DEFINITION_PAYLOAD_ARGUMENT: &str = "--validate-definition-payload";
 const VERIFY_DEFINITION_UPDATE_ARGUMENT: &str = "--verify-definition-update";
 const EVALUATE_CORPUS_ARGUMENT: &str = "--evaluate-corpus";
 
@@ -110,7 +111,7 @@ fn definition_update_verification_exit_code() -> Option<i32> {
         )?;
         let payload = read_validation_file(
             std::path::Path::new(&payload_path),
-            definitions::MAX_DEFINITION_BUNDLE_BYTES as u64,
+            definitions::MAX_DEFINITION_PAYLOAD_BYTES as u64,
         )?;
         let key = hex::decode(public_key_hex.to_string_lossy().as_ref())
             .map_err(|_| "public key is not hexadecimal".to_owned())?;
@@ -125,13 +126,35 @@ fn definition_update_verification_exit_code() -> Option<i32> {
             &payload,
             installed_sequence,
             Utc::now(),
-            definitions::MAX_DEFINITION_BUNDLE_BYTES as u64,
+            definitions::MAX_DEFINITION_PAYLOAD_BYTES as u64,
             &key,
         )
         .map_err(|error| error.to_string())?;
-        definitions::DefinitionBundle::from_json(&payload).map_err(|error| error.to_string())?;
+        definitions::DefinitionPayload::from_bytes(&payload).map_err(|error| error.to_string())?;
         Ok(())
     })();
+    Some(if result.is_ok() { 0 } else { 1 })
+}
+
+fn definition_payload_validation_exit_code() -> Option<i32> {
+    let mut arguments = std::env::args_os();
+    arguments.next();
+    if arguments.next().as_deref() != Some(OsStr::new(VALIDATE_DEFINITION_PAYLOAD_ARGUMENT)) {
+        return None;
+    }
+    let Some(payload_path) = arguments.next() else {
+        return Some(2);
+    };
+    if arguments.next().is_some() {
+        return Some(2);
+    }
+    let result = read_validation_file(
+        std::path::Path::new(&payload_path),
+        definitions::MAX_DEFINITION_PAYLOAD_BYTES as u64,
+    )
+    .and_then(|payload| {
+        definitions::DefinitionPayload::from_bytes(&payload).map_err(|error| error.to_string())
+    });
     Some(if result.is_ok() { 0 } else { 1 })
 }
 
@@ -382,6 +405,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(exit_code);
     }
     if let Some(exit_code) = release_configuration_validation_exit_code() {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = definition_payload_validation_exit_code() {
         std::process::exit(exit_code);
     }
     if let Some(exit_code) = definition_update_verification_exit_code() {

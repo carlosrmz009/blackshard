@@ -19,15 +19,22 @@ param(
     [string]$BaseBundlePath,
     [string]$OpenSslPath,
     [string]$ValidatorPath = (Join-Path $PSScriptRoot '..\target\release\blackshard-service.exe'),
+    [string]$DefinitionCompilerPath = (Join-Path $PSScriptRoot '..\target\release\blackshard-definition-compiler.exe'),
     [ValidateRange(1, 168)]
     [int]$ExpiryHours = 24,
     [switch]$IncludePua,
+    [switch]$IncludeMalwareBazaar,
     [Parameter(Mandatory = $true)]
-    [switch]$AcceptClamAvGpl2
+    [switch]$AcceptClamAvGpl2,
+    [switch]$AcceptAbuseChTerms
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($IncludeMalwareBazaar -and -not $AcceptAbuseChTerms) {
+    throw 'Review the abuse.ch terms and fair-use principles, then rerun with -AcceptAbuseChTerms.'
+}
 
 $feedUri = $null
 if (-not [Uri]::TryCreate($FeedBaseUrl, [UriKind]::Absolute, [ref]$feedUri) -or
@@ -63,11 +70,30 @@ try {
     }
     & (Join-Path $PSScriptRoot 'Import-ClamAvSha256.ps1') @importArguments
 
+    $publishCandidate = $candidate
+    if ($IncludeMalwareBazaar) {
+        $malwareBazaarCandidate = Join-Path $workspace 'candidate-malwarebazaar.bundle'
+        & (Join-Path $PSScriptRoot 'Import-MalwareBazaar.ps1') `
+            -BaseBundlePath $candidate `
+            -OutputPath $malwareBazaarCandidate `
+            -BundleId ('stable-' + $Version) `
+            -AcceptAbuseChTerms
+        $fullHistoryCandidate = Join-Path $workspace 'candidate-malwarebazaar-full.bundle'
+        & (Join-Path $PSScriptRoot 'Import-MalwareBazaar.ps1') `
+            -BaseBundlePath $malwareBazaarCandidate `
+            -OutputPath $fullHistoryCandidate `
+            -BundleId ('stable-' + $Version) `
+            -DefinitionCompilerPath $DefinitionCompilerPath `
+            -FullHistory `
+            -AcceptAbuseChTerms
+        $publishCandidate = $fullHistoryCandidate
+    }
+
     # Immutable payload names let a client that fetched the previous manifest
     # complete its download while a new manifest is being published.
     $payloadUrl = $FeedBaseUrl.TrimEnd('/') + "/stable/rules-$Sequence.bundle"
     $publishArguments = @{
-        BundlePath = $candidate
+        BundlePath = $publishCandidate
         PrivateKeyPath = $PrivateKeyPath
         PublicKeyPath = $PublicKeyPath
         Sequence = $Sequence

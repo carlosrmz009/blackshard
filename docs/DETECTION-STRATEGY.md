@@ -24,9 +24,23 @@ A future learned PE model must be distributed as signed, versioned data; expose 
 ## External intelligence
 
 - Blackshard's Ed25519-signed online bundle is the only direct client trust path.
-- The development package pins the official ClamAV runtime by archive SHA-256. Official `freshclam` and `sigtool` verify and atomically activate versioned databases. One `clamd` child remains resident inside the worker job so definitions are compiled once; Blackshard streams bytes from the identity-validated open handle using `INSTREAM` instead of exposing a replaceable pathname.
+- Every development-package build resolves the latest stable official ClamAV Windows x64 release without a version pin, verifies GitHub's published archive SHA-256 and the detached release signature with the current Cisco Talos key published in the official ClamAV documentation, and records the resolved version and signing fingerprint in `clamav-runtime.json`. Official `freshclam` and `sigtool` verify and atomically activate versioned databases every four hours without user intervention. One `clamd` child remains resident inside the worker job so definitions are compiled once; Blackshard streams bytes from the identity-validated open handle using `INSTREAM` instead of exposing a replaceable pathname.
+- `Import-MalwareBazaar.ps1` uses the authenticated abuse.ch Community API to import only family-labelled recent detections as exact SHA-256 candidate definitions. It never downloads malware samples, deduplicates against an optional base bundle, records response provenance, enforces the 100,000-record client limit, and cannot affect endpoints until the resulting candidate is reviewed and published through Blackshard's signed definition-update workflow.
 - YARA Forge core releases are useful upstream material, not automatic policy. Each included subset needs provenance/license review, YARA-X compilation, policy assignment, match-rate analysis, and clean-corpus qualification.
 - Public multi-engine or sample-upload services are not silently queried. Uploading user files creates privacy, confidentiality, API-license, availability, and attacker-oracle risks.
+
+To prepare a MalwareBazaar candidate, obtain an abuse.ch Auth-Key, keep it out of source control, and run:
+
+```powershell
+$env:MALWAREBAZAAR_AUTH_KEY = '<auth-key>'
+.\tools\Import-MalwareBazaar.ps1 `
+    -BaseBundlePath .\publisher\current.bundle `
+    -OutputPath .\publisher\candidates\malwarebazaar.bundle `
+    -AcceptAbuseChTerms
+```
+
+The default import window is the API maximum of 168 hours. Re-running against an unchanged window is idempotent and succeeds with zero new records when the base bundle already contains the hashes.
+`Build-StaticDefinitionFeed.ps1 -IncludeMalwareBazaar -AcceptAbuseChTerms` adds the same import before the existing validation, signing, and publication step.
 
 ## Required parity evidence
 

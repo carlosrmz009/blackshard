@@ -110,7 +110,7 @@ fn definition_update_verification_exit_code() -> Option<i32> {
         )?;
         let payload = read_validation_file(
             std::path::Path::new(&payload_path),
-            definitions::MAX_DEFINITION_BUNDLE_BYTES as u64,
+            definitions::MAX_DEFINITION_PAYLOAD_BYTES as u64,
         )?;
         let key = hex::decode(public_key_hex.to_string_lossy().as_ref())
             .map_err(|_| "public key is not hexadecimal".to_owned())?;
@@ -125,11 +125,11 @@ fn definition_update_verification_exit_code() -> Option<i32> {
             &payload,
             installed_sequence,
             Utc::now(),
-            definitions::MAX_DEFINITION_BUNDLE_BYTES as u64,
+            definitions::MAX_DEFINITION_PAYLOAD_BYTES as u64,
             &key,
         )
         .map_err(|error| error.to_string())?;
-        definitions::DefinitionBundle::from_json(&payload).map_err(|error| error.to_string())?;
+        definitions::DefinitionPayload::from_bytes(&payload).map_err(|error| error.to_string())?;
         Ok(())
     })();
     Some(if result.is_ok() { 0 } else { 1 })
