@@ -455,7 +455,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut worker = clamav_worker::ClamAvWorker::new()?;
             let versions = worker.health_check()?;
             println!(
-                "ClamAV worker {} loaded database {} and detected its inert EICAR self-test.",
+                "ClamAV worker {} loaded and validated database {}.",
                 versions.engine_version, versions.database_version
             );
             Ok(())

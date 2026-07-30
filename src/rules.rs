@@ -5,13 +5,6 @@ use std::time::Duration;
 use yara_x::{Compiler, Rules, Scanner};
 
 const BUILTIN_RULES: &str = r#"
-rule blackshard_eicar_test_file {
-    strings:
-        $eicar = { 58 35 4F 21 50 25 40 41 50 5B 34 5C 50 5A 58 35 34 28 50 5E 29 37 43 43 29 37 7D 24 45 49 43 41 52 2D 53 54 41 4E 44 41 52 44 2D 41 4E 54 49 56 49 52 55 53 2D 54 45 53 54 2D 46 49 4C 45 21 24 48 2B 48 2A }
-    condition:
-        filesize == 68 and $eicar at 0
-}
-
 rule blackshard_harmless_self_test {
     strings:
         $v2 = "BLACKSHARD-HARMLESS-SELF-TEST-V2" ascii
@@ -208,10 +201,7 @@ impl RuleEngine {
 fn provenance_for(namespace: &str, identifier: &str) -> RuleProvenance {
     if namespace != "blackshard_builtin" {
         RuleProvenance::PublisherAuthenticated
-    } else if matches!(
-        identifier,
-        "blackshard_eicar_test_file" | "blackshard_harmless_self_test"
-    ) {
+    } else if identifier == "blackshard_harmless_self_test" {
         RuleProvenance::EmbeddedTrustedTest
     } else {
         RuleProvenance::EmbeddedHeuristic
@@ -219,12 +209,7 @@ fn provenance_for(namespace: &str, identifier: &str) -> RuleProvenance {
 }
 
 fn enforcement_authority_for(namespace: &str, identifier: &str) -> RuleEnforcementAuthority {
-    if namespace == "blackshard_builtin"
-        && matches!(
-            identifier,
-            "blackshard_eicar_test_file" | "blackshard_harmless_self_test"
-        )
-    {
+    if namespace == "blackshard_builtin" && identifier == "blackshard_harmless_self_test" {
         RuleEnforcementAuthority::ExecutionDeny
     } else {
         RuleEnforcementAuthority::AlertOnly
@@ -233,13 +218,6 @@ fn enforcement_authority_for(namespace: &str, identifier: &str) -> RuleEnforceme
 
 fn builtin_policies() -> HashMap<String, RulePolicy> {
     let entries = [
-        (
-            "blackshard_eicar_test_file",
-            RuleDisposition::Malicious,
-            100,
-            "EICAR-Test-File",
-            "matched the industry-standard harmless antivirus test file",
-        ),
         (
             "blackshard_harmless_self_test",
             RuleDisposition::Malicious,
@@ -314,12 +292,10 @@ fn validate_namespace(namespace: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
-
     #[test]
-    fn exact_eicar_rule_is_high_confidence_malicious() {
+    fn harmless_self_test_rule_is_high_confidence_malicious() {
         let engine = RuleEngine::builtin().unwrap();
-        let matches = engine.scan(EICAR).unwrap();
+        let matches = engine.scan(crate::self_test::PAYLOAD).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].disposition, RuleDisposition::Malicious);
         assert_eq!(matches[0].risk_score, 100);

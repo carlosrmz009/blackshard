@@ -754,9 +754,8 @@ mod windows_service_host {
                 consecutive_health_successes,
                 consecutive_health_failures,
             };
-            let preflight_healthy = components.mandatory_failures().is_empty()
-                && !snapshot.external_rules_suppressed
-                && snapshot.last_error.is_none();
+            let preflight_healthy =
+                components.mandatory_failures().is_empty() && !snapshot.external_rules_suppressed;
             if preflight_healthy {
                 consecutive_health_failures = 0;
                 consecutive_health_successes = consecutive_health_successes.saturating_add(1);

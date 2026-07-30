@@ -6,8 +6,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-pub const EICAR_SHA256: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
-
 pub const BLACKSHARD_SELF_TEST_SHA256: &str =
     "e316cf90429b8ac181a7006de57c3f4af0c75642caf24589b86f63c8798294f8";
 
@@ -196,9 +194,6 @@ pub struct SignatureDatabase {
 impl Default for SignatureDatabase {
     fn default() -> Self {
         let mut database = Self::empty();
-        database
-            .insert_sha256_hex(EICAR_SHA256, "EICAR-Test-File", Some("Test".to_owned()))
-            .expect("the built-in EICAR digest is valid");
         database
             .insert_sha256_hex(
                 BLACKSHARD_SELF_TEST_SHA256,
@@ -1348,10 +1343,9 @@ mod tests {
     use std::io::{self, Cursor};
 
     #[test]
-    fn canonical_eicar_is_an_exact_malicious_match() {
-        let eicar = eicar_bytes();
-        let report = ScanEngine::default().scan_bytes(&eicar);
-        assert_eq!(report.sha256.as_deref(), Some(EICAR_SHA256));
+    fn harmless_self_test_is_an_exact_malicious_match() {
+        let report = ScanEngine::default().scan_bytes(crate::self_test::PAYLOAD);
+        assert_eq!(report.sha256.as_deref(), Some(BLACKSHARD_SELF_TEST_SHA256));
         assert_eq!(report.verdict, Verdict::Malicious);
         assert_eq!(report.risk_score, 100);
         assert_eq!(report.confidence, 100);
@@ -1365,12 +1359,16 @@ mod tests {
     fn exact_signature_database_accepts_uppercase_hex() {
         let mut signatures = SignatureDatabase::empty();
         signatures
-            .insert_sha256_hex(&EICAR_SHA256.to_ascii_uppercase(), "test", None)
+            .insert_sha256_hex(
+                &BLACKSHARD_SELF_TEST_SHA256.to_ascii_uppercase(),
+                "test",
+                None,
+            )
             .unwrap();
         assert_eq!(signatures.len(), 1);
         let engine = ScanEngine::new(ScanConfig::default(), signatures).unwrap();
         assert_eq!(
-            engine.scan_bytes(&eicar_bytes()).verdict,
+            engine.scan_bytes(crate::self_test::PAYLOAD).verdict,
             Verdict::Malicious
         );
     }
@@ -1600,17 +1598,17 @@ mod tests {
 
     #[test]
     fn supplied_sample_preserves_declared_size_and_truncation() {
-        let eicar = eicar_bytes();
+        let payload = crate::self_test::PAYLOAD;
         let engine = ScanEngine::default();
-        let complete = engine.scan_sample(&eicar, eicar.len() as u64);
+        let complete = engine.scan_sample(payload, payload.len() as u64);
         assert_eq!(complete.verdict, Verdict::Malicious);
         assert!(!complete.truncated);
 
-        let partial = engine.scan_sample(&eicar, eicar.len() as u64 + 1);
+        let partial = engine.scan_sample(payload, payload.len() as u64 + 1);
         assert_eq!(partial.verdict, Verdict::Clean);
         assert!(partial.truncated);
         assert!(partial.sha256.is_none());
-        assert_eq!(partial.bytes_scanned, eicar.len());
+        assert_eq!(partial.bytes_scanned, payload.len());
     }
 
     #[test]
@@ -1686,12 +1684,6 @@ mod tests {
             .evidence
             .iter()
             .all(|item| !item.code.starts_with("pdf.")));
-    }
-
-    fn eicar_bytes() -> Vec<u8> {
-        let mut bytes = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}".to_vec();
-        bytes.extend_from_slice(b"$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*");
-        bytes
     }
 
     fn deterministic_high_entropy(length: usize) -> Vec<u8> {

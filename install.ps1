@@ -32,6 +32,49 @@ function Test-blackshardFilterLoaded {
     return ($filterOutput -match "(?im)^blackshard\s")
 }
 
+function Stop-blackshardServiceForReplacement([string]$Name) {
+    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        return
+    }
+
+    & sc.exe stop $Name 2>$null | Out-Host
+    $deadline = [DateTime]::UtcNow.AddSeconds(45)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        if ($null -eq $service -or [string]$service.State -eq "Stopped" -or [uint32]$service.ProcessId -eq 0) {
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    if ($null -ne $service -and [uint32]$service.ProcessId -ne 0) {
+        $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$([uint32]$service.ProcessId)" -ErrorAction SilentlyContinue
+        $expectedPath = [IO.Path]::GetFullPath($destinationService)
+        $actualPath = if ($null -eq $process -or [string]::IsNullOrWhiteSpace([string]$process.ExecutablePath)) {
+            ""
+        }
+        else {
+            [IO.Path]::GetFullPath([string]$process.ExecutablePath)
+        }
+        if (-not $actualPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The $Name service did not stop and its process identity could not be validated."
+        }
+        Stop-Process -Id ([uint32]$service.ProcessId) -Force -ErrorAction Stop
+        Wait-Process -Id ([uint32]$service.ProcessId) -Timeout 15 -ErrorAction SilentlyContinue
+    }
+
+    & sc.exe delete $Name 2>$null | Out-Host
+    $deleteDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ([DateTime]::UtcNow -lt $deleteDeadline) {
+        if ($null -eq (Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue)) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "The $Name service registration could not be removed before replacement."
+}
+
 function Get-DriverLoadDiagnostics {
     $lines = New-Object Collections.Generic.List[string]
     try {
@@ -68,8 +111,7 @@ function Get-DriverLoadDiagnostics {
 function Remove-blackshardInstallation {
     Write-Host "[*] Stopping blackshard protection service..." -ForegroundColor Cyan
     foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)) {
-        & sc.exe stop $serviceName 2>$null | Out-Host
-        & sc.exe delete $serviceName 2>$null | Out-Host
+        Stop-blackshardServiceForReplacement -Name $serviceName
     }
 
     foreach ($registryView in @("32", "64")) {
@@ -159,10 +201,8 @@ foreach ($sourceExecutable in @($sourceService, $sourceUi)) {
 }
 
 foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)) {
-    & sc.exe stop $serviceName 2>$null | Out-Host
-    & sc.exe delete $serviceName 2>$null | Out-Host
+    Stop-blackshardServiceForReplacement -Name $serviceName
 }
-Start-Sleep -Seconds 1
 New-Item -ItemType Directory -Path $agentDirectory -Force | Out-Null
 Copy-Item -LiteralPath $sourceService -Destination $destinationService -Force
 Copy-Item -LiteralPath $sourceUi -Destination $destinationUi -Force
