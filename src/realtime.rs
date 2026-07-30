@@ -23,11 +23,9 @@ use std::thread::{self, JoinHandle};
 mod connection_supervisor;
 
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, S_OK,
-};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
@@ -333,26 +331,6 @@ impl RealtimeProtection {
         if port == 0 {
             return Err("the kernel communication port is not connected".to_owned());
         }
-        let process = unsafe { GetCurrentProcess() };
-        let mut duplicated = 0;
-        if unsafe {
-            DuplicateHandle(
-                process,
-                port,
-                process,
-                &mut duplicated,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        } == 0
-        {
-            return Err(format!(
-                "could not duplicate the kernel communication handle: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
         let request = DriverControlRequest {
             magic: BLACKSHARD_PROTOCOL_MAGIC,
             version: BLACKSHARD_PROTOCOL_VERSION,
@@ -364,7 +342,7 @@ impl RealtimeProtection {
         let mut returned = 0u32;
         let result = unsafe {
             FilterSendMessage(
-                duplicated,
+                port,
                 (&request as *const DriverControlRequest).cast(),
                 mem::size_of::<DriverControlRequest>() as u32,
                 (&mut reply as *mut DriverHealthReply).cast(),
@@ -372,7 +350,6 @@ impl RealtimeProtection {
                 &mut returned,
             )
         };
-        unsafe { CloseHandle(duplicated) };
         if result != S_OK {
             return Err(hresult_text(result));
         }
