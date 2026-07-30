@@ -24,3 +24,5 @@ path = "fuzz_targets/vba_decompress.rs"
 test = false
 doc = false
 bench = false
+
+[workspace]
