@@ -325,7 +325,7 @@ namespace blackshardDevelopmentSetup
             };
             brand.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170F));
             brand.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            var logoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo.png");
+            var logoPath = Path.Combine(EmbeddedPayload.Root, "logo.png");
             if (File.Exists(logoPath))
             {
                 try
@@ -456,7 +456,7 @@ namespace blackshardDevelopmentSetup
             SetStatus("initializing", "Validating the VM and preparing the protected installer payload.", Accent);
             AppendLog("Starting elevated blackshard setup engine...");
 
-            var script = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "vm-setup.ps1");
+            var script = Path.Combine(EmbeddedPayload.Root, "vm-setup.ps1");
             if (!File.Exists(script))
             {
                 FinishSetup(2, "The embedded setup script is missing.");
@@ -468,7 +468,7 @@ namespace blackshardDevelopmentSetup
             {
                 FileName = powerShell,
                 Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\" -UiMode",
-                WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory,
+                WorkingDirectory = EmbeddedPayload.Root,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
@@ -1380,6 +1380,100 @@ namespace blackshardDevelopmentSetup
         }
     }
 
+    internal static class EmbeddedPayload
+    {
+        private static readonly string[] FileNames =
+        {
+            "blackshard-setup-ui.exe",
+            "blackshard-service.exe",
+            "blackshard-ui.exe",
+            "blackshard.sys",
+            "blackshard-amsi-x64.dll",
+            "blackshard-amsi-x86.dll",
+            "clamav-runtime.zip",
+            "install.ps1",
+            "uninstall.ps1",
+            "verify.ps1",
+            "enable-test-signing.ps1",
+            "disable-test-signing.ps1",
+            "vm-setup.ps1",
+            "oobe.png",
+            "logo.png",
+            "blackshard.ico"
+        };
+
+        public static string Root { get; private set; }
+
+        public static void Prepare()
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var version = assembly.ManifestModule.ModuleVersionId.ToString("N");
+            var parent = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "blackshard-vm-bootstrap"
+            );
+            var root = Path.Combine(parent, version);
+            Directory.CreateDirectory(root);
+            RejectReparsePoint(parent);
+            RejectReparsePoint(root);
+
+            foreach (var fileName in FileNames)
+            {
+                var resourceName = "blackshard.payload." + fileName;
+                using (var input = assembly.GetManifestResourceStream(resourceName))
+                {
+                    if (input == null)
+                    {
+                        throw new InvalidOperationException("The installer payload is incomplete: " + fileName);
+                    }
+
+                    var destination = Path.Combine(root, fileName);
+                    if (File.Exists(destination))
+                    {
+                        RejectReparsePoint(destination);
+                    }
+                    var temporary = Path.Combine(root, Guid.NewGuid().ToString("N") + ".tmp");
+                    try
+                    {
+                        using (var output = new FileStream(
+                            temporary,
+                            FileMode.CreateNew,
+                            FileAccess.Write,
+                            FileShare.None,
+                            131072,
+                            FileOptions.WriteThrough
+                        ))
+                        {
+                            input.CopyTo(output);
+                            output.Flush(true);
+                        }
+                        if (File.Exists(destination))
+                        {
+                            File.Delete(destination);
+                        }
+                        File.Move(temporary, destination);
+                    }
+                    finally
+                    {
+                        if (File.Exists(temporary))
+                        {
+                            File.Delete(temporary);
+                        }
+                    }
+                }
+            }
+            Root = root;
+        }
+
+        private static void RejectReparsePoint(string path)
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new InvalidOperationException("Installer payload paths must not be reparse points: " + path);
+            }
+        }
+    }
+
     internal static class Program
     {
         [STAThread]
@@ -1395,6 +1489,21 @@ namespace blackshardDevelopmentSetup
             {
                 if (!EnsureElevated())
                 {
+                    return;
+                }
+                try
+                {
+                    EmbeddedPayload.Prepare();
+                }
+                catch (Exception error)
+                {
+                    MessageBox.Show(
+                        "blackshard setup could not prepare its verified payload."
+                            + Environment.NewLine + Environment.NewLine + error.Message,
+                        "blackshard setup",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error
+                    );
                     return;
                 }
                 Application.Run(new SetupForm());

@@ -29,8 +29,6 @@ function Resolve-RequiredFile([string]$Path, [string]$Description) {
     return $item.FullName
 }
 
-$iexpress = Join-Path $env:SystemRoot "System32\iexpress.exe"
-$iexpress = Resolve-RequiredFile $iexpress "Windows IExpress"
 $ServicePath = Resolve-RequiredFile $ServicePath "blackshard protection service"
 $UiPath = Resolve-RequiredFile $UiPath "blackshard desktop UI"
 $DriverPath = Resolve-RequiredFile $DriverPath "blackshard development driver"
@@ -74,6 +72,8 @@ $interLicense = Resolve-RequiredFile (Join-Path $fontRoot "LICENSE-Inter.txt") "
 $jetBrainsMonoLicense = Resolve-RequiredFile (Join-Path $fontRoot "LICENSE-JetBrainsMono.txt") "JetBrains Mono license"
 $uiExecutable = Join-Path $buildRoot "blackshard-setup-ui.exe"
 $uiManifest = Join-Path $buildRoot "blackshard-setup-ui.manifest"
+$outerManifest = Join-Path $buildRoot "blackshard-vm-setup.manifest"
+$assemblyInfo = Join-Path $buildRoot "blackshard-setup-assembly-info.cs"
 $manifest = @"
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
@@ -94,6 +94,21 @@ $manifest = @"
 </assembly>
 "@
 [IO.File]::WriteAllText($uiManifest, $manifest, [Text.Encoding]::UTF8)
+$outerManifestContent = $manifest.Replace(
+    'level="asInvoker"',
+    'level="requireAdministrator"'
+)
+[IO.File]::WriteAllText($outerManifest, $outerManifestContent, [Text.Encoding]::UTF8)
+$assemblyMetadata = @"
+using System.Reflection;
+[assembly: AssemblyTitle("blackshard VM setup")]
+[assembly: AssemblyDescription("blackshard disposable VM development installer")]
+[assembly: AssemblyCompany("blackshard")]
+[assembly: AssemblyProduct("blackshard")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+"@
+[IO.File]::WriteAllText($assemblyInfo, $assemblyMetadata, [Text.Encoding]::UTF8)
 $compiler = Start-Process -FilePath $csc -ArgumentList @(
     "/nologo",
     "/target:winexe",
@@ -110,6 +125,7 @@ $compiler = Start-Process -FilePath $csc -ArgumentList @(
     ('/resource:"{0}",blackshard.fonts.Inter.LICENSE.txt' -f $interLicense),
     ('/resource:"{0}",blackshard.fonts.JetBrainsMono.LICENSE.txt' -f $jetBrainsMonoLicense),
     ('/out:"{0}"' -f $uiExecutable),
+    ('"{0}"' -f $assemblyInfo),
     ('"{0}"' -f $uiSource)
 ) -WorkingDirectory $buildRoot -WindowStyle Hidden -Wait -PassThru
 if ($compiler.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $uiExecutable -PathType Leaf)) {
@@ -212,70 +228,55 @@ $outputPath = Join-Path $OutputDirectory "blackshard-vm-setup.exe"
 if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
     Remove-Item -LiteralPath $outputPath -Force
 }
-$strings = New-Object Collections.Generic.List[string]
-$sourceEntries = New-Object Collections.Generic.List[string]
-$index = 0
+$outerArguments = New-Object Collections.Generic.List[string]
+$outerArguments.Add("/nologo")
+$outerArguments.Add("/target:winexe")
+$outerArguments.Add("/optimize+")
+$outerArguments.Add("/platform:x64")
+$outerArguments.Add(('/win32manifest:"{0}"' -f $outerManifest))
+$outerArguments.Add(('/win32icon:"{0}"' -f $iconPath))
+$outerArguments.Add("/reference:System.dll")
+$outerArguments.Add("/reference:System.Drawing.dll")
+$outerArguments.Add("/reference:System.Windows.Forms.dll")
+$outerArguments.Add(('/resource:"{0}",blackshard.fonts.Inter.Regular.ttf' -f $interRegular))
+$outerArguments.Add(('/resource:"{0}",blackshard.fonts.Inter.Bold.ttf' -f $interBold))
+$outerArguments.Add(('/resource:"{0}",blackshard.fonts.JetBrainsMono.Regular.ttf' -f $jetBrainsMonoRegular))
+$outerArguments.Add(('/resource:"{0}",blackshard.fonts.JetBrainsMono.Bold.ttf' -f $jetBrainsMonoBold))
+$outerArguments.Add(('/resource:"{0}",blackshard.fonts.Inter.LICENSE.txt' -f $interLicense))
+$outerArguments.Add(('/resource:"{0}",blackshard.fonts.JetBrainsMono.LICENSE.txt' -f $jetBrainsMonoLicense))
 foreach ($name in $payload.Keys) {
-    $strings.Add(('FILE{0}="{1}"' -f $index, $name))
-    $sourceEntries.Add(('%FILE{0}%=' -f $index))
-    $index++
+    $outerArguments.Add((
+        '/resource:"{0}",blackshard.payload.{1}' -f (Join-Path $buildRoot $name), $name
+    ))
 }
+$outerArguments.Add(('/out:"{0}"' -f $packageOutputPath))
+$outerArguments.Add(('"{0}"' -f $assemblyInfo))
+$outerArguments.Add(('"{0}"' -f $uiSource))
 
-$sedPath = Join-Path $buildRoot "blackshard-vm-setup.sed"
-$sed = @"
-[Version]
-Class=IEXPRESS
-SEDVersion=3
-
-[Options]
-PackagePurpose=InstallApp
-ShowInstallProgramWindow=0
-HideExtractAnimation=1
-UseLongFileName=1
-InsideCompressed=0
-CAB_FixedSize=0
-CAB_ResvCodeSigning=0
-RebootMode=N
-InstallPrompt=%InstallPrompt%
-DisplayLicense=%DisplayLicense%
-FinishMessage=%FinishMessage%
-TargetName=%TargetName%
-FriendlyName=%FriendlyName%
-AppLaunched=%AppLaunched%
-PostInstallCmd=%PostInstallCmd%
-AdminQuietInstCmd=%AdminQuietInstCmd%
-UserQuietInstCmd=%UserQuietInstCmd%
-SourceFiles=SourceFiles
-
-[Strings]
-InstallPrompt=
-DisplayLicense=
-FinishMessage=
-TargetName=$packageOutputPath
-FriendlyName=blackshard VM development setup
-AppLaunched=blackshard-setup-ui.exe
-PostInstallCmd=<None>
-AdminQuietInstCmd=
-UserQuietInstCmd=
-$($strings -join "`r`n")
-
-[SourceFiles]
-SourceFiles0=$buildRoot\
-
-[SourceFiles0]
-$($sourceEntries -join "`r`n")
-"@
-[IO.File]::WriteAllText($sedPath, $sed, [Text.Encoding]::ASCII)
-
-$iexpressProcess = Start-Process -FilePath $iexpress -ArgumentList @("/N", "blackshard-vm-setup.sed") `
+$outerCompiler = Start-Process -FilePath $csc -ArgumentList $outerArguments `
     -WorkingDirectory $buildRoot -WindowStyle Hidden -Wait -PassThru
-if ($iexpressProcess.ExitCode -ne 0) {
-    throw "IExpress failed with exit code $($iexpressProcess.ExitCode)."
+if ($outerCompiler.ExitCode -ne 0) {
+    throw "The blackshard VM setup executable could not be compiled (csc exit code $($outerCompiler.ExitCode))."
 }
 if (-not (Test-Path -LiteralPath $packageOutputPath -PathType Leaf)) {
-    throw "IExpress completed without producing $packageOutputPath."
+    throw "The compiler completed without producing $packageOutputPath."
 }
 Copy-Item -LiteralPath $packageOutputPath -Destination $outputPath -Force
+
+$builtAssembly = [Reflection.Assembly]::LoadFile($outputPath)
+$embeddedPayloads = @(
+    $builtAssembly.GetManifestResourceNames() |
+        Where-Object { $_.StartsWith("blackshard.payload.", [StringComparison]::Ordinal) }
+)
+$expectedPayloads = @($payload.Keys | ForEach-Object { "blackshard.payload.$_" })
+if ($embeddedPayloads.Count -ne $expectedPayloads.Count) {
+    throw "Expected $($expectedPayloads.Count) embedded payloads, found $($embeddedPayloads.Count)."
+}
+foreach ($resourceName in $expectedPayloads) {
+    if ($embeddedPayloads -notcontains $resourceName) {
+        throw "The compiled installer is missing embedded payload $resourceName."
+    }
+}
 
 $hash = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash
 Write-Host "[+] VM development installer created: $outputPath" -ForegroundColor Green

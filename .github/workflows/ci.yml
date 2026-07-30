@@ -100,6 +100,27 @@ jobs:
             }
           }
 
+      - name: Scan VM installer with Microsoft Defender
+        shell: pwsh
+        run: |
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          $scanner = Get-ChildItem -LiteralPath $platformRoot -Filter "MpCmdRun.exe" -File -Recurse |
+            Sort-Object { $_.VersionInfo.FileVersionRaw } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $scanner) {
+            $fallback = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+            if (Test-Path -LiteralPath $fallback -PathType Leaf) {
+              $scanner = $fallback
+            }
+          }
+          if (-not $scanner) {
+            throw "Microsoft Defender command-line scanner is unavailable."
+          }
+          & $scanner -Scan -ScanType 3 -File (Join-Path $PWD "dist\blackshard-vm-setup.exe") -DisableRemediation
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender rejected blackshard-vm-setup.exe with exit code $LASTEXITCODE."
+          }
+
       - name: Upload development test package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
