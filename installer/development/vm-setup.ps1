@@ -489,6 +489,10 @@ try {
     Write-Output "blackshard_ui:PROGRESS:25:Restarting Windows to activate the development driver."
     Write-Output "blackshard_ui:REBOOT_PENDING"
     Write-Host "[+] Setup will automatically resume during the next VM boot." -ForegroundColor Green
+    if ($UiMode) {
+        Write-Host "[*] Waiting for the interactive installer to request the restart." -ForegroundColor Yellow
+        exit 0
+    }
     Show-SetupMessage -Message @"
 The test certificate and boot configuration are ready.
 

@@ -1,12 +1,11 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO;
 using System.Reflection;
-using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
@@ -23,7 +22,6 @@ namespace blackshardDevelopmentSetup
 
         private readonly Label statusLabel;
         private readonly Label detailLabel;
-        private readonly CheckBox confirmation;
         private readonly Button installButton;
         private readonly Button openButton;
         private readonly Button copyButton;
@@ -113,17 +111,6 @@ namespace blackshardDevelopmentSetup
             };
             Controls.Add(detailLabel);
 
-            confirmation = new CheckBox
-            {
-                Text = "I confirm this is an isolated, snapshotted virtual machine with Secure Boot disabled.",
-                ForeColor = Color.White,
-                BackColor = Background,
-                AutoSize = true,
-                Location = new Point(25, 151)
-            };
-            confirmation.CheckedChanged += delegate { UpdateInstallButtonAvailability(); };
-            Controls.Add(confirmation);
-
             installButton = CreateButton("INSTALL FULL PROTECTION", new Point(24, 184), new Size(225, 38), true);
             installButton.Enabled = false;
             installButton.Click += StartSetup;
@@ -186,7 +173,7 @@ namespace blackshardDevelopmentSetup
 
             ApplyModernLayout();
             FormClosing += OnFormClosing;
-            AppendLog("Waiting for confirmation. No system changes have been made.");
+            AppendLog("Ready to install. No system changes have been made.");
         }
 
         private void ApplyModernLayout()
@@ -216,12 +203,11 @@ namespace blackshardDevelopmentSetup
                 Dock = DockStyle.Fill,
                 BackColor = Color.Black,
                 ColumnCount = 1,
-                RowCount = 3,
+                RowCount = 2,
                 Padding = new Padding(10, 0, 55, 0)
             };
             left.RowStyles.Add(new RowStyle(SizeType.Percent, 24F));
-            left.RowStyles.Add(new RowStyle(SizeType.Percent, 68F));
-            left.RowStyles.Add(new RowStyle(SizeType.Percent, 8F));
+            left.RowStyles.Add(new RowStyle(SizeType.Percent, 76F));
             layout.Controls.Add(left, 0, 0);
             left.Controls.Add(BuildInstallerBrand(), 0, 0);
 
@@ -233,13 +219,6 @@ namespace blackshardDevelopmentSetup
                 Margin = new Padding(30, 12, 30, 12)
             };
             left.Controls.Add(ringProgress, 0, 1);
-
-            confirmation.Dock = DockStyle.Fill;
-            confirmation.AutoSize = false;
-            confirmation.TextAlign = ContentAlignment.MiddleCenter;
-            confirmation.BackColor = Color.Black;
-            confirmation.Font = FontResolver.CreateDisplay(10F, FontStyle.Regular);
-            left.Controls.Add(confirmation, 0, 2);
 
             var right = new TableLayoutPanel
             {
@@ -453,7 +432,7 @@ namespace blackshardDevelopmentSetup
 
         private void UpdateInstallButtonAvailability()
         {
-            var enabled = confirmation.Checked && setupProcess == null && !rebootPending;
+            var enabled = setupProcess == null && !rebootPending;
             installButton.Enabled = enabled;
             installButton.BackColor = enabled ? Accent : Color.FromArgb(48, 48, 48);
             installButton.ForeColor = enabled ? Background : Muted;
@@ -462,7 +441,7 @@ namespace blackshardDevelopmentSetup
 
         private void StartSetup(object sender, EventArgs eventArgs)
         {
-            if (!confirmation.Checked || setupProcess != null) return;
+            if (setupProcess != null) return;
             rebootPending = false;
             installComplete = false;
             failureDetail = null;
@@ -471,7 +450,6 @@ namespace blackshardDevelopmentSetup
             installButton.BackColor = Surface;
             installButton.ForeColor = Muted;
             installButton.FlatAppearance.BorderColor = Color.FromArgb(65, 72, 72);
-            confirmation.Enabled = false;
             progress.Style = ProgressBarStyle.Marquee;
             ringProgress.ProgressValue = 5;
             ringProgress.RingColor = Accent;
@@ -506,6 +484,7 @@ namespace blackshardDevelopmentSetup
                 setupProcess.ErrorDataReceived += delegate(object o, DataReceivedEventArgs e) { if (e.Data != null) HandleOutput(e.Data, true); };
                 setupProcess.Exited += delegate
                 {
+                    setupProcess.WaitForExit();
                     var code = setupProcess.ExitCode;
                     BeginInvoke((Action)(() => FinishSetup(code, null)));
                 };
@@ -594,7 +573,8 @@ namespace blackshardDevelopmentSetup
             }
             else if (exitCode == 0 && rebootPending)
             {
-                SetStatus("reboot scheduled", "Windows will restart and setup will continue during boot.", Accent);
+                SetStatus("restart required", "Windows must restart before installation can continue.", Accent);
+                PromptForRestart();
             }
             else
             {
@@ -608,8 +588,48 @@ namespace blackshardDevelopmentSetup
                 AppendLog("Setup failed. Persistent logs: %TEMP%\\blackshard-vm-setup.log and C:\\ProgramData\\blackshard-development-installer\\setup.log");
                 installButton.Text = "retry";
             }
-            confirmation.Enabled = true;
             UpdateInstallButtonAvailability();
+        }
+
+        private void PromptForRestart()
+        {
+            using (var prompt = new RestartPromptForm())
+            {
+                if (prompt.ShowDialog(this) != DialogResult.OK)
+                {
+                    SetStatus("restart postponed", "Restart Windows when ready. Installation will resume automatically.", Accent);
+                    AppendLog("Restart postponed. Installation will resume automatically after the next restart.");
+                    return;
+                }
+            }
+
+            try
+            {
+                var restart = Process.Start(new ProcessStartInfo
+                {
+                    FileName = Path.Combine(Environment.SystemDirectory, "shutdown.exe"),
+                    Arguments = "/r /t 10 /d p:2:4 /c \"blackshard setup must restart Windows to continue.\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+                if (restart == null)
+                {
+                    throw new InvalidOperationException("Windows did not start the restart request.");
+                }
+                restart.WaitForExit();
+                if (restart.ExitCode != 0)
+                {
+                    throw new InvalidOperationException("Windows refused the restart request.");
+                }
+                SetStatus("restarting", "We'll be right back. Installation will continue automatically.", Accent);
+                AppendLog("Windows restart scheduled. Installation will resume automatically.");
+            }
+            catch (Exception error)
+            {
+                rebootPending = false;
+                SetStatus("restart required", "Restart Windows manually to continue installation.", Failure);
+                AppendLog("ERROR: " + error.Message);
+            }
         }
 
         private void SetStatus(string status, string detail, Color color)
@@ -709,11 +729,21 @@ namespace blackshardDevelopmentSetup
             eventArgs.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var inset = 20;
             var diameter = Math.Min(ClientSize.Width, ClientSize.Height) - inset * 2;
-            var bounds = new Rectangle(inset, inset, diameter, diameter);
+            var bounds = new Rectangle(
+                (ClientSize.Width - diameter) / 2,
+                (ClientSize.Height - diameter) / 2,
+                diameter,
+                diameter
+            );
             using (var track = new Pen(Color.FromArgb(35, 35, 35), 18F))
             using (var ring = new Pen(ringColor, 18F))
             using (var font = FontResolver.CreateDisplay(48F, FontStyle.Regular))
             using (var brush = new SolidBrush(ForeColor))
+            using (var format = new StringFormat
+            {
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center
+            })
             {
                 track.StartCap = LineCap.Round;
                 track.EndCap = LineCap.Round;
@@ -725,57 +755,155 @@ namespace blackshardDevelopmentSetup
                     eventArgs.Graphics.DrawArc(ring, bounds, -90F, 360F * progressValue / 100F);
                 }
                 var text = progressValue + "%";
-                var measured = eventArgs.Graphics.MeasureString(text, font);
                 eventArgs.Graphics.DrawString(
                     text,
                     font,
                     brush,
-                    (ClientSize.Width - measured.Width) / 2F,
-                    (ClientSize.Height - measured.Height) / 2F
+                    bounds,
+                    format
                 );
             }
+        }
+    }
+
+    internal sealed class RestartPromptForm : Form
+    {
+        internal RestartPromptForm()
+        {
+            Text = "blackshard setup";
+            ClientSize = new Size(680, 370);
+            MinimumSize = new Size(680, 370);
+            MaximumSize = new Size(680, 370);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            BackColor = Color.Black;
+            ForeColor = Color.White;
+            Padding = new Padding(46, 38, 46, 38);
+
+            var layout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 1,
+                RowCount = 3
+            };
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 34F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 38F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 28F));
+            Controls.Add(layout);
+
+            layout.Controls.Add(new Label
+            {
+                Text = "we'll be right back",
+                Dock = DockStyle.Fill,
+                ForeColor = Color.Yellow,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = FontResolver.CreateDisplay(34F, FontStyle.Regular)
+            }, 0, 0);
+
+            layout.Controls.Add(new Label
+            {
+                Text = "Windows needs to restart to activate the blackshard development driver. Installation will continue automatically when the computer starts again.",
+                Dock = DockStyle.Fill,
+                ForeColor = Color.White,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = FontResolver.CreateDisplay(13F, FontStyle.Regular)
+            }, 0, 1);
+
+            var actions = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.Black,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(0, 16, 0, 0)
+            };
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            layout.Controls.Add(actions, 0, 2);
+
+            var restart = CreateButton("restart now", Color.Yellow, Color.Black);
+            restart.DialogResult = DialogResult.OK;
+            actions.Controls.Add(restart, 0, 0);
+
+            var postpone = CreateButton("not now", Color.White, Color.Black);
+            postpone.DialogResult = DialogResult.Cancel;
+            actions.Controls.Add(postpone, 1, 0);
+
+            AcceptButton = restart;
+            CancelButton = postpone;
+        }
+
+        private static Button CreateButton(string text, Color background, Color foreground)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                Margin = new Padding(8, 0, 8, 0),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = background,
+                ForeColor = foreground,
+                Font = FontResolver.CreateDisplay(14F, FontStyle.Regular),
+                Cursor = Cursors.Hand
+            };
+            button.FlatAppearance.BorderSize = 0;
+            return button;
         }
     }
 
     internal static class FontResolver
     {
         private static readonly PrivateFontCollection Fonts = new PrivateFontCollection();
-        private static readonly List<IntPtr> FontMemory = new List<IntPtr>();
-        private static readonly FontFamily DisplayFamily;
-        private static readonly FontFamily MonoFamily;
+        private static readonly string FontDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "blackshard-fonts-" + Guid.NewGuid().ToString("N")
+        );
+        private static FontFamily DisplayFamily;
+        private static FontFamily MonoFamily;
 
         static FontResolver()
         {
-            Load("blackshard.fonts.Inter.Regular.ttf");
-            Load("blackshard.fonts.Inter.Bold.ttf");
-            Load("blackshard.fonts.JetBrainsMono.Regular.ttf");
-            Load("blackshard.fonts.JetBrainsMono.Bold.ttf");
-            DisplayFamily = Find("Inter");
-            MonoFamily = Find("JetBrains Mono");
+            try
+            {
+                Directory.CreateDirectory(FontDirectory);
+                Load("blackshard.fonts.Inter.Regular.ttf", "Inter-Regular.ttf");
+                Load("blackshard.fonts.Inter.Bold.ttf", "Inter-Bold.ttf");
+                Load("blackshard.fonts.JetBrainsMono.Regular.ttf", "JetBrainsMono-Regular.ttf");
+                Load("blackshard.fonts.JetBrainsMono.Bold.ttf", "JetBrainsMono-Bold.ttf");
+                DisplayFamily = Find("Inter");
+                MonoFamily = Find("JetBrains Mono");
+                AppDomain.CurrentDomain.ProcessExit += delegate { Cleanup(); };
+            }
+            catch
+            {
+                Cleanup();
+            }
         }
 
         internal static Font CreateDisplay(float size, FontStyle style)
         {
-            return Create(DisplayFamily, size, style);
+            return Create(DisplayFamily, "Arial", size, style);
         }
 
         internal static Font CreateMono(float size, FontStyle style)
         {
-            return Create(MonoFamily, size, style);
+            return Create(MonoFamily, "Consolas", size, style);
         }
 
-        private static Font Create(FontFamily family, float size, FontStyle style)
+        private static Font Create(FontFamily family, string fallback, float size, FontStyle style)
         {
-            if (!family.IsStyleAvailable(style))
+            if (family != null && family.IsStyleAvailable(style))
             {
-                throw new InvalidOperationException(
-                    "Embedded font style " + style + " is unavailable for " + family.Name + "."
-                );
+                return new Font(family, size, style, GraphicsUnit.Point);
             }
-            return new Font(family, size, style, GraphicsUnit.Point);
+            return new Font(fallback, size, style, GraphicsUnit.Point);
         }
 
-        private static void Load(string resourceName)
+        private static void Load(string resourceName, string fileName)
         {
             var assembly = Assembly.GetExecutingAssembly();
             using (var stream = assembly.GetManifestResourceStream(resourceName))
@@ -784,33 +912,12 @@ namespace blackshardDevelopmentSetup
                 {
                     throw new InvalidOperationException("Embedded font resource is missing: " + resourceName);
                 }
-                if (stream.Length > int.MaxValue)
+                var path = Path.Combine(FontDirectory, fileName);
+                using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
-                    throw new InvalidOperationException("Embedded font resource is too large: " + resourceName);
+                    stream.CopyTo(output);
                 }
-                var data = new byte[(int)stream.Length];
-                var offset = 0;
-                while (offset < data.Length)
-                {
-                    var read = stream.Read(data, offset, data.Length - offset);
-                    if (read == 0)
-                    {
-                        throw new EndOfStreamException("Embedded font resource is incomplete: " + resourceName);
-                    }
-                    offset += read;
-                }
-                var memory = Marshal.AllocCoTaskMem(data.Length);
-                Marshal.Copy(data, 0, memory, data.Length);
-                try
-                {
-                    Fonts.AddMemoryFont(memory, data.Length);
-                    FontMemory.Add(memory);
-                }
-                catch
-                {
-                    Marshal.FreeCoTaskMem(memory);
-                    throw;
-                }
+                Fonts.AddFontFile(path);
             }
         }
 
@@ -823,7 +930,28 @@ namespace blackshardDevelopmentSetup
                     return family;
                 }
             }
-            throw new InvalidOperationException("Embedded font family is unavailable: " + name);
+            return null;
+        }
+
+        private static void Cleanup()
+        {
+            try
+            {
+                Fonts.Dispose();
+            }
+            catch
+            {
+            }
+            try
+            {
+                if (Directory.Exists(FontDirectory))
+                {
+                    Directory.Delete(FontDirectory, true);
+                }
+            }
+            catch
+            {
+            }
         }
     }
 
@@ -1265,8 +1393,51 @@ namespace blackshardDevelopmentSetup
             }
             else
             {
+                if (!EnsureElevated())
+                {
+                    return;
+                }
                 Application.Run(new SetupForm());
             }
+        }
+
+        private static bool EnsureElevated()
+        {
+            using (var identity = WindowsIdentity.GetCurrent())
+            {
+                var principal = new WindowsPrincipal(identity);
+                if (principal.IsInRole(WindowsBuiltInRole.Administrator))
+                {
+                    return true;
+                }
+            }
+
+            try
+            {
+                var elevated = Process.Start(new ProcessStartInfo
+                {
+                    FileName = Application.ExecutablePath,
+                    WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory,
+                    UseShellExecute = true,
+                    Verb = "runas"
+                });
+                if (elevated == null)
+                {
+                    throw new InvalidOperationException("Windows did not start the elevated installer.");
+                }
+                elevated.WaitForExit();
+            }
+            catch (Exception error)
+            {
+                MessageBox.Show(
+                    "blackshard setup needs administrator approval to install its protection service and driver."
+                        + Environment.NewLine + Environment.NewLine + error.Message,
+                    "blackshard setup",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information
+                );
+            }
+            return false;
         }
     }
 }
