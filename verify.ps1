@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [switch]$DevelopmentVm,
+    [switch]$NoExit,
     [ValidateRange(0, 600)]
     [int]$WaitSeconds = 0
 )
@@ -201,11 +202,17 @@ if (($DevelopmentVm -and $developmentHealthy) -or (-not $DevelopmentVm -and $pro
         Write-Host "`n[PASS] Both blackshard services, filter attachment, service health, and application signature passed local checks." -ForegroundColor Green
         Write-Host "Run the UI's harmless protection test. This diagnostic does not prove detection efficacy or release readiness."
     }
+    if ($NoExit) {
+        return
+    }
     exit 0
 }
 
 Write-Host "`n[FAIL] blackshard did not pass all checks for this mode." -ForegroundColor Red
 if (-not $DevelopmentVm) {
     Write-Host "Use -DevelopmentVm only for the legacy unsigned/test-signed disposable-VM workflow."
+}
+if ($NoExit) {
+    throw "blackshard did not pass all checks for this mode."
 }
 exit 1

@@ -291,12 +291,7 @@ function Install-AllComponents {
     $verifier = Join-Path $stageRoot "verify.ps1"
     & $installer
     Write-Output "blackshard_ui:PROGRESS:70:Validating real-time protection and malware intelligence."
-    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    & $powerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $verifier `
-        -DevelopmentVm -WaitSeconds $serviceReadinessTimeoutSeconds
-    if ($LASTEXITCODE -ne 0) {
-        throw "blackshard components were installed, but runtime verification failed (exit code $LASTEXITCODE)."
-    }
+    & $verifier -DevelopmentVm -NoExit -WaitSeconds $serviceReadinessTimeoutSeconds
     Write-Output "blackshard_ui:PROGRESS:90:Creating shortcuts and registering blackshard."
     Install-ShortcutsAndRegistration
     foreach ($completionArtifact in @(
