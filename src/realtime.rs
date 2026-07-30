@@ -6,9 +6,7 @@ use crate::detection::{
 use crate::history::{EventHistory, EventKind, SecurityEvent};
 use crate::quarantine::{IsolationState, QuarantineRecord, QuarantineStore};
 use crate::trust;
-use crate::verdict_cache::{
-    AnalysisCompleteness, CacheVerdict, CachedVerdict, VerdictCache, VerdictCacheKey,
-};
+use crate::verdict_cache::{CacheVerdict, CachedVerdict, VerdictCache, VerdictCacheKey};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
@@ -612,21 +610,7 @@ pub(crate) fn realtime_worker(
                 Duration::ZERO,
             ),
         };
-        let driver_verdict = if report.should_block()
-            || (notification.must_enforce != 0
-                && (report.verdict == DetectionVerdict::Error
-                    || report.analysis_completeness != AnalysisCompleteness::Complete
-                    || report.truncated
-                    || matches!(
-                        report.clamav_verdict,
-                        Some(crate::clamav_worker::protocol::ScanVerdict::Error(_))
-                            | Some(crate::clamav_worker::protocol::ScanVerdict::NotScanned { .. })
-                            | None
-                    ))) {
-            DriverVerdict::Block
-        } else {
-            DriverVerdict::Allow
-        };
+        let driver_verdict = execution_driver_verdict(&report);
         let reply_accepted = reply(
             item.port,
             item.message.header.message_id,
@@ -760,6 +744,14 @@ pub(crate) fn realtime_worker(
                 action_error,
             })));
         }
+    }
+}
+
+fn execution_driver_verdict(report: &DetectionReport) -> DriverVerdict {
+    if report.should_block() {
+        DriverVerdict::Block
+    } else {
+        DriverVerdict::Allow
     }
 }
 
@@ -1088,5 +1080,18 @@ mod tests {
         assert_eq!(mem::size_of::<BlackshardMessage>(), 2120);
         assert_eq!(mem::size_of::<FilterReplyHeader>(), 16);
         assert_eq!(mem::size_of::<BlackshardReplyMessage>(), 32);
+    }
+
+    #[test]
+    fn scan_failures_do_not_deny_program_execution() {
+        let report = DetectionReport::error("scanner unavailable", Duration::ZERO);
+        assert_eq!(execution_driver_verdict(&report), DriverVerdict::Allow);
+    }
+
+    #[test]
+    fn execution_eligible_detections_deny_program_execution() {
+        let mut report = DetectionReport::error("test", Duration::ZERO);
+        report.execution_block_eligible = true;
+        assert_eq!(execution_driver_verdict(&report), DriverVerdict::Block);
     }
 }

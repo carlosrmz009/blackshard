@@ -480,16 +480,16 @@ BlackshardApplyFailurePolicy (
         0,
         0
         );
-    if (phase == BlackshardPhaseReady) {
+    if (phase == BlackshardPhaseReady &&
+        Reason == BlackshardFailureContentRace) {
         InterlockedIncrement64(&gBlackshardData.RequiredEnforcementBlocks);
         return BlackshardFailureBlock;
     }
 
-
-
-
-
-
+    InterlockedIncrement64(&gBlackshardData.EnforcementBypasses);
+    if (phase == BlackshardPhaseReady) {
+        return BlackshardFailureAuditAllow;
+    }
     InterlockedIncrement64(&gBlackshardData.BootPolicyAllows);
     return BlackshardFailureAllowBootPolicy;
 }
