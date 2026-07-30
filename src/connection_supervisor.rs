@@ -10,13 +10,77 @@ use crate::realtime::{
 };
 use crate::verdict_cache::VerdictCache;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_IO_PENDING, HANDLE, S_OK, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+const HRESULT_IO_PENDING: i32 = (0x8007_0000u32 | ERROR_IO_PENDING) as i32;
+const RECEIVE_WAIT_MILLISECONDS: u32 = 250;
+
+fn cancel_receive(port: HANDLE, overlapped: &OVERLAPPED) {
+    unsafe {
+        CancelIoEx(port, overlapped);
+        let mut transferred = 0u32;
+        GetOverlappedResult(port, overlapped, &mut transferred, 1);
+    }
+}
+
+fn receive_message(
+    port: HANDLE,
+    event: HANDLE,
+    message: &mut BlackshardMessage,
+    stop: &AtomicBool,
+) -> Result<bool, String> {
+    let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+    overlapped.hEvent = event;
+    let result = unsafe {
+        FilterGetMessage(
+            port,
+            (message as *mut BlackshardMessage).cast(),
+            std::mem::size_of::<BlackshardMessage>() as u32,
+            (&mut overlapped as *mut OVERLAPPED).cast(),
+        )
+    };
+    if result == S_OK {
+        return Ok(true);
+    }
+    if result != HRESULT_IO_PENDING {
+        return Err(hresult_text(result));
+    }
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            cancel_receive(port, &overlapped);
+            return Ok(false);
+        }
+        match unsafe { WaitForSingleObject(event, RECEIVE_WAIT_MILLISECONDS) } {
+            WAIT_OBJECT_0 => {
+                let mut transferred = 0u32;
+                if unsafe { GetOverlappedResult(port, &overlapped, &mut transferred, 0) } == 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                return Ok(true);
+            }
+            WAIT_TIMEOUT => {}
+            WAIT_FAILED => {
+                let error = std::io::Error::last_os_error().to_string();
+                cancel_receive(port, &overlapped);
+                return Err(error);
+            }
+            status => {
+                cancel_receive(port, &overlapped);
+                return Err(format!("unexpected receive wait status {status}"));
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn connection_loop(
@@ -69,6 +133,21 @@ pub fn connection_loop(
                 ProtectionConnection::Disconnected(format!("connect {error_text}")),
             ));
 
+            interruptible_wait(&stop, Duration::from_secs(backoff_secs));
+            backoff_secs = (backoff_secs * 2).min(60);
+            continue;
+        }
+
+        let receive_event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
+        if receive_event == 0 {
+            let error = format!(
+                "could not create the minifilter receive event: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { CloseHandle(port_handle) };
+            let _ = events.try_send(RealtimeEvent::Connection(
+                ProtectionConnection::Disconnected(error),
+            ));
             interruptible_wait(&stop, Duration::from_secs(backoff_secs));
             backoff_secs = (backoff_secs * 2).min(60);
             continue;
@@ -133,22 +212,13 @@ pub fn connection_loop(
             struct AlignedMessage(BlackshardMessage);
 
             let mut message = unsafe { std::mem::zeroed::<AlignedMessage>() };
-            let get_result = unsafe {
-                FilterGetMessage(
-                    port_handle,
-                    &mut message as *mut _ as *mut c_void,
-                    std::mem::size_of::<BlackshardMessage>() as u32,
-                    ptr::null_mut(),
-                )
-            };
-            if get_result != S_OK {
-                let error_text = hresult_text(get_result);
-                log::error!(
-                    "FilterGetMessage failed: get {} (HRESULT {:X})",
-                    error_text,
-                    get_result
-                );
-                break format!("get {error_text}");
+            match receive_message(port_handle, receive_event, &mut message.0, &stop) {
+                Ok(true) => {}
+                Ok(false) => break "real-time protection stopped".to_owned(),
+                Err(error) => {
+                    log::error!("FilterGetMessage failed: {error}");
+                    break format!("get {error}");
+                }
             }
 
             let message = message.0;
@@ -208,6 +278,7 @@ pub fn connection_loop(
         };
 
         let uptime = uptime_start.elapsed();
+        unsafe { CloseHandle(receive_event) };
 
         drop(sender);
         for worker in scan_workers {
