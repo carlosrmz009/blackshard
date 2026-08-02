@@ -41,7 +41,7 @@ ureq = { version = "2.9.6", default-features = false, features = ["tls"] }
 log = "0.4.33"
 env_logger = "0.11.11"
 chacha20poly1305 = { version = "0.10", features = ["stream"] }
-hkdf = "0.12"
+hkdf = "0.13"
 crossbeam-channel = "0.5.16"
 
 [target.'cfg(windows)'.dependencies]
