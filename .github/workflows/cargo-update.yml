@@ -21,6 +21,13 @@ jobs:
       - name: Update Cargo.lock dependencies
         run: cargo update
 
+      - name: Remove checkout credentials
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --local --name-only --get-regexp '^includeIf\.gitdir:.*\.path$' | while read -r key; do
+            git config --local --unset-all "$key" || true
+          done
+
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
