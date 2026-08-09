@@ -1,0 +1,30 @@
+name: "Scheduled Cargo Update"
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Update Cargo.lock dependencies
+        run: cargo update
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(deps): update Cargo.lock"
+          title: "chore(deps): update Cargo.lock"
+          body: |
+            Automatically generated Pull Request to update `Cargo.lock` with the latest compatible dependencies.
+          branch: "chore/cargo-update"
+          delete-branch: true

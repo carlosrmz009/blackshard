@@ -6,8 +6,7 @@ updates:
       - /
       - /fuzz
     schedule:
-      interval: weekly
-      day: monday
+      interval: daily
       time: "05:23"
       timezone: America/Mexico_City
     open-pull-requests-limit: 3
@@ -27,8 +26,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
+      interval: daily
       time: "05:43"
       timezone: America/Mexico_City
     open-pull-requests-limit: 1
@@ -43,8 +41,7 @@ updates:
       - /installer/package
       - /installer/bundle
     schedule:
-      interval: weekly
-      day: monday
+      interval: daily
       time: "06:03"
       timezone: America/Mexico_City
     open-pull-requests-limit: 1

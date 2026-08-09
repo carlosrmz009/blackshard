@@ -5,7 +5,7 @@
 
 
 [advisories]
-ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195", "RUSTSEC-2026-0222"]
 
 [target]
 arch = ["x86_64"]

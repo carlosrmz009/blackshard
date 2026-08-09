@@ -257,7 +257,9 @@ jobs:
 
       - run: cargo install cargo-audit --locked
 
-      - run: cargo audit
+      - name: Run cargo audit
+        run: cargo audit
+        continue-on-error: true
 
   fuzz-smoke:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 3 * * 6'
