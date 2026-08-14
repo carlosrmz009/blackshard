@@ -29,6 +29,7 @@ jobs:
           done
 
       - name: Create Pull Request
+        id: cpr
         uses: peter-evans/create-pull-request@v7
         with:
           commit-message: "chore(deps): update Cargo.lock"
@@ -37,3 +38,12 @@ jobs:
             Automatically generated Pull Request to update `Cargo.lock` with the latest compatible dependencies.
           branch: "chore/cargo-update"
           delete-branch: true
+
+      - name: Auto-approve and enable auto-merge
+        if: steps.cpr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+        run: |
+          gh pr review --approve "$PR_NUMBER" || true
+          gh pr merge --auto --squash "$PR_NUMBER" || true
