@@ -484,15 +484,9 @@ pub(crate) fn realtime_worker(
             continue;
         }
         let openable_path = device_path_to_openable_path(&kernel_path);
-        let candidate = open_candidate_file(&openable_path);
-        let path = candidate
-            .as_ref()
-            .ok()
-            .and_then(|file| opened_final_path(file).ok())
-            .unwrap_or_else(|| kernel_path.clone());
         let enabled = settings
             .read()
-            .map(|value| value.real_time_protection && !value.is_excluded(&path))
+            .map(|value| value.real_time_protection && !value.is_excluded(&openable_path))
             .unwrap_or(false);
         if !enabled {
             let _ = reply(
@@ -503,6 +497,37 @@ pub(crate) fn realtime_worker(
             );
             continue;
         }
+
+        let current_gen = definition_generation.load(Ordering::Acquire);
+        if notification.file_id != 0 {
+            let fast_cached = verdict_cache
+                .write()
+                .ok()
+                .and_then(|mut cache| cache.get_by_file_id_and_gen(notification.file_id, notification.content_generation, current_gen));
+
+            if let Some(cached) = fast_cached {
+                if cached.verdict == CacheVerdict::Clean {
+                    log::debug!("Real-time fast-path cache hit for FileId 0x{:016x}", notification.file_id);
+                    let _ = reply(
+                        item.port,
+                        item.message.header.message_id,
+                        DriverVerdict::Allow,
+                        0,
+                    );
+                    if let Ok(mut c) = counters.lock() {
+                        c.scanned += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let candidate = open_candidate_file(&openable_path);
+        let path = candidate
+            .as_ref()
+            .ok()
+            .and_then(|file| opened_final_path(file).ok())
+            .unwrap_or_else(|| kernel_path.clone());
 
         let active_engine = {
             let active = engine
@@ -617,6 +642,10 @@ pub(crate) fn realtime_worker(
             driver_verdict,
             report.risk_score as u32,
         );
+
+        if driver_verdict == DriverVerdict::Block && notification.process_id != 0 {
+            terminate_malicious_process(notification.process_id);
+        }
 
         let mut quarantine_record = None;
         let mut action_error = None;
@@ -835,6 +864,9 @@ fn handle_protected_modification(
     if decision.block && accepted {
         if let Ok(mut counters) = counters.lock() {
             counters.blocked_replies += 1;
+        }
+        if notification.process_id != 0 {
+            terminate_malicious_process(notification.process_id);
         }
     }
     if !decision.alert {
@@ -1057,6 +1089,23 @@ pub fn launch_hidden_probe(executable: &Path, argument: &str, path: &Path) -> st
         .creation_flags(CREATE_NO_WINDOW)
         .status()?;
     Ok(status.code().unwrap_or(-1))
+}
+
+fn terminate_malicious_process(process_id: u32) {
+    if process_id == 0 || process_id == 4 || process_id == std::process::id() {
+        return;
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, process_id);
+        if handle != 0 {
+            let _ = TerminateProcess(handle, 1);
+            CloseHandle(handle);
+            log::warn!("Terminated malicious process PID {}", process_id);
+        }
+    }
 }
 
 #[cfg(test)]

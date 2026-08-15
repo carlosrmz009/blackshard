@@ -4,7 +4,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
-    pub hash: Vec<u8>,
+    pub hash: [u8; 32],
     pub size: Option<u64>,
     pub name: String,
 }
@@ -45,8 +45,11 @@ impl NativeIndex {
                 let size_str = parts[1];
                 let name = parts[2..].join(":");
 
-                let hash = match hex::decode(hash_hex) {
-                    Ok(h) => h,
+                let hash: [u8; 32] = match hex::decode(hash_hex) {
+                    Ok(bytes) => match bytes.try_into() {
+                        Ok(array) => array,
+                        Err(_) => continue,
+                    },
                     Err(_) => continue,
                 };
 
@@ -101,18 +104,20 @@ impl NativeIndex {
     }
 
     pub fn evaluate(&self, hash: &[u8], file_size: Option<u64>) -> Option<&str> {
-        if self.signatures.is_empty() {
+        if self.signatures.is_empty() || hash.len() != 32 {
             return None;
         }
 
+        let hash_array: [u8; 32] = hash.try_into().ok()?;
+
         if let Ok(idx) = self
             .signatures
-            .binary_search_by(|sig| sig.hash.as_slice().cmp(hash))
+            .binary_search_by(|sig| sig.hash.cmp(&hash_array))
         {
             let mut curr = idx;
             loop {
                 let sig = &self.signatures[curr];
-                if sig.hash != hash {
+                if sig.hash != hash_array {
                     break;
                 }
                 if Self::size_matches(sig.size, file_size) {
@@ -127,7 +132,7 @@ impl NativeIndex {
             let mut curr = idx + 1;
             while curr < self.signatures.len() {
                 let sig = &self.signatures[curr];
-                if sig.hash != hash {
+                if sig.hash != hash_array {
                     break;
                 }
                 if Self::size_matches(sig.size, file_size) {

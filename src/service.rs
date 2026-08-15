@@ -396,6 +396,7 @@ mod windows_service_host {
     where
         F: FnMut(BodyState) -> Result<(), String>,
     {
+        apply_process_self_defense();
         let readiness = crate::readiness::ReadinessMonitor::new();
         readiness.update_state(crate::readiness::ReadinessState::Starting);
         report_state(BodyState::StartPending)?;
@@ -1197,6 +1198,35 @@ mod windows_service_host {
     fn append_service_error(message: String) {
         let history = EventHistory::default_for_machine();
         append_error(&history, &message);
+    }
+
+    fn apply_process_self_defense() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{SetKernelObjectSecurity, DACL_SECURITY_INFORMATION};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let sddl: Vec<u16> = "D:P(A;;GA;;;SY)(A;;0x121411;;;BA)\0".encode_utf16().collect();
+        let mut descriptor = std::ptr::null_mut();
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            ) != 0
+            {
+                let _ = SetKernelObjectSecurity(
+                    GetCurrentProcess(),
+                    DACL_SECURITY_INFORMATION,
+                    descriptor,
+                );
+                LocalFree(descriptor);
+                log::info!("Applied hardened process DACL self-defense to service");
+            }
+        }
     }
 }
 

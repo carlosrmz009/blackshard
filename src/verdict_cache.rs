@@ -62,6 +62,7 @@ impl CachedVerdict {
 pub struct VerdictCache {
     capacity: usize,
     entries: HashMap<VerdictCacheKey, CachedVerdict>,
+    by_file_id: HashMap<(u64, u64), VerdictCacheKey>,
     lru: VecDeque<VerdictCacheKey>,
 }
 
@@ -70,6 +71,7 @@ impl VerdictCache {
         Arc::new(RwLock::new(Self {
             capacity,
             entries: HashMap::with_capacity(capacity),
+            by_file_id: HashMap::with_capacity(capacity),
             lru: VecDeque::with_capacity(capacity),
         }))
     }
@@ -93,6 +95,7 @@ impl VerdictCache {
                 }
                 return Some(cached.clone());
             } else {
+                self.by_file_id.remove(&(key.file_id, key.content_generation));
                 self.entries.remove(key);
                 if let Some(pos) = self.lru.iter().position(|k| k == key) {
                     self.lru.remove(pos);
@@ -100,6 +103,16 @@ impl VerdictCache {
             }
         }
         None
+    }
+
+    pub fn get_by_file_id_and_gen(
+        &mut self,
+        file_id: u64,
+        content_generation: u64,
+        current_definition_generation: u64,
+    ) -> Option<CachedVerdict> {
+        let key = self.by_file_id.get(&(file_id, content_generation)).cloned()?;
+        self.get(&key, current_definition_generation)
     }
 
     pub fn insert(&mut self, key: VerdictCacheKey, verdict: CachedVerdict) -> bool {
@@ -112,10 +125,12 @@ impl VerdictCache {
             }
         } else if self.entries.len() >= self.capacity {
             if let Some(oldest) = self.lru.pop_front() {
+                self.by_file_id.remove(&(oldest.file_id, oldest.content_generation));
                 self.entries.remove(&oldest);
             }
         }
         self.lru.push_back(key.clone());
+        self.by_file_id.insert((key.file_id, key.content_generation), key.clone());
         self.entries.insert(key, verdict);
         true
     }
@@ -181,5 +196,21 @@ mod tests {
         let mut cache = cache.write().unwrap();
         assert!(cache.insert(key.clone(), clean(AnalysisCompleteness::Complete, false)));
         assert!(cache.get(&key, 1).is_some());
+    }
+
+    #[test]
+    fn fast_path_lookup_works() {
+        let cache = VerdictCache::new(4);
+        let key = VerdictCacheKey {
+            volume_serial: 10,
+            file_id: 200,
+            file_size: 500,
+            content_generation: 1,
+        };
+        let mut cache = cache.write().unwrap();
+        assert!(cache.insert(key, clean(AnalysisCompleteness::Complete, false)));
+        assert!(cache.get_by_file_id_and_gen(200, 1, 1).is_some());
+        assert!(cache.get_by_file_id_and_gen(200, 2, 1).is_none());
+        assert!(cache.get_by_file_id_and_gen(999, 1, 1).is_none());
     }
 }

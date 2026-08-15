@@ -1486,6 +1486,10 @@ BlackshardPortConnect (
         *ConnectionPortCookie = NULL;
     }
 
+    if (gBlackshardData.ClientPort != NULL) {
+        return STATUS_ALREADY_COMMITTED;
+    }
+
     gBlackshardData.ClientProcessId = PsGetCurrentProcessId();
     gBlackshardData.ClientPort = ClientPort;
     InterlockedExchange(
