@@ -1208,7 +1208,9 @@ mod windows_service_host {
         use windows_sys::Win32::Security::{SetKernelObjectSecurity, DACL_SECURITY_INFORMATION};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-        let sddl: Vec<u16> = "D:P(A;;GA;;;SY)(A;;0x121411;;;BA)\0".encode_utf16().collect();
+        let sddl: Vec<u16> = "D:P(A;;GA;;;SY)(A;;0x121411;;;BA)\0"
+            .encode_utf16()
+            .collect();
         let mut descriptor = std::ptr::null_mut();
         unsafe {
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(

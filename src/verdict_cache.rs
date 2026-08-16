@@ -95,7 +95,8 @@ impl VerdictCache {
                 }
                 return Some(cached.clone());
             } else {
-                self.by_file_id.remove(&(key.file_id, key.content_generation));
+                self.by_file_id
+                    .remove(&(key.file_id, key.content_generation));
                 self.entries.remove(key);
                 if let Some(pos) = self.lru.iter().position(|k| k == key) {
                     self.lru.remove(pos);
@@ -111,7 +112,10 @@ impl VerdictCache {
         content_generation: u64,
         current_definition_generation: u64,
     ) -> Option<CachedVerdict> {
-        let key = self.by_file_id.get(&(file_id, content_generation)).cloned()?;
+        let key = self
+            .by_file_id
+            .get(&(file_id, content_generation))
+            .cloned()?;
         self.get(&key, current_definition_generation)
     }
 
@@ -125,12 +129,14 @@ impl VerdictCache {
             }
         } else if self.entries.len() >= self.capacity {
             if let Some(oldest) = self.lru.pop_front() {
-                self.by_file_id.remove(&(oldest.file_id, oldest.content_generation));
+                self.by_file_id
+                    .remove(&(oldest.file_id, oldest.content_generation));
                 self.entries.remove(&oldest);
             }
         }
         self.lru.push_back(key.clone());
-        self.by_file_id.insert((key.file_id, key.content_generation), key.clone());
+        self.by_file_id
+            .insert((key.file_id, key.content_generation), key.clone());
         self.entries.insert(key, verdict);
         true
     }

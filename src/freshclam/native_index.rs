@@ -100,7 +100,7 @@ impl NativeIndex {
     }
 
     pub fn sort_index(&mut self) {
-        self.signatures.sort_by(|a, b| a.hash.cmp(&b.hash));
+        self.signatures.sort_by_key(|a| a.hash);
     }
 
     pub fn evaluate(&self, hash: &[u8], file_size: Option<u64>) -> Option<&str> {

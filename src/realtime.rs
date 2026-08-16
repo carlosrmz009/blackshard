@@ -500,14 +500,20 @@ pub(crate) fn realtime_worker(
 
         let current_gen = definition_generation.load(Ordering::Acquire);
         if notification.file_id != 0 {
-            let fast_cached = verdict_cache
-                .write()
-                .ok()
-                .and_then(|mut cache| cache.get_by_file_id_and_gen(notification.file_id, notification.content_generation, current_gen));
+            let fast_cached = verdict_cache.write().ok().and_then(|mut cache| {
+                cache.get_by_file_id_and_gen(
+                    notification.file_id,
+                    notification.content_generation,
+                    current_gen,
+                )
+            });
 
             if let Some(cached) = fast_cached {
                 if cached.verdict == CacheVerdict::Clean {
-                    log::debug!("Real-time fast-path cache hit for FileId 0x{:016x}", notification.file_id);
+                    log::debug!(
+                        "Real-time fast-path cache hit for FileId 0x{:016x}",
+                        notification.file_id
+                    );
                     let _ = reply(
                         item.port,
                         item.message.header.message_id,
@@ -1098,7 +1104,9 @@ fn terminate_malicious_process(process_id: u32) {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
         let handle = OpenProcess(PROCESS_TERMINATE, 0, process_id);
         if handle != 0 {
             let _ = TerminateProcess(handle, 1);
