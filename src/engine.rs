@@ -606,7 +606,7 @@ fn parse_sha256_hex(value: &str) -> Result<[u8; 32], SignatureError> {
         ));
     }
     let mut digest = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0]).ok_or_else(|| {
             SignatureError(format!(
                 "invalid hexadecimal digit at position {}",
@@ -696,8 +696,10 @@ fn decode_probable_text(bytes: &[u8]) -> Option<String> {
         let start = usize::from(bytes.starts_with(&[0xff, 0xfe]));
         let start = start * 2;
         let units: Vec<u16> = bytes[start..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         let text = String::from_utf16_lossy(&units);
         return is_probable_text(&text).then_some(text);
@@ -712,7 +714,7 @@ fn looks_utf16_le(bytes: &[u8]) -> bool {
     if bytes.len() < 8 {
         return false;
     }
-    let pairs = bytes.chunks_exact(2).take(256);
+    let pairs = bytes.as_chunks::<2>().0.iter().take(256);
     let mut total = 0usize;
     let mut zero_high = 0usize;
     for pair in pairs {

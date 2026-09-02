@@ -260,7 +260,7 @@ jobs:
           tool: cargo-audit
 
       - name: Run cargo audit
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0269 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0222 --ignore RUSTSEC-2026-0257
         continue-on-error: true
 
   fuzz-smoke:

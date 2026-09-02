@@ -240,8 +240,8 @@ impl DefinitionPayload {
         }
 
         let mut digests = Vec::with_capacity(count);
-        for chunk in bytes[header_end..].chunks_exact(32) {
-            digests.push(chunk.try_into().expect("fixed digest slice"));
+        for &chunk in bytes[header_end..].as_chunks::<32>().0 {
+            digests.push(chunk);
         }
         if digests.windows(2).any(|window| window[0] >= window[1]) {
             return Err(DefinitionError::InvalidField {

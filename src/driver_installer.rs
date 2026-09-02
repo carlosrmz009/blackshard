@@ -64,8 +64,10 @@ fn read_inf_altitude(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("could not read driver INF {}: {error}", path.display()))?;
     let text = if bytes.starts_with(&[0xff, 0xfe]) {
         let words = bytes[2..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         String::from_utf16(&words)
             .map_err(|error| format!("driver INF is not valid UTF-16LE: {error}"))?
