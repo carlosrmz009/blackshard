@@ -19,7 +19,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
 
       - name: Update Cargo.lock dependencies
-        run: cargo update
+        run: |
+          cargo update
+          cd fuzz && cargo update
 
       - name: Remove checkout credentials
         run: |

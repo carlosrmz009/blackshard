@@ -255,7 +255,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
 
-      - run: cargo install cargo-audit --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Run cargo audit
         run: cargo audit
@@ -274,7 +276,9 @@ jobs:
           toolchain: nightly
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Fuzz byte scanner
         id: fuzz_byte_scanner
