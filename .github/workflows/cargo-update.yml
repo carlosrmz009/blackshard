@@ -34,6 +34,7 @@ jobs:
         id: cpr
         uses: peter-evans/create-pull-request@v8
         with:
+          token: ${{ secrets.GH_PAT || secrets.GH_PATH || secrets.GITHUB_TOKEN }}
           commit-message: "chore(deps): update Cargo.lock"
           title: "chore(deps): update Cargo.lock"
           body: |
@@ -47,5 +48,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
         run: |
-          gh pr review --approve "$PR_NUMBER" || true
+          PR_AUTHOR=$(gh pr view "$PR_NUMBER" --json author -q .author.login 2>/dev/null || echo "")
+          CURRENT_USER=$(gh api user -q .login 2>/dev/null || echo "")
+          if [ -n "$PR_AUTHOR" ] && [ "$PR_AUTHOR" != "$CURRENT_USER" ]; then
+            gh pr review --approve "$PR_NUMBER" || true
+          fi
           gh pr merge --auto --squash "$PR_NUMBER" || true
+

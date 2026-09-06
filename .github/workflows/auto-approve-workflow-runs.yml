@@ -1,0 +1,80 @@
+name: "Auto-approve Action Runs"
+
+on:
+  workflow_run:
+    workflows:
+      - "security-ci"
+    types:
+      - requested
+      - completed
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  auto-approve:
+    runs-on: ubuntu-latest
+    if: github.repository == 'carlosrmz009/blackshard'
+    steps:
+      - name: Approve pending action runs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GH_PATH || secrets.GITHUB_TOKEN }}
+          HAS_PAT: ${{ secrets.GH_PAT != '' || secrets.GH_PATH != '' }}
+          TRIGGER_EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "::warning ::Neither GH_PAT nor GH_PATH repository secret is set. GitHub requires a Personal Access Token or GitHub App token with 'Actions: Write' permission to approve workflow runs programmatically."
+          fi
+
+          approve_run() {
+            local target_id="$1"
+            echo "Inspecting run $target_id..."
+
+            local run_json
+            run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$target_id" 2>/dev/null || echo "{}")
+            local head_repo
+            head_repo=$(echo "$run_json" | jq -r '.head_repository.full_name // empty')
+            local branch
+            branch=$(echo "$run_json" | jq -r '.head_branch // empty')
+            local conclusion
+            conclusion=$(echo "$run_json" | jq -r '.conclusion // empty')
+            local status
+            status=$(echo "$run_json" | jq -r '.status // empty')
+
+            # Only approve if in action_required or waiting state
+            if [ "$conclusion" != "action_required" ] && [ "$status" != "waiting" ]; then
+              echo "Run $target_id is in status='$status', conclusion='$conclusion'; approval not required."
+              return 0
+            fi
+
+            # Security check: Ensure run is from within blackshard repo or on automated chore/dependabot branches
+            if [ "$head_repo" = "$GITHUB_REPOSITORY" ] || [[ "$branch" =~ ^(chore/|dependabot/) ]]; then
+              echo "Run $target_id meets criteria (branch: $branch, repo: $head_repo). Approving..."
+              if gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$target_id/approve" 2>&1; then
+                echo "Successfully approved workflow run $target_id!"
+              else
+                echo "Failed to approve run $target_id. Note: default GITHUB_TOKEN cannot approve runs; ensure GH_PAT is configured with Actions:write."
+              fi
+            else
+              echo "Skipping run $target_id: untrusted external source (branch: $branch, repo: $head_repo)."
+            fi
+          }
+
+          if [ "$TRIGGER_EVENT" = "workflow_run" ] && [ -n "$RUN_ID" ]; then
+            approve_run "$RUN_ID"
+          else
+            echo "Checking for any pending workflow runs in repository..."
+            PENDING_RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs" --jq '.workflow_runs[] | select(.conclusion == "action_required" or .status == "waiting") | .id' 2>/dev/null || echo "")
+            if [ -z "$PENDING_RUNS" ]; then
+              echo "No workflow runs awaiting approval."
+            else
+              for id in $PENDING_RUNS; do
+                approve_run "$id"
+              done
+            fi
+          fi
