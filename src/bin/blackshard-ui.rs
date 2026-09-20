@@ -407,16 +407,20 @@ fn apply_service_health(runtime: &SharedUiState, health: ServiceHealthSnapshot) 
         },
         ServiceDefinitionHealth::Failed { detail } => DefinitionStatus::Failed(detail),
     };
-    state.driver = match &health.connection {
-        ServiceConnection::Connecting => DriverStatus::Checking,
-        ServiceConnection::Connected => DriverStatus::Connected,
-        ServiceConnection::Disconnected => DriverStatus::Disconnected(
+    state.tier = health.tier;
+    state.driver = match (health.tier, &health.connection) {
+        // With no driver installed the service never opens the port, so the connection state is
+        // meaningless here and would otherwise sit on "Checking" forever.
+        (blackshard::readiness::ProtectionTier::Userland, _) => DriverStatus::NotRequired,
+        (_, ServiceConnection::Connecting) => DriverStatus::Checking,
+        (_, ServiceConnection::Connected) => DriverStatus::Connected,
+        (_, ServiceConnection::Disconnected) => DriverStatus::Disconnected(
             health
                 .connection_detail
                 .clone()
                 .unwrap_or_else(|| "the minifilter channel is disconnected".to_owned()),
         ),
-        ServiceConnection::Stopped => {
+        (_, ServiceConnection::Stopped) => {
             DriverStatus::Disconnected("the protection service is stopped".to_owned())
         }
     };
@@ -433,9 +437,12 @@ fn apply_service_health(runtime: &SharedUiState, health: ServiceHealthSnapshot) 
                     .to_owned(),
             )
         }
+        // Readiness already accounts for the tier, so a userland install that reached Ready is
+        // genuinely active; requiring a kernel connection here would have contradicted it.
         ServiceLifecycle::Running
-            if health.connection == ServiceConnection::Connected
-                && matches!(health.readiness, Some(readiness::ReadinessState::Ready)) =>
+            if matches!(health.readiness, Some(readiness::ReadinessState::Ready))
+                && (health.tier == readiness::ProtectionTier::Userland
+                    || health.connection == ServiceConnection::Connected) =>
         {
             ProtectionStatus::Active
         }
@@ -664,6 +671,7 @@ mod tests {
             },
             counters: service::ServiceCounters::default(),
             definition_database_version: Some("1".to_owned()),
+            tier: blackshard::readiness::ProtectionTier::Kernel,
         };
 
         apply_service_health(&runtime, health);
@@ -695,6 +703,7 @@ mod tests {
             },
             counters: service::ServiceCounters::default(),
             definition_database_version: Some("1".to_owned()),
+            tier: blackshard::readiness::ProtectionTier::Kernel,
         };
 
         apply_service_health(&runtime, health);

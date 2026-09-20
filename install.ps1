@@ -2,7 +2,10 @@
 [CmdletBinding()]
 param(
     [switch]$Uninstall,
-    [switch]$AllowUnsigned
+    [switch]$AllowUnsigned,
+    # Install without the kernel minifilter. Real-time coverage then comes from AMSI, which needs
+    # no kernel code and therefore no EV certificate or test-signing.
+    [switch]$SkipDriver
 )
 
 Set-StrictMode -Version Latest
@@ -159,8 +162,10 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw "This build supports only 64-bit Windows."
 }
 
-if (-not (Test-Path -LiteralPath $sourceDriver)) {
-    throw "blackshard.sys was not found beside install.ps1. Run deploy.ps1 after building the driver."
+$installDriver = -not $SkipDriver
+if ($installDriver -and -not (Test-Path -LiteralPath $sourceDriver -PathType Leaf)) {
+    Write-Warning "blackshard.sys was not found beside install.ps1; installing without the kernel minifilter."
+    $installDriver = $false
 }
 foreach ($sourceArtifact in @(
     @{ Path = $sourceService; Name = "blackshard-service.exe" },
@@ -173,18 +178,23 @@ foreach ($sourceArtifact in @(
     }
 }
 
-$signature = Get-AuthenticodeSignature -LiteralPath $sourceDriver
-if ($signature.Status -ne "Valid" -and -not $AllowUnsigned) {
-    throw @"
-blackshard.sys does not have a trusted signature (status: $($signature.Status)).
-Production Windows systems must use a properly signed driver. On an isolated test VM,
-run enable-test-signing.ps1, reboot, and then run install.ps1 again.
-Use -AllowUnsigned only when code-integrity enforcement is already disabled in a disposable VM.
+if ($installDriver) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $sourceDriver
+    if ($signature.Status -ne "Valid" -and -not $AllowUnsigned) {
+        # Windows would refuse to load it anyway, so fall back rather than abort. The agent is
+        # still useful without the driver; it just cannot mediate file system operations.
+        Write-Warning @"
+blackshard.sys does not have a trusted signature (status: $($signature.Status)), so the kernel
+minifilter will not be installed. blackshard will run with AMSI coverage for scripts and macros,
+plus on-demand scanning and quarantine.
+To use the minifilter, either install a properly signed driver, or on an isolated test VM run
+enable-test-signing.ps1, reboot, and re-run install.ps1 with -AllowUnsigned.
 "@
-}
-
-if ($signature.Status -ne "Valid") {
-    Write-Warning "Installing an untrusted driver in test mode. Never do this on a production system."
+        $installDriver = $false
+    }
+    elseif ($signature.Status -ne "Valid") {
+        Write-Warning "Installing an untrusted driver in test mode. Never do this on a production system."
+    }
 }
 
 foreach ($sourceExecutable in @($sourceService, $sourceUi)) {
@@ -249,102 +259,107 @@ foreach ($provider in @(
     if ($LASTEXITCODE -ne 0) { throw "Could not register the $($provider.View)-bit AMSI provider." }
 }
 
-if (Test-blackshardFilterLoaded) {
-    & fltmc.exe unload $driverName | Out-Host
-}
-& sc.exe stop $driverName 2>$null | Out-Host
-& sc.exe delete $driverName 2>$null | Out-Host
-
-
-
-
-
-
-$waitLimit = 20
-for ($i = 0; $i -lt $waitLimit; $i++) {
-    $query = & sc.exe query $driverName 2>&1
-    if ($LASTEXITCODE -ne 0) {
-
-        break
+if ($installDriver) {
+    if (Test-blackshardFilterLoaded) {
+        & fltmc.exe unload $driverName | Out-Host
     }
-    Start-Sleep -Milliseconds 500
-}
-if (Test-Path -LiteralPath $serviceRegistryPath) {
-
-
-
-    Remove-Item -LiteralPath $serviceRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 500
-}
-
-Copy-Item -LiteralPath $sourceDriver -Destination $destinationDriver -Force
-
-$createCmd = 'sc.exe create "{0}" type= filesys start= demand error= normal binPath= "{1}" group= "FSFilter Anti-Virus" depend= FltMgr' -f $driverName, $destinationDriver
-$createOutput = & cmd.exe /c $createCmd 2>&1
-$createExitCode = $LASTEXITCODE
-$createOutput | Out-Host
-if ($createExitCode -ne 0) {
-    throw "Could not create the blackshard driver service (sc.exe exit code $createExitCode)."
-}
-
-if (-not (Test-Path -LiteralPath $serviceRegistryPath)) {
-    New-Item -Path $serviceRegistryPath -Force | Out-Null
-}
+    & sc.exe stop $driverName 2>$null | Out-Host
+    & sc.exe delete $driverName 2>$null | Out-Host
 
 
 
 
 
 
-$instanceLayouts = @(
-    (Join-Path $serviceRegistryPath "Instances"),
-    (Join-Path $serviceRegistryPath "Parameters\Instances")
-)
-foreach ($instancesPath in $instanceLayouts) {
-    $instancePath = Join-Path $instancesPath "blackshard Instance"
-    New-Item -Path $instancesPath -Force | Out-Null
-    New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
-    New-Item -Path $instancePath -Force | Out-Null
+    $waitLimit = 20
+    for ($i = 0; $i -lt $waitLimit; $i++) {
+        $query = & sc.exe query $driverName 2>&1
+        if ($LASTEXITCODE -ne 0) {
+
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (Test-Path -LiteralPath $serviceRegistryPath) {
 
 
 
-    New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
-}
+        Remove-Item -LiteralPath $serviceRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+
+    Copy-Item -LiteralPath $sourceDriver -Destination $destinationDriver -Force
+
+    $createCmd = 'sc.exe create "{0}" type= filesys start= demand error= normal binPath= "{1}" group= "FSFilter Anti-Virus" depend= FltMgr' -f $driverName, $destinationDriver
+    $createOutput = & cmd.exe /c $createCmd 2>&1
+    $createExitCode = $LASTEXITCODE
+    $createOutput | Out-Host
+    if ($createExitCode -ne 0) {
+        throw "Could not create the blackshard driver service (sc.exe exit code $createExitCode)."
+    }
+
+    if (-not (Test-Path -LiteralPath $serviceRegistryPath)) {
+        New-Item -Path $serviceRegistryPath -Force | Out-Null
+    }
 
 
-$parametersPath = Join-Path $serviceRegistryPath "Parameters"
-New-Item -Path $parametersPath -Force | Out-Null
-New-ItemProperty -Path $parametersPath -Name "DebugFlags" -Value 0 -PropertyType DWord -Force | Out-Null
-New-ItemProperty -Path $parametersPath -Name "SupportedFeatures" -Value 3 -PropertyType DWord -Force | Out-Null
-
-Write-Host "[*] Loading blackshard minifilter..." -ForegroundColor Cyan
 
 
 
-$registryDump = & reg.exe query "HKLM\System\CurrentControlSet\Services\$driverName" /s 2>&1
-$registryDump | Out-Host
 
-$loadOutput = & fltmc.exe load $driverName 2>&1
-$loadExitCode = $LASTEXITCODE
-$loadOutput | Out-Host
-if ($loadExitCode -ne 0) {
-    $loadMessage = ($loadOutput | Out-String).Trim()
-    $diagnostics = Get-DriverLoadDiagnostics
-    $regDump = ($registryDump | Out-String).Trim()
-    throw @"
+    $instanceLayouts = @(
+        (Join-Path $serviceRegistryPath "Instances"),
+        (Join-Path $serviceRegistryPath "Parameters\Instances")
+    )
+    foreach ($instancesPath in $instanceLayouts) {
+        $instancePath = Join-Path $instancesPath "blackshard Instance"
+        New-Item -Path $instancesPath -Force | Out-Null
+        New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
+        New-Item -Path $instancePath -Force | Out-Null
+
+
+
+        New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
+    }
+
+
+    $parametersPath = Join-Path $serviceRegistryPath "Parameters"
+    New-Item -Path $parametersPath -Force | Out-Null
+    New-ItemProperty -Path $parametersPath -Name "DebugFlags" -Value 0 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $parametersPath -Name "SupportedFeatures" -Value 3 -PropertyType DWord -Force | Out-Null
+
+    Write-Host "[*] Loading blackshard minifilter..." -ForegroundColor Cyan
+
+
+
+    $registryDump = & reg.exe query "HKLM\System\CurrentControlSet\Services\$driverName" /s 2>&1
+    $registryDump | Out-Host
+
+    $loadOutput = & fltmc.exe load $driverName 2>&1
+    $loadExitCode = $LASTEXITCODE
+    $loadOutput | Out-Host
+    if ($loadExitCode -ne 0) {
+        $loadMessage = ($loadOutput | Out-String).Trim()
+        $diagnostics = Get-DriverLoadDiagnostics
+        $regDump = ($registryDump | Out-String).Trim()
+        throw @"
 The service was installed, but Windows refused to load the minifilter (fltmc exit code $loadExitCode).
 fltmc output: $loadMessage
 $diagnostics
 Service registry state:
 $regDump
 "@
-}
+    }
 
-if (-not (Test-blackshardFilterLoaded)) {
-    throw "fltmc reported success, but blackshard is absent from the loaded filter list."
-}
+    if (-not (Test-blackshardFilterLoaded)) {
+        throw "fltmc reported success, but blackshard is absent from the loaded filter list."
+    }
 
+}
+else {
+    Write-Host "[*] Skipping the kernel minifilter; blackshard will run with AMSI coverage." -ForegroundColor Yellow
+}
 Write-Host "[*] Installing blackshard protection service..." -ForegroundColor Cyan
 $null = New-Service `
     -Name $protectionServiceName `
@@ -371,5 +386,11 @@ if (-not $serviceRunning) {
     throw "The blackshard protection service did not reach RUNNING state."
 }
 
-Write-Host "[+] blackshard minifilter and protection service are running." -ForegroundColor Green
-& fltmc.exe instances -f $driverName | Out-Host
+if ($installDriver) {
+    Write-Host "[+] blackshard minifilter and protection service are running." -ForegroundColor Green
+    & fltmc.exe instances -f $driverName | Out-Host
+}
+else {
+    Write-Host "[+] blackshard protection service is running with AMSI coverage." -ForegroundColor Green
+    Write-Host "    Real-time protection covers scripts and macros. Install the signed driver for file system coverage." -ForegroundColor Gray
+}

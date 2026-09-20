@@ -309,6 +309,20 @@ impl RealtimeProtection {
         }
     }
 
+    /// An inert instance for machines with no minifilter installed.
+    ///
+    /// Starting the supervisor there would retry a port that never opens, backing off to a
+    /// 60 second cycle of failures for the life of the service. `driver_health` already reports an
+    /// error while the port is zero, so callers need no other change.
+    pub fn without_driver() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            port: Arc::new(AtomicIsize::new(0)),
+            worker: None,
+            counters: Arc::new(Mutex::new(RealtimeCounters::default())),
+        }
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let handle = self.port.swap(0, Ordering::AcqRel);

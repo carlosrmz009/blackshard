@@ -46,6 +46,10 @@ pub enum DriverStatus {
     Checking,
     Connected,
     Disconnected(String),
+    /// The minifilter was never installed. Real-time coverage falls back to AMSI, which is a
+    /// supported configuration rather than a fault, so this is not reported in red.
+    NotRequired,
+    /// The minifilter is installed but unusable, which *is* a fault.
     NotInstalled,
     Error(String),
 }
@@ -97,6 +101,7 @@ pub enum ProtectionTestStatus {
 pub struct UiRuntimeState {
     pub protection: ProtectionStatus,
     pub driver: DriverStatus,
+    pub tier: crate::readiness::ProtectionTier,
     pub build_trust: BuildTrustStatus,
     pub certification: CertificationStatus,
     pub definitions: DefinitionStatus,
@@ -119,6 +124,7 @@ impl Default for UiRuntimeState {
         Self {
             protection: ProtectionStatus::Starting,
             driver: DriverStatus::Checking,
+            tier: crate::readiness::ProtectionTier::default(),
             build_trust: BuildTrustStatus::Checking,
             certification: CertificationStatus::NotEvaluated,
             definitions: DefinitionStatus::BuiltInOnly {
@@ -696,8 +702,13 @@ impl BlackshardApp {
         );
 
         let (health, detail, color) = overall_health(runtime);
+        // The userland self-test exercises the detection engine rather than kernel enforcement,
+        // so it is just as runnable without a driver.
         let test_available = matches!(runtime.protection, ProtectionStatus::Active)
-            && matches!(runtime.driver, DriverStatus::Connected);
+            && matches!(
+                runtime.driver,
+                DriverStatus::Connected | DriverStatus::NotRequired
+            );
         let test_busy = matches!(
             runtime.protection_test,
             ProtectionTestStatus::Requested | ProtectionTestStatus::Running
@@ -1919,6 +1930,9 @@ fn compact_health(runtime: &UiRuntimeState) -> (String, Color32) {
         (ProtectionStatus::Active, DriverStatus::Connected) => {
             ("PROTECTION ACTIVE".to_owned(), GREEN)
         }
+        (ProtectionStatus::Active, DriverStatus::NotRequired) => {
+            ("PROTECTION ACTIVE".to_owned(), GREEN)
+        }
         (ProtectionStatus::Paused, _) => ("PROTECTION PAUSED".to_owned(), AMBER),
         (ProtectionStatus::Unavailable(_), _)
         | (_, DriverStatus::Disconnected(_))
@@ -1938,6 +1952,14 @@ fn overall_health(runtime: &UiRuntimeState) -> (String, String, Color32) {
             "The real-time engine and kernel minifilter report a healthy connection.".to_owned(),
             GREEN,
         ),
+        // Real protection, narrower than the kernel tier. The scope is stated rather than rounded
+        // up, so nobody believes they have file system coverage they do not have.
+        (ProtectionStatus::Active, DriverStatus::NotRequired) => (
+            "PROTECTION ACTIVE".to_owned(),
+            "Real-time protection covers scripts and macros through AMSI, with on-demand scanning              and quarantine active. Installing the signed driver adds file system coverage."
+                .to_owned(),
+            GREEN,
+        ),
         (ProtectionStatus::Paused, _) => (
             "PROTECTION PAUSED".to_owned(),
             "Real-time inspection is paused. On-demand scanning remains available.".to_owned(),
@@ -1954,8 +1976,9 @@ fn overall_health(runtime: &UiRuntimeState) -> (String, String, Color32) {
             RED,
         ),
         (_, DriverStatus::NotInstalled) => (
-            "ON-DEMAND ONLY".to_owned(),
-            "The kernel minifilter is not installed; real-time blocking is unavailable.".to_owned(),
+            "LIMITED PROTECTION".to_owned(),
+            "The kernel minifilter is installed but could not be loaded; file system blocking is              unavailable."
+                .to_owned(),
             RED,
         ),
         (ProtectionStatus::Degraded(reason), _) => (
@@ -1986,6 +2009,7 @@ fn driver_label(status: &DriverStatus) -> (String, Color32) {
         DriverStatus::Checking => ("CHECKING".to_owned(), AMBER),
         DriverStatus::Connected => ("CONNECTED".to_owned(), GREEN),
         DriverStatus::Disconnected(reason) => (format!("DISCONNECTED | {reason}"), RED),
+        DriverStatus::NotRequired => ("NOT INSTALLED | AMSI COVERAGE ACTIVE".to_owned(), AMBER),
         DriverStatus::NotInstalled => ("NOT INSTALLED".to_owned(), RED),
         DriverStatus::Error(reason) => (format!("ERROR | {reason}"), RED),
     }
@@ -2136,7 +2160,32 @@ mod tests {
             ..UiRuntimeState::default()
         };
         assert_eq!(compact_health(&state).0, "PROTECTION LIMITED");
-        assert_eq!(overall_health(&state).0, "ON-DEMAND ONLY");
+        assert_eq!(overall_health(&state).0, "LIMITED PROTECTION");
+    }
+
+    #[test]
+    fn a_userland_install_reads_as_protected_rather_than_broken() {
+        let state = UiRuntimeState {
+            protection: ProtectionStatus::Active,
+            driver: DriverStatus::NotRequired,
+            tier: crate::readiness::ProtectionTier::Userland,
+            ..UiRuntimeState::default()
+        };
+
+        assert_eq!(compact_health(&state).0, "PROTECTION ACTIVE");
+        let (headline, detail, colour) = overall_health(&state);
+        assert_eq!(headline, "PROTECTION ACTIVE");
+        assert_eq!(colour, GREEN);
+
+        // The scope has to be stated, not rounded up to full file system coverage.
+        assert!(detail.contains("AMSI"), "{detail}");
+        assert!(detail.contains("signed driver"), "{detail}");
+    }
+
+    #[test]
+    fn an_absent_driver_is_not_reported_in_red_when_none_is_installed() {
+        assert_eq!(driver_label(&DriverStatus::NotRequired).1, AMBER);
+        assert_eq!(driver_label(&DriverStatus::NotInstalled).1, RED);
     }
 
     #[test]

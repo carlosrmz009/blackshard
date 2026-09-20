@@ -105,6 +105,10 @@ pub struct ServiceHealthSnapshot {
     pub readiness: Option<crate::readiness::ReadinessState>,
     #[serde(default)]
     pub definition_database_version: Option<String>,
+    /// How much of the machine this install can watch. Defaults to `Kernel` so a snapshot written
+    /// by an older build is not mistaken for a driverless install.
+    #[serde(default)]
+    pub tier: crate::readiness::ProtectionTier,
 }
 
 impl ServiceHealthSnapshot {
@@ -128,6 +132,7 @@ impl ServiceHealthSnapshot {
             counters: ServiceCounters::default(),
             readiness: Some(crate::readiness::ReadinessState::Starting),
             definition_database_version: None,
+            tier: crate::readiness::ProtectionTier::default(),
         }
     }
 }
@@ -416,8 +421,18 @@ mod windows_service_host {
             .map(|value| value.real_time_protection)
             .unwrap_or(true);
 
+        // The minifilter's presence decides how much of the machine can be watched. Detected once
+        // here rather than re-derived, so every later decision agrees on the tier.
+        let tier = crate::readiness::detect_protection_tier();
+        log::info!(
+            "Protection tier: {:?} (real-time coverage: {})",
+            tier,
+            tier.coverage_summary()
+        );
+
         let mut snapshot = ServiceHealthSnapshot::starting(started_at, real_time_enabled);
         snapshot.readiness = Some(readiness.diagnostics().current_state);
+        snapshot.tier = tier;
         write_health_best_effort(&health_path, &snapshot, &history);
 
         readiness.update_state(crate::readiness::ReadinessState::LoadingFreshClam);
@@ -476,15 +491,19 @@ mod windows_service_host {
         let (event_sender, event_receiver) = mpsc::sync_channel(REALTIME_EVENT_CHANNEL_CAPACITY);
         let definition_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let verdict_cache = crate::verdict_cache::VerdictCache::new(100_000);
-        let mut protection = RealtimeProtection::start(
-            Arc::clone(&engine),
-            Arc::clone(&quarantine),
-            Arc::clone(&history),
-            Arc::clone(&settings),
-            event_sender,
-            Arc::clone(&verdict_cache),
-            Arc::clone(&definition_generation),
-        );
+        let mut protection = if tier.requires_driver() {
+            RealtimeProtection::start(
+                Arc::clone(&engine),
+                Arc::clone(&quarantine),
+                Arc::clone(&history),
+                Arc::clone(&settings),
+                event_sender,
+                Arc::clone(&verdict_cache),
+                Arc::clone(&definition_generation),
+            )
+        } else {
+            RealtimeProtection::without_driver()
+        };
         let counters = Arc::clone(&protection.counters);
         let (mut update_client, update_receiver) =
             start_definition_updater(&settings, &mut snapshot, &history);
@@ -691,22 +710,28 @@ mod windows_service_host {
                 last_worker_health_check = Some(Instant::now());
             }
             let worker_preflight = active_freshclam.is_some() && parser_worker_healthy;
+            let self_test_ready =
+                worker_preflight && (!tier.requires_driver() || driver_health.is_some());
             if !self_test_passed
-                && driver_health.is_some()
-                && worker_preflight
+                && self_test_ready
                 && last_self_test_attempt
                     .is_none_or(|attempt| attempt.elapsed() >= Duration::from_secs(30))
             {
                 last_self_test_attempt = Some(Instant::now());
-                match crate::self_test::run_self_test() {
+                let outcome = match engine.read() {
+                    Ok(active) => crate::self_test::run_tiered_self_test(tier, &active),
+                    Err(_) => Err("the detection engine lock is poisoned".to_owned()),
+                };
+                match outcome {
                     Ok(message) => {
                         log::info!("{message}");
                         self_test_passed = true;
                     }
-                    Err(error) => log::warn!("End-to-end protection self-test failed: {error}"),
+                    Err(error) => log::warn!("Protection self-test failed: {error}"),
                 }
             }
             let mut components = crate::readiness::ProtectionComponents {
+                tier,
                 service_operational: snapshot.lifecycle == ServiceLifecycle::Running,
                 settings_loaded: true,
                 native_definitions_loaded: !matches!(

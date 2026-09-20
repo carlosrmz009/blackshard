@@ -29,8 +29,68 @@ pub enum UserFacingStatus {
     Repairing,
 }
 
+/// How much of the machine blackshard can actually watch.
+///
+/// The tier is detected rather than configured: the minifilter's presence *is* the tier. See
+/// [`detect_protection_tier`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtectionTier {
+    /// The signed minifilter is installed, so every file operation is mediated in the kernel.
+    ///
+    /// This is the default so that any path which forgets to set the tier errs towards demanding
+    /// the driver and reporting a degraded state. Over-reporting protection is the dangerous
+    /// direction for an antivirus; a loud false alarm is recoverable, a quiet false assurance is
+    /// not.
+    #[default]
+    Kernel,
+    /// No minifilter is installed. AMSI still covers scripts, macros and .NET loads, and on-demand
+    /// scanning, quarantine and definition updates are unaffected.
+    Userland,
+}
+
+impl ProtectionTier {
+    pub fn requires_driver(&self) -> bool {
+        matches!(self, Self::Kernel)
+    }
+
+    /// Short description of what real-time protection actually covers in this tier.
+    pub fn coverage_summary(&self) -> &'static str {
+        match self {
+            Self::Kernel => "files and scripts",
+            Self::Userland => "scripts and macros (AMSI)",
+        }
+    }
+}
+
+/// Decides the tier from whether the minifilter binary is installed.
+///
+/// `install.ps1` writes `blackshard.sys` into the driver store and its uninstall path removes it,
+/// so the file's presence tracks whether the driver was ever installed. This cannot wrongly claim
+/// kernel protection: an actual connection is what sets `driver_connected`. It only decides
+/// whether the *absence* of a driver is expected or a fault.
+///
+/// A stale `.sys` with no service entry lands in the fault path, which is the same behaviour as
+/// before this tiering existed. Querying the service registry key would tighten that if it ever
+/// matters.
+pub fn detect_protection_tier() -> ProtectionTier {
+    let driver = std::path::Path::new(&std::env::var_os("SystemRoot").unwrap_or_else(|| {
+        // Only reachable on a machine with no SystemRoot, where nothing else would work either.
+        std::ffi::OsString::from(r"C:\Windows")
+    }))
+    .join("System32")
+    .join("drivers")
+    .join("blackshard.sys");
+
+    if driver.is_file() {
+        ProtectionTier::Kernel
+    } else {
+        ProtectionTier::Userland
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProtectionComponents {
+    pub tier: ProtectionTier,
     pub service_operational: bool,
     pub settings_loaded: bool,
     pub native_definitions_loaded: bool,
@@ -62,8 +122,6 @@ impl ProtectionComponents {
                 "active FreshClam database",
             ),
             (self.rule_generation != 0, "rule generation"),
-            (self.driver_connected, "minifilter connection"),
-            (self.driver_protocol_validated, "driver protocol"),
             (self.parser_worker_healthy, "isolated parser worker"),
             (self.quarantine_available, "quarantine store"),
             (self.history_available, "event history"),
@@ -74,6 +132,20 @@ impl ProtectionComponents {
                 failures.push(name);
             }
         }
+
+        // The minifilter is only load-bearing when it is actually installed. Without it the agent
+        // still protects through AMSI, on-demand scanning and quarantine, so its absence is a
+        // supported configuration rather than a failure. A driver that *is* installed but will not
+        // connect remains a fault.
+        if self.tier.requires_driver() {
+            if !self.driver_connected {
+                failures.push("minifilter connection");
+            }
+            if !self.driver_protocol_validated {
+                failures.push("driver protocol");
+            }
+        }
+
         failures
     }
 }
@@ -85,7 +157,7 @@ pub fn derive_readiness(components: &ProtectionComponents) -> ReadinessState {
             reason: format!("Unavailable: {}", failures.join(", ")),
         };
     }
-    if components.driver_ready_generation.is_none() {
+    if components.tier.requires_driver() && components.driver_ready_generation.is_none() {
         return ReadinessState::Recovering {
             reason: "Arming the validated driver generation".to_owned(),
         };
@@ -241,6 +313,7 @@ mod tests {
 
     fn healthy_components() -> ProtectionComponents {
         ProtectionComponents {
+            tier: ProtectionTier::Kernel,
             service_operational: true,
             settings_loaded: true,
             native_definitions_loaded: true,
@@ -286,7 +359,7 @@ mod tests {
             |components: &mut ProtectionComponents| components.driver_connected = false,
             |components: &mut ProtectionComponents| components.self_test_passed = false,
             |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
-            |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
+            |components: &mut ProtectionComponents| components.quarantine_available = false,
         ] {
             let mut components = healthy_components();
             mutate(&mut components);
@@ -295,5 +368,60 @@ mod tests {
                 ReadinessState::Ready
             ));
         }
+    }
+
+    #[test]
+    fn the_userland_tier_reaches_ready_without_any_driver() {
+        let mut components = healthy_components();
+        components.tier = ProtectionTier::Userland;
+        components.driver_connected = false;
+        components.driver_protocol_validated = false;
+        components.driver_ready_generation = None;
+
+        assert_eq!(components.mandatory_failures(), Vec::<&str>::new());
+        assert_eq!(derive_readiness(&components), ReadinessState::Ready);
+    }
+
+    #[test]
+    fn an_installed_driver_that_will_not_connect_is_still_a_fault() {
+        let mut components = healthy_components();
+        components.driver_connected = false;
+
+        // Same missing driver as the userland case above, but this machine has one installed, so
+        // its absence is a failure rather than a supported configuration.
+        assert!(components
+            .mandatory_failures()
+            .contains(&"minifilter connection"));
+        assert!(matches!(
+            derive_readiness(&components),
+            ReadinessState::Degraded { .. }
+        ));
+    }
+
+    #[test]
+    fn the_userland_tier_still_requires_everything_that_does_not_need_a_driver() {
+        for mutate in [
+            |components: &mut ProtectionComponents| components.self_test_passed = false,
+            |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
+            |components: &mut ProtectionComponents| components.native_definitions_loaded = false,
+            |components: &mut ProtectionComponents| components.quarantine_available = false,
+        ] {
+            let mut components = healthy_components();
+            components.tier = ProtectionTier::Userland;
+            mutate(&mut components);
+            assert!(!matches!(
+                derive_readiness(&components),
+                ReadinessState::Ready
+            ));
+        }
+    }
+
+    #[test]
+    fn the_tier_defaults_to_demanding_the_driver() {
+        // Over-reporting protection is the dangerous direction, so a forgotten tier must fail
+        // loudly rather than quietly claim coverage it does not have.
+        assert_eq!(ProtectionTier::default(), ProtectionTier::Kernel);
+        assert!(ProtectionTier::default().requires_driver());
+        assert!(!ProtectionTier::Userland.requires_driver());
     }
 }
