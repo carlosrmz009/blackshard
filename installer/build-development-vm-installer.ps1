@@ -10,8 +10,6 @@ param(
     [string]$AmsiX64Path,
     [Parameter(Mandatory)]
     [string]$AmsiX86Path,
-    [Parameter(Mandatory)]
-    [string]$ClamRuntimePath,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\target\development-installer")
 )
 
@@ -34,7 +32,6 @@ $UiPath = Resolve-RequiredFile $UiPath "blackshard desktop UI"
 $DriverPath = Resolve-RequiredFile $DriverPath "blackshard development driver"
 $AmsiX64Path = Resolve-RequiredFile $AmsiX64Path "blackshard x64 AMSI provider"
 $AmsiX86Path = Resolve-RequiredFile $AmsiX86Path "blackshard x86 AMSI provider"
-$ClamRuntimePath = Resolve-RequiredFile $ClamRuntimePath "Verified latest ClamAV runtime archive"
 $oobeSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "..\oobe.png") "blackshard OOBE image"
 $logoSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "..\logo.png") "blackshard logo"
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -201,7 +198,6 @@ $payload = [ordered]@{
     "blackshard.sys" = $DriverPath
     "blackshard-amsi-x64.dll" = $AmsiX64Path
     "blackshard-amsi-x86.dll" = $AmsiX86Path
-    "clamav-runtime.zip" = $ClamRuntimePath
     "install.ps1" = (Join-Path $PSScriptRoot "..\install.ps1")
     "uninstall.ps1" = (Join-Path $PSScriptRoot "..\uninstall.ps1")
     "verify.ps1" = (Join-Path $PSScriptRoot "..\verify.ps1")

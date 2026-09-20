@@ -1439,7 +1439,7 @@ mod windows_transport {
                     .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
                     .join("blackshard");
                 let active =
-                    crate::freshclam::downloader::active_database(&data_root).map_err(|error| {
+                    crate::clamdb::downloader::active_database(&data_root).map_err(|error| {
                         RpcFailure {
                             code: RpcErrorCode::NotConfigured,
                             message: format!(
@@ -1453,19 +1453,9 @@ mod windows_transport {
                     .max(0) as u64;
                 Ok(RpcResponse::FreshClamStatus {
                     status: FreshClamStatusView {
-                        engine_version: resources
-                            .engine
-                            .read()
-                            .map_err(|_| RpcFailure {
-                                code: RpcErrorCode::Internal,
-                                message: "detection engine state is unavailable".to_owned(),
-                            })?
-                            .clamav_worker_health()
-                            .map_err(|error| RpcFailure {
-                                code: RpcErrorCode::NotConfigured,
-                                message: error,
-                            })?
-                            .engine_version,
+                        // The definitions are now evaluated by blackshard's own engine, so the
+                        // reported engine version is blackshard's rather than a sidecar's.
+                        engine_version: format!("blackshard {}", env!("CARGO_PKG_VERSION")),
                         database_version: active.version,
                         database_age_hours: age,
                     },

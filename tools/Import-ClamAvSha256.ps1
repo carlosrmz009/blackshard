@@ -74,7 +74,7 @@ $databaseFiles = @(
     }
 )
 if ($databaseFiles.Count -eq 0) {
-    throw "No ClamAV SHA-256 .hsb database files were found. Use freshclam and sigtool --unpack first."
+    throw "No ClamAV SHA-256 .hsb database files were found. Run 'blackshard-service --update-definitions <data path>' first and point -DatabaseDirectory at its Unpacked folder."
 }
 
 foreach ($file in $databaseFiles) {

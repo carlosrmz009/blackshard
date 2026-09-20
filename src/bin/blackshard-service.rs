@@ -14,11 +14,8 @@ const SELF_TEST_ARGUMENT: &str = "--blackshard-self-test-open";
 const INSTALL_DRIVER_ARGUMENT: &str = "--install-driver";
 const UNINSTALL_DRIVER_ARGUMENT: &str = "--uninstall-driver";
 const NOTIFICATION_AGENT_ARGUMENT: &str = "--notification-agent";
-const CLAMAV_WORKER_ARGUMENT: &str = "--clamav-worker";
 const PARSER_WORKER_ARGUMENT: &str = "--parser-worker";
-const FRESHCLAM_UPDATE_ARGUMENT: &str = "--freshclam-update";
-const CLAMAV_SCAN_ARGUMENT: &str = "--clamav-scan";
-const CLAMAV_HEALTH_ARGUMENT: &str = "--clamav-health";
+const UPDATE_DEFINITIONS_ARGUMENT: &str = "--update-definitions";
 const VALIDATE_RELEASE_CONFIGURATION_ARGUMENT: &str = "--validate-release-configuration";
 const VALIDATE_DEFINITION_PAYLOAD_ARGUMENT: &str = "--validate-definition-payload";
 const VERIFY_DEFINITION_UPDATE_ARGUMENT: &str = "--verify-definition-update";
@@ -421,43 +418,34 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(INSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(true)),
         Some(UNINSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(false)),
         Some(NOTIFICATION_AGENT_ARGUMENT) => notification_agent::run().map_err(Into::into),
-        Some(CLAMAV_WORKER_ARGUMENT) => clamav_worker::run_worker_process().map_err(Into::into),
         Some(PARSER_WORKER_ARGUMENT) => parser_worker::run_worker_process().map_err(Into::into),
-        Some(FRESHCLAM_UPDATE_ARGUMENT) => {
+        Some(UPDATE_DEFINITIONS_ARGUMENT) => {
             let destination = std::env::args_os()
                 .nth(2)
                 .map(std::path::PathBuf::from)
-                .ok_or("usage: blackshard-service --freshclam-update <blackshard data path>")?;
-            let active = freshclam::downloader::download_databases(&destination)?;
+                .ok_or("usage: blackshard-service --update-definitions <blackshard data path>")?;
+            let active = clamdb::downloader::download_databases(&destination)?;
+
+            // Load the databases straight back so the command fails loudly if a container was
+            // fetched and unpacked but turns out to hold nothing blackshard can evaluate.
+            let mut index = clamdb::native_index::NativeIndex::new();
+            let stats = index.load_from_directory(
+                &active.unpacked_path,
+                clamdb::native_index::LoadOptions::default(),
+            )?;
             println!(
-                "Activated ClamAV generation {} version {} at {}",
+                "Activated definition generation {} version {} at {}",
                 active.generation,
                 active.version,
                 active.path.display()
             );
-            Ok(())
-        }
-        Some(CLAMAV_SCAN_ARGUMENT) => {
-            let path = std::env::args_os()
-                .nth(2)
-                .map(std::path::PathBuf::from)
-                .ok_or("usage: blackshard-service --clamav-scan <file>")?;
-            let mut worker = clamav_worker::ClamAvWorker::new()?;
-            worker.health_check()?;
-            let verdict = worker.scan_path(
-                path.to_str()
-                    .ok_or("the ClamAV diagnostic path is not valid Unicode")?,
-            )?;
-            println!("{verdict:?}");
-            Ok(())
-        }
-        Some(CLAMAV_HEALTH_ARGUMENT) => {
-            let mut worker = clamav_worker::ClamAvWorker::new()?;
-            let versions = worker.health_check()?;
             println!(
-                "ClamAV worker {} loaded and validated database {}.",
-                versions.engine_version, versions.database_version
+                "Indexed {} file hashes, {} PE section hashes and {} allowlist entries",
+                stats.file_hashes, stats.section_hashes, stats.allowlist_entries
             );
+            if stats.file_hashes == 0 {
+                return Err("the activated generation produced no usable file hashes".into());
+            }
             Ok(())
         }
         _ => Err("UI mode is not supported in this build".into()),

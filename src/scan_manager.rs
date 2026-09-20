@@ -163,6 +163,17 @@ impl ScanJob {
             }
         }
     }
+
+    /// Blocks until the scan worker has finished and returns its final progress.
+    ///
+    /// Callers that need a settled result should prefer this over polling `snapshot`, which makes
+    /// the outcome depend on how quickly the machine happens to get through the queue.
+    pub fn join(&mut self) -> ScanProgress {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.snapshot()
+    }
 }
 
 impl Drop for ScanJob {
@@ -676,14 +687,7 @@ mod tests {
             Settings::default(),
         );
 
-        for _ in 0..200 {
-            if job.snapshot().is_finished() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        job.join_if_finished();
-        let progress = job.snapshot();
+        let progress = job.join();
         assert_eq!(progress.phase, ScanPhase::Completed);
         assert_eq!(progress.scanned_files, 2);
         assert_eq!(progress.malicious_files, 1);
@@ -700,7 +704,7 @@ mod tests {
         let engine = Arc::new(DetectionEngine::builtin().unwrap());
         let quarantine = Arc::new(QuarantineStore::new(temporary.path().join("vault")));
         let history = Arc::new(EventHistory::new(temporary.path().join("history.jsonl")));
-        let job = ScanJob::start(
+        let mut job = ScanJob::start(
             ScanKind::Custom(vec![temporary.path().to_path_buf()]),
             engine,
             quarantine,
@@ -708,13 +712,7 @@ mod tests {
             Settings::default(),
         );
         job.cancel();
-        for _ in 0..100 {
-            if job.snapshot().is_finished() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(matches!(job.snapshot().phase, ScanPhase::Cancelled));
+        assert!(matches!(job.join().phase, ScanPhase::Cancelled));
     }
 
     #[test]

@@ -41,7 +41,6 @@ pub struct ProtectionComponents {
     pub driver_connected: bool,
     pub driver_protocol_validated: bool,
     pub driver_ready_generation: Option<u64>,
-    pub clamav_worker_healthy: bool,
     pub parser_worker_healthy: bool,
     pub quarantine_available: bool,
     pub history_available: bool,
@@ -65,7 +64,6 @@ impl ProtectionComponents {
             (self.rule_generation != 0, "rule generation"),
             (self.driver_connected, "minifilter connection"),
             (self.driver_protocol_validated, "driver protocol"),
-            (self.clamav_worker_healthy, "ClamAV scanner worker"),
             (self.parser_worker_healthy, "isolated parser worker"),
             (self.quarantine_available, "quarantine store"),
             (self.history_available, "event history"),
@@ -253,7 +251,6 @@ mod tests {
             driver_connected: true,
             driver_protocol_validated: true,
             driver_ready_generation: Some(9),
-            clamav_worker_healthy: true,
             parser_worker_healthy: true,
             quarantine_available: true,
             history_available: true,
@@ -288,7 +285,7 @@ mod tests {
         for mutate in [
             |components: &mut ProtectionComponents| components.driver_connected = false,
             |components: &mut ProtectionComponents| components.self_test_passed = false,
-            |components: &mut ProtectionComponents| components.clamav_worker_healthy = false,
+            |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
             |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
         ] {
             let mut components = healthy_components();

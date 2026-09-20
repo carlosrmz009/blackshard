@@ -38,7 +38,6 @@ pub struct CachedVerdict {
     pub analysis_completeness: AnalysisCompleteness,
     pub automatic_quarantine_eligible: bool,
     pub execution_block_eligible: bool,
-    pub clamav_verdict: Option<crate::clamav_worker::protocol::ScanVerdict>,
 }
 
 impl CachedVerdict {
@@ -47,13 +46,11 @@ impl CachedVerdict {
             return false;
         }
         if self.verdict == CacheVerdict::Clean {
+            // The definition generation is part of the cache key, so a clean result stays valid
+            // until the databases change; no separate sidecar verdict needs to corroborate it.
             return self.analysis_completeness == AnalysisCompleteness::Complete
                 && !self.truncated
-                && self.sha256.is_some()
-                && matches!(
-                    self.clamav_verdict,
-                    Some(crate::clamav_worker::protocol::ScanVerdict::Clean { .. })
-                );
+                && self.sha256.is_some();
         }
         true
     }
@@ -164,10 +161,6 @@ mod tests {
             analysis_completeness: completeness,
             automatic_quarantine_eligible: false,
             execution_block_eligible: false,
-            clamav_verdict: Some(crate::clamav_worker::protocol::ScanVerdict::Clean {
-                engine_version: "test".to_owned(),
-                database_version: "1".to_owned(),
-            }),
         }
     }
 

@@ -78,7 +78,6 @@ jobs:
             -DriverPath .\dist\blackshard.sys `
             -AmsiX64Path .\dist\blackshard-amsi-x64.dll `
             -AmsiX86Path .\dist\blackshard-amsi-x86.dll `
-            -ClamRuntimePath .\dist\clamav-runtime.zip `
             -OutputDirectory .\dist
 
       - name: Verify development artifacts
@@ -90,7 +89,6 @@ jobs:
             "blackshard.sys",
             "blackshard-amsi-x64.dll",
             "blackshard-amsi-x86.dll",
-            "clamav-runtime.zip",
             "blackshard-vm-setup.exe"
           )
 
@@ -262,6 +260,39 @@ jobs:
       - name: Run cargo audit
         run: cargo audit --ignore RUSTSEC-2026-0269 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0222 --ignore RUSTSEC-2026-0257
         continue-on-error: true
+
+  definitions-smoke:
+    name: Native ClamAV definition pipeline
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 3 * * 6'
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - run: cargo build --release --bin blackshard-service
+
+      - name: Download and index the live ClamAV databases
+        shell: pwsh
+        run: |
+          # Exercises the whole native path end to end: HTTPS fetch, CVD header and MD5
+          # verification, tar extraction and signature indexing, with no ClamAV binaries present.
+          $data = Join-Path $env:RUNNER_TEMP "definitions"
+          New-Item -ItemType Directory -Path $data -Force | Out-Null
+          .\target\release\blackshard-service.exe --update-definitions $data
+          if ($LASTEXITCODE -ne 0) {
+            throw "The native definition pipeline failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Confirm no ClamAV runtime was required
+        shell: pwsh
+        run: |
+          $stray = @(Get-ChildItem -Path . -Recurse -File -Include "clamd.exe", "freshclam.exe", "sigtool.exe" -ErrorAction SilentlyContinue)
+          if ($stray.Count) {
+            throw "A ClamAV binary reappeared in the tree: $($stray.FullName -join ', ')"
+          }
 
   fuzz-smoke:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 3 * * 6'

@@ -83,10 +83,6 @@ pub struct ServiceCounters {
     pub required_enforcement_blocks: u64,
     pub driver_queue_overloads: u64,
     pub driver_ready_generation: u64,
-    pub clamav_clean: u64,
-    pub clamav_detected: u64,
-    pub clamav_errors: u64,
-    pub clamav_not_scanned: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,9 +104,7 @@ pub struct ServiceHealthSnapshot {
     #[serde(default)]
     pub readiness: Option<crate::readiness::ReadinessState>,
     #[serde(default)]
-    pub clamav_engine_version: Option<String>,
-    #[serde(default)]
-    pub clamav_database_version: Option<String>,
+    pub definition_database_version: Option<String>,
 }
 
 impl ServiceHealthSnapshot {
@@ -133,8 +127,7 @@ impl ServiceHealthSnapshot {
             },
             counters: ServiceCounters::default(),
             readiness: Some(crate::readiness::ReadinessState::Starting),
-            clamav_engine_version: None,
-            clamav_database_version: None,
+            definition_database_version: None,
         }
     }
 }
@@ -436,22 +429,21 @@ mod windows_service_host {
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         let blackshard_data = program_data.join("blackshard");
         let mut active_freshclam =
-            match crate::freshclam::downloader::download_databases(&blackshard_data) {
+            match crate::clamdb::downloader::download_databases(&blackshard_data) {
                 Ok(active) => Some(active),
                 Err(error) => {
                     log::warn!("Initial FreshClam activation failed: {error}");
-                    crate::freshclam::downloader::active_database(&blackshard_data).ok()
+                    crate::clamdb::downloader::active_database(&blackshard_data).ok()
                 }
             };
-        let freshclam_receiver =
-            crate::freshclam::scheduler::start_scheduler(blackshard_data.clone());
+        let freshclam_receiver = crate::clamdb::scheduler::start_scheduler(blackshard_data.clone());
 
         readiness.update_state(crate::readiness::ReadinessState::LoadingDefinitions);
         snapshot.readiness = Some(readiness.diagnostics().current_state);
         let engine = match load_detection_engine(&mut snapshot, &history) {
             Ok(engine) => {
                 let engine = if let Some(active) = active_freshclam.as_ref() {
-                    match load_freshclam_native_index(active) {
+                    match load_native_index(active) {
                         Ok(index) => engine.with_native_index(index),
                         Err(error) => {
                             log::warn!("ClamAV native SHA-256 index was not loaded: {error}");
@@ -564,7 +556,6 @@ mod windows_service_host {
         let mut self_test_passed = false;
         let mut last_self_test_attempt = None::<Instant>;
         let mut last_worker_health_check = None::<Instant>;
-        let mut clamav_worker_healthy = false;
         let mut parser_worker_healthy = false;
         while !stop_requested.load(Ordering::Acquire) {
             let mut changed = false;
@@ -585,11 +576,10 @@ mod windows_service_host {
             }
 
             while let Ok(active) = freshclam_receiver.try_recv() {
-                match load_freshclam_native_index(&active) {
+                match load_native_index(&active) {
                     Ok(index) => {
                         if let Ok(current) = engine.read() {
                             current.replace_native_index(index);
-                            current.reset_clamav_circuit_breaker();
                         }
                         active_freshclam = Some(active);
                         definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -693,24 +683,14 @@ mod windows_service_host {
                 .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(30))
             {
                 if let Ok(active) = engine.read() {
-                    match active.clamav_worker_health() {
-                        Ok(versions) => {
-                            clamav_worker_healthy = true;
-                            snapshot.clamav_engine_version = Some(versions.engine_version);
-                            snapshot.clamav_database_version = Some(versions.database_version);
-                        }
-                        Err(_) => {
-                            clamav_worker_healthy = false;
-                            snapshot.clamav_engine_version = None;
-                            snapshot.clamav_database_version = None;
-                        }
-                    }
                     parser_worker_healthy = active.parser_worker_healthy();
                 }
+                snapshot.definition_database_version = active_freshclam
+                    .as_ref()
+                    .map(|active| active.version.clone());
                 last_worker_health_check = Some(Instant::now());
             }
-            let worker_preflight =
-                active_freshclam.is_some() && clamav_worker_healthy && parser_worker_healthy;
+            let worker_preflight = active_freshclam.is_some() && parser_worker_healthy;
             if !self_test_passed
                 && driver_health.is_some()
                 && worker_preflight
@@ -746,7 +726,6 @@ mod windows_service_host {
                 driver_ready_generation: driver_health.as_ref().and_then(|health| {
                     (health.ready_generation != 0).then_some(health.ready_generation)
                 }),
-                clamav_worker_healthy,
                 parser_worker_healthy,
                 quarantine_available: quarantine.list().is_ok(),
                 history_available: history.recent(1).is_ok(),
@@ -1020,15 +999,21 @@ mod windows_service_host {
         Ok(outcome.engine)
     }
 
-    fn load_freshclam_native_index(
-        active: &crate::freshclam::downloader::ActiveDatabase,
-    ) -> Result<crate::freshclam::native_index::NativeIndex, String> {
-        let mut index = crate::freshclam::native_index::NativeIndex::new();
+    fn load_native_index(
+        active: &crate::clamdb::downloader::ActiveDatabase,
+    ) -> Result<crate::clamdb::native_index::NativeIndex, String> {
+        let mut index = crate::clamdb::native_index::NativeIndex::new();
         let loaded = index
-            .load_from_directory(&active.unpacked_path)
+            .load_from_directory(
+                &active.unpacked_path,
+                crate::clamdb::native_index::LoadOptions::default(),
+            )
             .map_err(|error| error.to_string())?;
         log::info!(
-            "Loaded {loaded} ClamAV SHA-256 signatures for generation {}",
+            "Loaded {} file hashes, {} PE section hashes and {} allowlist entries for generation {}",
+            loaded.file_hashes,
+            loaded.section_hashes,
+            loaded.allowlist_entries,
             active.generation
         );
         Ok(index)
@@ -1091,10 +1076,6 @@ mod windows_service_host {
                 quarantined: value.quarantined,
                 scan_errors: value.scan_errors,
                 bypassed_due_to_load: value.bypassed_due_to_load,
-                clamav_clean: value.clamav_clean,
-                clamav_detected: value.clamav_detected,
-                clamav_errors: value.clamav_errors,
-                clamav_not_scanned: value.clamav_not_scanned,
                 ..ServiceCounters::default()
             },
             Err(_) => {

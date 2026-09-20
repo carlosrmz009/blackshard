@@ -16,7 +16,6 @@ $sourceService = Join-Path $PSScriptRoot "blackshard-service.exe"
 $sourceUi = Join-Path $PSScriptRoot "blackshard-ui.exe"
 $sourceAmsiX64 = Join-Path $PSScriptRoot "blackshard-amsi-x64.dll"
 $sourceAmsiX86 = Join-Path $PSScriptRoot "blackshard-amsi-x86.dll"
-$sourceClamRuntime = Join-Path $PSScriptRoot "clamav-runtime.zip"
 $destinationDriver = Join-Path $env:SystemRoot "System32\drivers\blackshard.sys"
 $agentDirectory = Join-Path $env:ProgramFiles "blackshard"
 $destinationService = Join-Path $agentDirectory "blackshard-service.exe"
@@ -141,10 +140,6 @@ function Remove-blackshardInstallation {
             Remove-Item -LiteralPath $installedFile -Force
         }
     }
-    $installedClamRuntime = Join-Path $agentDirectory "ClamAV"
-    if (Test-Path -LiteralPath $installedClamRuntime -PathType Container) {
-        Remove-Item -LiteralPath $installedClamRuntime -Recurse -Force
-    }
     if (Test-Path -LiteralPath $agentDirectory -PathType Container) {
         $remaining = @(Get-ChildItem -LiteralPath $agentDirectory -Force)
         if ($remaining.Count -eq 0) {
@@ -171,8 +166,7 @@ foreach ($sourceArtifact in @(
     @{ Path = $sourceService; Name = "blackshard-service.exe" },
     @{ Path = $sourceUi; Name = "blackshard-ui.exe" },
     @{ Path = $sourceAmsiX64; Name = "blackshard-amsi-x64.dll" },
-    @{ Path = $sourceAmsiX86; Name = "blackshard-amsi-x86.dll" },
-    @{ Path = $sourceClamRuntime; Name = "clamav-runtime.zip" }
+    @{ Path = $sourceAmsiX86; Name = "blackshard-amsi-x86.dll" }
 )) {
     if (-not (Test-Path -LiteralPath $sourceArtifact.Path -PathType Leaf)) {
         throw "$($sourceArtifact.Name) was not found beside install.ps1. Run deploy.ps1 before copying dist to the VM."
@@ -208,16 +202,6 @@ Copy-Item -LiteralPath $sourceService -Destination $destinationService -Force
 Copy-Item -LiteralPath $sourceUi -Destination $destinationUi -Force
 Copy-Item -LiteralPath $sourceAmsiX64 -Destination $destinationAmsiX64 -Force
 Copy-Item -LiteralPath $sourceAmsiX86 -Destination $destinationAmsiX86 -Force
-$clamRuntimeDirectory = Join-Path $agentDirectory "ClamAV"
-if (Test-Path -LiteralPath $clamRuntimeDirectory -PathType Container) {
-    Remove-Item -LiteralPath $clamRuntimeDirectory -Recurse -Force
-}
-Expand-Archive -LiteralPath $sourceClamRuntime -DestinationPath $clamRuntimeDirectory -Force
-foreach ($requiredClamFile in @("clamd.exe", "clamscan.exe", "freshclam.exe", "sigtool.exe", "clamav-runtime.json")) {
-    if (-not (Test-Path -LiteralPath (Join-Path $clamRuntimeDirectory $requiredClamFile) -PathType Leaf)) {
-        throw "The packaged ClamAV runtime is incomplete: missing $requiredClamFile."
-    }
-}
 
 
 

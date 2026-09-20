@@ -546,7 +546,12 @@ impl ScanEngine {
             &evidence,
         );
 
-        let heuristic_score = self.model.active().evaluate(&heuristic_features);
+        // Reported alongside the verdict for telemetry and future tuning. It deliberately does
+        // not feed `risk_score` or `verdict` above: the static heuristic is not calibrated, and
+        // letting it convict would change detections without any corroborating evidence. It used
+        // to shadow the evidence derived score on this line, which made it look influential when
+        // it was not.
+        let model_score = self.model.active().evaluate(&heuristic_features);
 
         ScanReport {
             verdict,
@@ -562,7 +567,7 @@ impl ScanEngine {
             evidence,
             error: None,
             heuristic_features: Some(heuristic_features),
-            heuristic_score: Some(heuristic_score),
+            heuristic_score: Some(model_score),
         }
     }
 }

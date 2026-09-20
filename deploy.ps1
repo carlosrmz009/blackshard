@@ -20,12 +20,6 @@ try {
         exit $LASTEXITCODE
     }
 
-    $clamRuntimeDirectory = Join-Path $PSScriptRoot "build\clamav-runtime"
-    & (Join-Path $PSScriptRoot "tools\Get-ClamAvRuntime.ps1") -OutputDirectory $clamRuntimeDirectory
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
-
     $x86Target = "i686-pc-windows-msvc"
     $installedTargets = @(& rustup target list --installed)
     if ($LASTEXITCODE -ne 0 -or $x86Target -notin $installedTargets) {
@@ -86,16 +80,12 @@ try {
     Copy-Item -LiteralPath $amsiX64Binary -Destination (Join-Path $distributionDirectory "blackshard-amsi-x64.dll")
     Copy-Item -LiteralPath $amsiX86Binary -Destination (Join-Path $distributionDirectory "blackshard-amsi-x86.dll")
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "README.md") -Destination $distributionDirectory
-    $clamRuntimeArchive = Join-Path $distributionDirectory "clamav-runtime.zip"
-    Compress-Archive -Path (Join-Path $clamRuntimeDirectory "*") -DestinationPath $clamRuntimeArchive -CompressionLevel Optimal
-
     $requiredArtifacts = @(
         "blackshard-service.exe",
         "blackshard-ui.exe",
         "blackshard.sys",
         "blackshard-amsi-x64.dll",
         "blackshard-amsi-x86.dll"
-        "clamav-runtime.zip"
     )
     foreach ($requiredArtifact in $requiredArtifacts) {
         if (-not (Test-Path -LiteralPath (Join-Path $distributionDirectory $requiredArtifact) -PathType Leaf)) {

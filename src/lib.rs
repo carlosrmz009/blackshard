@@ -28,6 +28,5 @@ pub mod updater;
 pub mod vba;
 pub mod verdict_cache;
 
-pub mod clamav_worker;
-pub mod freshclam;
+pub mod clamdb;
 pub mod parser_worker;

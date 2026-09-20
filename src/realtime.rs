@@ -248,10 +248,6 @@ pub struct RealtimeCounters {
     pub quarantined: u64,
     pub scan_errors: u64,
     pub bypassed_due_to_load: u64,
-    pub clamav_clean: u64,
-    pub clamav_detected: u64,
-    pub clamav_errors: u64,
-    pub clamav_not_scanned: u64,
 }
 
 pub type SharedDetectionEngine = Arc<RwLock<Arc<DetectionEngine>>>;
@@ -580,7 +576,6 @@ pub(crate) fn realtime_worker(
                             container_inspection: None,
                             amsi_report: None,
                             amsi_error: None,
-                            clamav_verdict: cached.clamav_verdict.clone(),
                             elapsed: std::time::Duration::ZERO,
                             from_cache: true,
                             error: None,
@@ -617,7 +612,6 @@ pub(crate) fn realtime_worker(
                                     automatic_quarantine_eligible: scan_result
                                         .automatic_quarantine_eligible,
                                     execution_block_eligible: scan_result.execution_block_eligible,
-                                    clamav_verdict: scan_result.clamav_verdict.clone(),
                                 },
                             );
                         }
@@ -729,20 +723,6 @@ pub(crate) fn realtime_worker(
                 DetectionVerdict::Suspicious => value.suspicious += 1,
                 DetectionVerdict::Malicious => value.detected += 1,
                 DetectionVerdict::Error => value.scan_errors += 1,
-            }
-            match report.clamav_verdict.as_ref() {
-                Some(crate::clamav_worker::protocol::ScanVerdict::Clean { .. }) => {
-                    value.clamav_clean += 1
-                }
-                Some(crate::clamav_worker::protocol::ScanVerdict::Detected { .. }) => {
-                    value.clamav_detected += 1
-                }
-                Some(crate::clamav_worker::protocol::ScanVerdict::Error(_)) => {
-                    value.clamav_errors += 1
-                }
-                Some(crate::clamav_worker::protocol::ScanVerdict::NotScanned { .. })
-                | Some(crate::clamav_worker::protocol::ScanVerdict::Suspicious)
-                | None => value.clamav_not_scanned += 1,
             }
             if driver_verdict == DriverVerdict::Block && reply_accepted {
                 value.blocked_replies += 1;
