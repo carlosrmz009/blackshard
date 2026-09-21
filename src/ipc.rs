@@ -447,15 +447,17 @@ mod windows_transport {
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_NO_DATA,
-        ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        CheckTokenMembership, CreateWellKnownSid, GetLengthSid, GetTokenInformation, IsValidSid,
-        RevertToSelf, SecurityIdentification, TokenElevation, TokenImpersonationLevel, TokenUser,
-        WinBuiltinAdministratorsSid, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+        CheckTokenMembership, CreateWellKnownSid, EqualSid, GetLengthSid, GetTokenInformation,
+        IsValidSid, RevertToSelf, SecurityIdentification, TokenElevation, TokenImpersonationLevel,
+        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
+        SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
@@ -473,8 +475,29 @@ mod windows_transport {
 
     const IO_TIMEOUT: Duration = Duration::from_secs(3);
     const PIPE_DEFAULT_TIMEOUT_MS: u32 = 3_000;
-    const MANAGEMENT_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
-    const AMSI_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+    // Non-admin callers get `FILE_GENERIC_READ | FILE_WRITE_DATA` (0x12008b) rather than
+    // `GENERIC_WRITE`. On a pipe, `GENERIC_WRITE` includes `FILE_CREATE_PIPE_INSTANCE`, which would
+    // let any caller add a rogue server instance alongside the real ones; every instance shares
+    // this descriptor, so the owner check in `verify_pipe_owner` could not tell the two apart.
+    //
+    // `OW` grants the pipe's owner, whoever created the first instance, the right to add the rest
+    // of the pool. For the service that is SYSTEM, which already holds `GA` anyway.
+    const CLIENT_PIPE_ACCESS: u32 = 0x0012_008b;
+    const MANAGEMENT_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12008b;;;IU)";
+    const AMSI_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12008b;;;AU)";
+
+    /// Concurrent AMSI requests the service can serve.
+    ///
+    /// AMSI is the only real-time layer without the minifilter, and a single instance let a burst
+    /// of scripts queue past the client's wait budget, at which point the provider fails open.
+    // ponytail: fixed pool; size it from the core count if scanning ever becomes the bottleneck.
+    const AMSI_INSTANCES: usize = 8;
+
+    /// How long an AMSI client may take to send its request, or hold the instance afterwards.
+    ///
+    /// Genuine clients write as soon as they connect, so this only bounds how long an idle or
+    /// hostile connection can keep one of the pool's instances away from everyone else.
+    const AMSI_IO_TIMEOUT: Duration = Duration::from_millis(500);
 
     #[derive(Clone)]
     pub struct RpcServiceResources {
@@ -590,64 +613,73 @@ mod windows_transport {
                 Self::Amsi => MAX_AMSI_REQUEST_BYTES,
             }
         }
+
+        fn instances(self) -> usize {
+            match self {
+                // The UI and a handful of commands; one instance is plenty.
+                Self::Management => 1,
+                Self::Amsi => AMSI_INSTANCES,
+            }
+        }
+
+        fn io_timeout(self) -> Duration {
+            match self {
+                Self::Management => IO_TIMEOUT,
+                Self::Amsi => AMSI_IO_TIMEOUT,
+            }
+        }
     }
 
     pub struct RpcServer {
         stop: Arc<AtomicBool>,
-        workers: Vec<JoinHandle<()>>,
+        workers: Vec<(Endpoint, JoinHandle<()>)>,
     }
 
     impl RpcServer {
         pub fn start(resources: RpcServiceResources) -> Result<Self, String> {
             let stop = Arc::new(AtomicBool::new(false));
-            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(2);
-            let mut workers = Vec::with_capacity(2);
-            for (name, endpoint) in [
-                ("blackshard-local-rpc", Endpoint::Management),
-                ("blackshard-amsi-rpc", Endpoint::Amsi),
-            ] {
-                let worker_resources = resources.clone();
-                let worker_stop = Arc::clone(&stop);
-                let worker_ready = ready_sender.clone();
-                match thread::Builder::new().name(name.to_owned()).spawn(move || {
-                    server_loop(worker_resources, worker_stop, worker_ready, endpoint)
-                }) {
-                    Ok(worker) => workers.push(worker),
-                    Err(error) => {
-                        stop.store(true, Ordering::Release);
-                        wake_listener(PIPE_NAME);
-                        wake_listener(AMSI_PIPE_NAME);
-                        for worker in workers {
-                            let _ = worker.join();
-                        }
-                        return Err(format!("could not start {name}: {error}"));
-                    }
-                }
-            }
-            drop(ready_sender);
+            let mut workers = Vec::new();
 
-            for _ in 0..2 {
-                match ready_receiver.recv_timeout(IO_TIMEOUT) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        stop.store(true, Ordering::Release);
-                        wake_listener(PIPE_NAME);
-                        wake_listener(AMSI_PIPE_NAME);
-                        for worker in workers {
-                            let _ = worker.join();
+            // Instances start one at a time. The first of each endpoint must exist before its
+            // siblings: only the first uses `FILE_FLAG_FIRST_PIPE_INSTANCE`, and a sibling racing
+            // ahead would take the name and make that first create fail.
+            for endpoint in [Endpoint::Management, Endpoint::Amsi] {
+                for instance in 0..endpoint.instances() {
+                    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+                    let worker_resources = resources.clone();
+                    let worker_stop = Arc::clone(&stop);
+                    let spawned = thread::Builder::new()
+                        .name(format!("blackshard-{endpoint:?}-rpc-{instance}").to_lowercase())
+                        .spawn(move || {
+                            server_loop(
+                                worker_resources,
+                                worker_stop,
+                                ready_sender,
+                                endpoint,
+                                instance == 0,
+                            )
+                        });
+                    let worker = match spawned {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            stop_workers(&stop, workers);
+                            return Err(format!(
+                                "could not start the {endpoint:?} server: {error}"
+                            ));
                         }
+                    };
+                    workers.push((endpoint, worker));
+
+                    let failure = match ready_receiver.recv_timeout(IO_TIMEOUT) {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(error) => Some(format!(
+                            "the {endpoint:?} server did not initialize in time: {error}"
+                        )),
+                    };
+                    if let Some(error) = failure {
+                        stop_workers(&stop, workers);
                         return Err(error);
-                    }
-                    Err(error) => {
-                        stop.store(true, Ordering::Release);
-                        wake_listener(PIPE_NAME);
-                        wake_listener(AMSI_PIPE_NAME);
-                        for worker in workers {
-                            let _ = worker.join();
-                        }
-                        return Err(format!(
-                            "local control servers did not initialize in time: {error}"
-                        ));
                     }
                 }
             }
@@ -659,12 +691,31 @@ mod windows_transport {
         }
 
         fn shutdown(&mut self) {
-            self.stop.store(true, Ordering::Release);
+            stop_workers(&self.stop, std::mem::take(&mut self.workers));
+        }
+    }
 
-            wake_listener(PIPE_NAME);
-            wake_listener(AMSI_PIPE_NAME);
-            for worker in self.workers.drain(..) {
+    /// Signals every listener to stop and waits for them to exit.
+    ///
+    /// Each instance may be parked in `ConnectNamedPipe`, so each needs its own connection to wake
+    /// it. Pokes repeat until every worker has exited, because an instance that was busy when
+    /// `stop` was set only starts listening again, and so only becomes wakeable, afterwards.
+    fn stop_workers(stop: &AtomicBool, workers: Vec<(Endpoint, JoinHandle<()>)>) {
+        stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workers.iter().any(|(_, worker)| !worker.is_finished()) && Instant::now() < deadline {
+            for (endpoint, worker) in &workers {
+                if !worker.is_finished() {
+                    poke_listener(endpoint.pipe_name());
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        for (endpoint, worker) in workers {
+            if worker.is_finished() {
                 let _ = worker.join();
+            } else {
+                log::warn!("a {endpoint:?} listener did not stop within 5 seconds");
             }
         }
     }
@@ -680,47 +731,42 @@ mod windows_transport {
         stop: Arc<AtomicBool>,
         ready: SyncSender<Result<(), String>>,
         endpoint: Endpoint,
+        first: bool,
     ) {
-        let mut first = true;
-        while !stop.load(Ordering::Acquire) {
-            let pipe = loop {
-                match create_server_pipe(endpoint) {
-                    Ok(pipe) => break pipe,
-                    Err(error) => {
-                        if error.raw_os_error() == Some(5) {
-                            thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                        let detail = format!(
-                            "could not create protected {:?} local pipe: {error}",
-                            endpoint
-                        );
-                        if first {
-                            let _ = ready.send(Err(detail));
-                        } else {
-                            append_rpc_error(&resources.history, &detail);
-                        }
-                        return;
-                    }
-                }
-            };
+        // The instance is created once and reused for every client. Dropping and recreating it
+        // after each request left moments where the pipe name did not exist at all, and any local
+        // user could claim it in that gap.
+        let pipe = match create_server_pipe_with_retry(endpoint, first) {
+            Ok(pipe) => pipe,
+            Err(detail) => {
+                let _ = ready.send(Err(detail));
+                return;
+            }
+        };
+        let _ = ready.send(Ok(()));
 
-            if first {
-                let _ = ready.send(Ok(()));
-                first = false;
+        let blocking = PIPE_READMODE_BYTE | PIPE_WAIT;
+        while !stop.load(Ordering::Acquire) {
+            // The previous client left the handle non-blocking, and in that mode
+            // `ConnectNamedPipe` returns immediately instead of waiting.
+            unsafe {
+                SetNamedPipeHandleState(pipe.raw(), &blocking, null(), null());
             }
 
             let connected = unsafe { ConnectNamedPipe(pipe.raw(), null_mut()) } != 0
                 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
             if !connected {
                 if !stop.load(Ordering::Acquire) {
-                    append_rpc_error(
-                        &resources.history,
-                        &format!(
-                            "local control connection failed: {}",
-                            io::Error::last_os_error()
-                        ),
+                    log::debug!(
+                        "local control connection failed: {}",
+                        io::Error::last_os_error()
                     );
+                    // A client that connected and left before we noticed leaves the instance in a
+                    // state that only a disconnect clears.
+                    unsafe {
+                        DisconnectNamedPipe(pipe.raw());
+                    }
+                    thread::sleep(Duration::from_millis(10));
                 }
                 continue;
             }
@@ -748,7 +794,7 @@ mod windows_transport {
 
             let handled = match authorize_client(pipe.raw(), endpoint) {
                 Ok(caller) => {
-                    log::info!(
+                    log::debug!(
                         "IPC client connected and authorized: component {:?}, SID {:?}",
                         caller.component,
                         caller.sid
@@ -788,16 +834,50 @@ mod windows_transport {
             };
             if handled.is_ok() {
                 let mut dummy = [0u8; 1];
-                let _ = read_exact_until(pipe.raw(), &mut dummy, Instant::now() + IO_TIMEOUT);
+                let _ = read_exact_until(
+                    pipe.raw(),
+                    &mut dummy,
+                    Instant::now() + endpoint.io_timeout(),
+                );
             }
             unsafe {
                 DisconnectNamedPipe(pipe.raw());
             }
-            log::info!("IPC client disconnected");
+            log::debug!("IPC client disconnected");
         }
     }
 
-    fn create_server_pipe(endpoint: Endpoint) -> io::Result<OwnedHandle> {
+    /// Creates an instance, retrying briefly while a previous service process releases the name.
+    ///
+    /// A first instance that still cannot be created after that means another process holds the
+    /// name. That is reported as a startup failure instead of being retried forever, which is what
+    /// used to happen and what left a squatter in control indefinitely.
+    fn create_server_pipe_with_retry(
+        endpoint: Endpoint,
+        first: bool,
+    ) -> Result<OwnedHandle, String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match create_server_pipe(endpoint, first) {
+                Ok(pipe) => return Ok(pipe),
+                Err(error) if error.raw_os_error() == Some(5) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) if error.raw_os_error() == Some(5) => {
+                    return Err(format!(
+                        "the {endpoint:?} pipe name is already owned by another process: {error}"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "could not create protected {endpoint:?} local pipe: {error}"
+                    ))
+                }
+            }
+        }
+    }
+
+    fn create_server_pipe(endpoint: Endpoint, first: bool) -> io::Result<OwnedHandle> {
         let mut descriptor = null_mut();
         let sddl = wide(match endpoint {
             Endpoint::Management => MANAGEMENT_SDDL,
@@ -824,9 +904,14 @@ mod windows_transport {
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX
+                    | if first {
+                        FILE_FLAG_FIRST_PIPE_INSTANCE
+                    } else {
+                        0
+                    },
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
+                endpoint.instances() as u32,
                 MAX_RESPONSE_BYTES as u32,
                 endpoint.max_request_bytes() as u32,
                 PIPE_DEFAULT_TIMEOUT_MS,
@@ -1123,7 +1208,7 @@ mod windows_transport {
                 message: "only authenticated AMSI hosts may use this endpoint".to_owned(),
             });
         }
-        let bytes = read_frame(pipe, MAX_AMSI_REQUEST_BYTES, IO_TIMEOUT).map_err(|error| {
+        let bytes = read_frame(pipe, MAX_AMSI_REQUEST_BYTES, AMSI_IO_TIMEOUT).map_err(|error| {
             RpcFailure::transport(format!("could not read AMSI request: {error}"))
         })?;
         let request: AmsiRequestEnvelope =
@@ -1191,7 +1276,7 @@ mod windows_transport {
             .read()
             .map_err(|_| internal("engine lock"))?
             .clone();
-        let report = engine.scan_bytes(&content);
+        let report = engine.scan_amsi_submission(&content);
         Ok(match report.verdict {
             crate::detection::DetectionVerdict::Clean => DetectionVerdictView::Clean,
             crate::detection::DetectionVerdict::Suspicious => DetectionVerdictView::Suspicious,
@@ -1777,7 +1862,7 @@ mod windows_transport {
                 let handle = unsafe {
                     CreateFileW(
                         name.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
+                        CLIENT_PIPE_ACCESS,
                         0,
                         null(),
                         OPEN_EXISTING,
@@ -1786,7 +1871,10 @@ mod windows_transport {
                     )
                 };
                 if handle != INVALID_HANDLE_VALUE {
-                    return OwnedHandle::new(handle);
+                    let handle = OwnedHandle::new(handle)?;
+                    // Nothing is written until the pipe has been shown to belong to the service.
+                    verify_pipe_owner(handle.raw())?;
+                    return Ok(handle);
                 }
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() != Some(231) {
@@ -1794,7 +1882,10 @@ mod windows_transport {
                 }
             } else {
                 let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(2) {
+                // 2: no instance exists yet. 121: every instance stayed busy for the 500 ms wait.
+                // Both are worth retrying until the overall deadline; giving up on the first busy
+                // wait turned one slow client into a failed, and therefore unscanned, request.
+                if !matches!(err.raw_os_error(), Some(2) | Some(121)) {
                     return Err(err);
                 }
             }
@@ -1805,8 +1896,104 @@ mod windows_transport {
         }
     }
 
-    fn wake_listener(pipe_name: &str) {
-        let _ = connect_client(pipe_name);
+    /// Opens and immediately closes a connection, releasing a listener parked in
+    /// `ConnectNamedPipe`. Nothing is sent, so the server needs no verification, and one attempt
+    /// is enough because `stop_workers` repeats it.
+    fn poke_listener(pipe_name: &str) {
+        let name = wide(pipe_name);
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                CLIENT_PIPE_ACCESS,
+                0,
+                null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                0,
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
+        let mut sid = vec![0u8; 68];
+        let mut length = sid.len() as u32;
+        if unsafe { CreateWellKnownSid(kind, null_mut(), sid.as_mut_ptr().cast(), &mut length) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        sid.truncate(length as usize);
+        Ok(sid)
+    }
+
+    /// Owners a genuine blackshard pipe can have.
+    ///
+    /// The service runs as SYSTEM, and objects it creates are owned by SYSTEM or, under the
+    /// default "objects created by administrators" policy, by the Administrators group. A standard
+    /// user cannot make either the owner of a pipe they create.
+    fn trusted_pipe_owners() -> io::Result<Vec<Vec<u8>>> {
+        #[allow(unused_mut)]
+        let mut owners = vec![
+            well_known_sid(WinLocalSystemSid)?,
+            well_known_sid(WinBuiltinAdministratorsSid)?,
+        ];
+        // Test builds serve the pipes from the unelevated test process, which then owns them.
+        // This exists only in `cargo test` binaries and is never compiled into a release.
+        #[cfg(test)]
+        owners.push(transport_tests::current_process_owner_sid()?);
+        Ok(owners)
+    }
+
+    fn is_trusted_owner(owner: *mut c_void, trusted: &[Vec<u8>]) -> bool {
+        !owner.is_null()
+            && trusted
+                .iter()
+                .any(|sid| unsafe { EqualSid(owner, sid.as_ptr() as *mut c_void) } != 0)
+    }
+
+    /// Refuses a pipe that was not created by privileged code.
+    ///
+    /// Every instance of a named pipe shares one security descriptor, set by whoever created the
+    /// first. A squatter that claims the name first therefore owns the whole pipe, and this check
+    /// rejects it. It only holds because the DACLs above deny non-admins
+    /// `FILE_CREATE_PIPE_INSTANCE`; otherwise a rogue instance could join a genuine pipe and
+    /// inherit its trusted owner.
+    ///
+    /// The owner is read from the client's own handle, so no access to the server process is
+    /// needed. That matters: a standard user cannot open a SYSTEM service's process, which rules
+    /// out checking the server's image path from inside the AMSI provider.
+    fn verify_pipe_owner(pipe: HANDLE) -> io::Result<()> {
+        let mut owner = null_mut();
+        let mut descriptor = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                pipe,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = SecurityDescriptor(descriptor);
+        if is_trusted_owner(owner, &trusted_pipe_owners()?) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the pipe is not owned by SYSTEM or Administrators; refusing a possible impostor",
+            ))
+        }
     }
 
     fn quick_scan_roots() -> Vec<String> {
@@ -2087,6 +2274,180 @@ mod windows_transport {
             message.push_str("...");
         }
         message
+    }
+
+    #[cfg(test)]
+    mod transport_tests {
+        use super::*;
+        use crate::detection::DetectionEngine;
+        use crate::realtime::new_shared_detection_engine;
+        use std::sync::Barrier;
+
+        /// Starts a real server on the machine-wide pipe names, or returns `None` when an
+        /// installed service already owns them.
+        fn start_test_server(root: &Path) -> Option<RpcServer> {
+            let (update_sender, _update_receiver) = std::sync::mpsc::sync_channel(1);
+            let resources = RpcServiceResources::new(
+                new_shared_detection_engine(DetectionEngine::builtin().unwrap()),
+                Arc::new(QuarantineStore::new(root.join("vault"))),
+                Arc::new(EventHistory::new(root.join("history.jsonl"))),
+                Arc::new(RwLock::new(Settings::default())),
+                root.join("settings.json"),
+                update_sender,
+                false,
+            );
+            match RpcServer::start(resources) {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    eprintln!("skipping: the blackshard pipes are already served here ({error})");
+                    None
+                }
+            }
+        }
+
+        /// The owner that objects created by this process receive, which is what owns the pipes
+        /// a test server creates.
+        pub(super) fn current_process_owner_sid() -> io::Result<Vec<u8>> {
+            use windows_sys::Win32::Security::{TokenOwner, TOKEN_OWNER};
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+            let mut token = 0;
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let token = OwnedHandle::new(token)?;
+            let mut buffer = vec![0u8; 256];
+            let mut returned = 0u32;
+            if unsafe {
+                GetTokenInformation(
+                    token.raw(),
+                    TokenOwner,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    &mut returned,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let owner = unsafe { buffer.as_ptr().cast::<TOKEN_OWNER>().read_unaligned() }.Owner;
+            let length = unsafe { GetLengthSid(owner) } as usize;
+            Ok(unsafe { std::slice::from_raw_parts(owner as *const u8, length) }.to_vec())
+        }
+
+        #[test]
+        fn non_admin_callers_cannot_create_pipe_instances() {
+            const FILE_CREATE_PIPE_INSTANCE: u32 = 0x0004;
+            assert_eq!(CLIENT_PIPE_ACCESS & FILE_CREATE_PIPE_INSTANCE, 0);
+            for (sddl, principal) in [(AMSI_SDDL, "AU"), (MANAGEMENT_SDDL, "IU")] {
+                let ace = sddl
+                    .split('(')
+                    .find(|ace| ace.ends_with(&format!(";;;{principal})")))
+                    .unwrap_or_else(|| panic!("{sddl} grants {principal} nothing"));
+                // Symbolic generic rights are exactly what must not come back.
+                assert!(!ace.contains("GW") && !ace.contains("GA"), "{sddl}");
+                assert!(ace.contains(&format!("{CLIENT_PIPE_ACCESS:#x}")), "{sddl}");
+            }
+        }
+
+        #[test]
+        fn only_privileged_owners_are_trusted() {
+            use windows_sys::Win32::Security::{WinBuiltinUsersSid, WinWorldSid};
+
+            let production = [
+                well_known_sid(WinLocalSystemSid).unwrap(),
+                well_known_sid(WinBuiltinAdministratorsSid).unwrap(),
+            ];
+            let as_owner = |sid: &Vec<u8>| sid.as_ptr() as *mut c_void;
+
+            assert!(is_trusted_owner(as_owner(&production[0]), &production));
+            assert!(is_trusted_owner(as_owner(&production[1]), &production));
+            // A pipe created by an ordinary user is owned by that user or a group like these.
+            for squatter in [WinWorldSid, WinBuiltinUsersSid] {
+                let sid = well_known_sid(squatter).unwrap();
+                assert!(!is_trusted_owner(as_owner(&sid), &production));
+            }
+            assert!(!is_trusted_owner(null_mut(), &production));
+        }
+
+        /// One test owns the pipes so parallel tests never race for the same machine-wide names.
+        #[test]
+        fn concurrent_amsi_clients_are_all_scanned() {
+            let temporary = tempfile::tempdir().unwrap();
+            let Some(server) = start_test_server(temporary.path()) else {
+                return;
+            };
+
+            // Sized to pass comfortably on a small CI runner. The idle-client check below is what
+            // discriminates the old single-instance server; this is a correctness check under load.
+            const CLIENTS: usize = 64;
+            let barrier = Arc::new(Barrier::new(CLIENTS));
+            let started = Instant::now();
+            let workers: Vec<_> = (0..CLIENTS)
+                .map(|index| {
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        let content = if index == 0 {
+                            crate::self_test::PAYLOAD.to_vec()
+                        } else {
+                            format!("Write-Host 'client {index}'").into_bytes()
+                        };
+                        let begun = Instant::now();
+                        let result = AmsiIpcClient.scan(
+                            "blackshard-test".to_owned(),
+                            format!("client-{index}.ps1"),
+                            content,
+                        );
+                        (index, result, begun.elapsed())
+                    })
+                })
+                .collect();
+
+            let mut failures = Vec::new();
+            let mut slowest = Duration::ZERO;
+            for worker in workers {
+                let (index, result, elapsed) = worker.join().unwrap();
+                slowest = slowest.max(elapsed);
+                match result {
+                    Ok(verdict) if index == 0 => {
+                        assert_eq!(verdict, DetectionVerdictView::Malicious)
+                    }
+                    Ok(_) => {}
+                    Err(error) => failures.push(format!("client {index}: {}", error.message)),
+                }
+            }
+            eprintln!(
+                "{CLIENTS} concurrent AMSI clients: {} failed, slowest {:?}, wall {:?}",
+                failures.len(),
+                slowest,
+                started.elapsed()
+            );
+            // A client that connects and never writes used to hold the only instance until its
+            // read timed out, and every other script on the machine waited behind it.
+            let idle = connect_client(AMSI_PIPE_NAME).unwrap();
+            let begun = Instant::now();
+            let behind_idle = AmsiIpcClient.scan(
+                "blackshard-test".to_owned(),
+                "behind-idle.ps1".to_owned(),
+                b"Write-Host 'waiting'".to_vec(),
+            );
+            let waited = begun.elapsed();
+            drop(idle);
+            eprintln!("scan behind an idle client took {waited:?}");
+
+            server.stop();
+
+            // Every failure here is a script the AMSI provider would have waved through as clean.
+            assert!(failures.is_empty(), "{failures:#?}");
+            assert!(behind_idle.is_ok(), "{:?}", behind_idle.err());
+            // The old server failed this outright (`is_ok` above). The bound is only there to catch
+            // a scan that technically succeeds after waiting out the idle client's timeout.
+            assert!(
+                waited < AMSI_IO_TIMEOUT * 4,
+                "blocked behind an idle client: {waited:?}"
+            );
+        }
     }
 }
 

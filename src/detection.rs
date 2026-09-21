@@ -116,6 +116,13 @@ impl DetectionReport {
     }
 }
 
+/// Whether a scan may hand content to the Windows AMSI for a second opinion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemAmsi {
+    Consult,
+    Skip,
+}
+
 pub struct DetectionEngine {
     static_engine: ScanEngine,
     rules: RuleEngine,
@@ -394,16 +401,35 @@ impl DetectionEngine {
         };
 
         let report = cascade.resolve(started.elapsed());
-        self.with_container_inspection(&sample, report, started)
+        self.with_container_inspection(&sample, report, started, SystemAmsi::Consult)
     }
 
     pub fn scan_bytes(&self, bytes: &[u8]) -> DetectionReport {
-        let started = Instant::now();
-        let report = self.scan_leaf_bytes(bytes);
-        self.with_container_inspection(bytes, report, started)
+        self.scan_bytes_with(bytes, SystemAmsi::Consult)
     }
 
+    /// Scans content that reached the service *through* AMSI, from blackshard's own provider.
+    ///
+    /// Windows has already dispatched that content to every registered AMSI provider, so handing
+    /// it back to the system AMSI would be redundant. It would also recurse: the system AMSI calls
+    /// blackshard's provider, which calls this service, which calls the system AMSI again, each
+    /// level holding a pipe instance until they run out and the innermost call fails open.
+    pub fn scan_amsi_submission(&self, bytes: &[u8]) -> DetectionReport {
+        self.scan_bytes_with(bytes, SystemAmsi::Skip)
+    }
+
+    fn scan_bytes_with(&self, bytes: &[u8], system_amsi: SystemAmsi) -> DetectionReport {
+        let started = Instant::now();
+        let report = self.scan_leaf_bytes_with(bytes, system_amsi);
+        self.with_container_inspection(bytes, report, started, system_amsi)
+    }
+
+    #[cfg(test)]
     pub(crate) fn scan_leaf_bytes(&self, bytes: &[u8]) -> DetectionReport {
+        self.scan_leaf_bytes_with(bytes, SystemAmsi::Consult)
+    }
+
+    fn scan_leaf_bytes_with(&self, bytes: &[u8], system_amsi: SystemAmsi) -> DetectionReport {
         let started = Instant::now();
         let static_start = Instant::now();
         let static_report = self.static_engine.scan_bytes(bytes);
@@ -428,8 +454,12 @@ impl DetectionEngine {
                 let ml_duration = ml_start.elapsed();
 
                 let amsi_start = Instant::now();
-                let (amsi_report, amsi_error) =
-                    self.scan_with_amsi(&static_report, &rule_matches, bytes);
+                let (amsi_report, amsi_error) = match system_amsi {
+                    SystemAmsi::Consult => {
+                        self.scan_with_amsi(&static_report, &rule_matches, bytes)
+                    }
+                    SystemAmsi::Skip => (None, None),
+                };
                 let amsi_duration = amsi_start.elapsed();
 
                 log::info!(
@@ -477,6 +507,7 @@ impl DetectionEngine {
         bytes: &[u8],
         mut report: DetectionReport,
         started: Instant,
+        system_amsi: SystemAmsi,
     ) -> DetectionReport {
         let content_type = report
             .static_report
@@ -493,11 +524,15 @@ impl DetectionEngine {
         }
 
         let inspection = match content_type {
-            Some(ContentType::Zip) => inspect_zip(bytes, |entry| self.scan_leaf_bytes(entry)),
-            Some(ContentType::OleCompound) => {
-                inspect_ole(bytes, |entry| self.scan_leaf_bytes(entry))
+            Some(ContentType::Zip) => {
+                inspect_zip(bytes, |entry| self.scan_leaf_bytes_with(entry, system_amsi))
             }
-            Some(ContentType::Gzip) => inspect_gzip(bytes, |entry| self.scan_leaf_bytes(entry)),
+            Some(ContentType::OleCompound) => {
+                inspect_ole(bytes, |entry| self.scan_leaf_bytes_with(entry, system_amsi))
+            }
+            Some(ContentType::Gzip) => {
+                inspect_gzip(bytes, |entry| self.scan_leaf_bytes_with(entry, system_amsi))
+            }
             _ => unreachable!("container type was checked above"),
         };
         let strongest = inspection

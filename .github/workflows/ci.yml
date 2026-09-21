@@ -257,9 +257,14 @@ jobs:
         with:
           tool: cargo-audit
 
+      # RUSTSEC-2023-0071 is the Marvin timing attack in `rsa`, which yara-x's `pe` module pulls in
+      # to verify Authenticode signatures. Marvin recovers a *private* key by timing decryption or
+      # signing; blackshard only ever performs public-key verification and holds no RSA private
+      # key, so it is not exposed. No fixed release exists. Revisit if that changes.
+      #
+      # This step is enforcing: a new advisory fails the job rather than being reported green.
       - name: Run cargo audit
-        run: cargo audit --ignore RUSTSEC-2026-0269 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0222 --ignore RUSTSEC-2026-0257
-        continue-on-error: true
+        run: cargo audit --ignore RUSTSEC-2026-0269 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0222 --ignore RUSTSEC-2026-0257 --ignore RUSTSEC-2023-0071
 
   definitions-smoke:
     name: Native ClamAV definition pipeline
