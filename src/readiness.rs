@@ -12,21 +12,11 @@ pub enum ReadinessState {
     StartingDetectionWorkers,
     ConnectingDriver,
     ValidatingProtocol,
-    RunningSelfTest,
     Ready,
     Degraded { reason: String },
     Recovering { reason: String },
     Failed { reason: String },
     Stopping,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UserFacingStatus {
-    Starting,
-    Protected,
-    ProtectionReduced,
-    ActionRequired,
-    Repairing,
 }
 
 /// How much of the machine blackshard can actually watch.
@@ -97,7 +87,6 @@ pub struct ProtectionComponents {
     pub freshclam_loaded: bool,
     pub freshclam_generation: u64,
     pub rule_generation: u64,
-    pub model_generation: u64,
     pub driver_connected: bool,
     pub driver_protocol_validated: bool,
     pub driver_ready_generation: Option<u64>,
@@ -257,38 +246,6 @@ impl ReadinessMonitor {
         inner.transition(derived);
     }
 
-    pub fn report_health(&self, is_healthy: bool, detail: Option<String>) {
-        let mut inner = self.inner.lock().unwrap();
-        if is_healthy {
-            inner.consecutive_failures = 0;
-            inner.consecutive_successes = inner.consecutive_successes.saturating_add(1);
-        } else {
-            inner.consecutive_successes = 0;
-            inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
-            let reason = detail.unwrap_or_else(|| "Unknown failure".to_string());
-            inner.transition(ReadinessState::Degraded { reason });
-        }
-    }
-
-    pub fn user_facing_status(&self) -> UserFacingStatus {
-        let inner = self.inner.lock().unwrap();
-        match &inner.current_state {
-            ReadinessState::Stopped | ReadinessState::Stopping => UserFacingStatus::ActionRequired,
-            ReadinessState::Starting
-            | ReadinessState::LoadingSettings
-            | ReadinessState::LoadingDefinitions
-            | ReadinessState::LoadingFreshClam
-            | ReadinessState::StartingDetectionWorkers
-            | ReadinessState::ConnectingDriver
-            | ReadinessState::ValidatingProtocol
-            | ReadinessState::RunningSelfTest => UserFacingStatus::Starting,
-            ReadinessState::Ready => UserFacingStatus::Protected,
-            ReadinessState::Degraded { .. } => UserFacingStatus::ProtectionReduced,
-            ReadinessState::Recovering { .. } => UserFacingStatus::Repairing,
-            ReadinessState::Failed { .. } => UserFacingStatus::ActionRequired,
-        }
-    }
-
     pub fn diagnostics(&self) -> Diagnostics {
         let inner = self.inner.lock().unwrap();
         Diagnostics {
@@ -320,7 +277,6 @@ mod tests {
             freshclam_loaded: true,
             freshclam_generation: 7,
             rule_generation: 4,
-            model_generation: 0,
             driver_connected: true,
             driver_protocol_validated: true,
             driver_ready_generation: Some(9),

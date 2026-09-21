@@ -1,7 +1,6 @@
 use crate::atomic_file;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -20,7 +19,6 @@ pub const MAX_UPDATE_SEQUENCE: u64 = u64::MAX - 1;
 
 pub const MAX_UPDATE_EXPIRY_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MAX_UPDATE_CLOCK_SKEW: Duration = Duration::from_secs(15 * 60);
-pub const DEFAULT_MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 pub const UPDATE_CHECK_JITTER: Duration = Duration::from_secs(15 * 60);
@@ -467,13 +465,6 @@ impl UpdateStore {
         })
     }
 
-    pub fn with_default_limit(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            maximum_payload_bytes: DEFAULT_MAX_UPDATE_BYTES,
-        }
-    }
-
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -507,7 +498,7 @@ impl UpdateStore {
             .read(true)
             .write(true)
             .open(lock_path)?;
-        FileExt::lock_exclusive(&lock)?;
+        lock.lock()?;
 
         let installed_sequence = self.installed_sequence()?;
         let verified = verify_update(

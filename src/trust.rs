@@ -17,8 +17,6 @@ impl AuthenticodeStatus {
     }
 }
 
-pub type TrustStatus = AuthenticodeStatus;
-
 pub fn verify_current_executable() -> AuthenticodeStatus {
     match std::env::current_exe() {
         Ok(path) => verify_file(&path),

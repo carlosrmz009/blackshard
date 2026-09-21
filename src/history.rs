@@ -151,10 +151,6 @@ impl EventHistory {
         Ok(events.into_iter().rev().collect())
     }
 
-    pub fn recent_default(&self) -> io::Result<Vec<SecurityEvent>> {
-        self.recent(DEFAULT_HISTORY_LIMIT)
-    }
-
     pub fn clear(&self) -> io::Result<()> {
         let _guard = self
             .writer_lock

@@ -910,10 +910,6 @@ impl DefinitionStore {
         })
     }
 
-    pub fn from_update_store(updates: UpdateStore) -> Self {
-        Self { updates }
-    }
-
     pub fn program_data() -> Result<Self, UpdateError> {
         Self::new(Self::program_data_path())
     }

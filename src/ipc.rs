@@ -1362,7 +1362,6 @@ mod windows_transport {
                     .read()
                     .map_err(|_| internal("detection engine lock"))?
                     .clone();
-                engine.clear_cache();
                 let settings = resources
                     .settings
                     .read()
@@ -1757,10 +1756,6 @@ mod windows_transport {
                 RpcResponse::FreshClamStatus { status } => Ok(status),
                 _ => Err(invalid("unexpected response to get_freshclam_status")),
             }
-        }
-
-        pub fn check_for_updates(&self) -> Result<String, RpcFailure> {
-            acknowledged(self.call(RpcCommand::CheckForUpdates)?)
         }
     }
 

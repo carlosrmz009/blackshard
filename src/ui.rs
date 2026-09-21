@@ -9,7 +9,7 @@ use crate::quarantine::IsolationState;
 use chrono::{DateTime, Local, Utc};
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Layout, RichText, Stroke};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -298,19 +298,6 @@ impl BlackshardApp {
 
     pub fn with_machine_defaults(runtime: SharedUiState) -> Self {
         Self::new(runtime, IpcClient)
-    }
-
-    pub fn set_custom_scan_path(&mut self, path: impl AsRef<Path>) {
-        self.custom_scan_path = path.as_ref().display().to_string();
-        self.page = Page::Scan;
-    }
-
-    pub fn set_page(&mut self, page: Page) {
-        self.page = page;
-    }
-
-    pub fn runtime_state(&self) -> SharedUiState {
-        Arc::clone(&self.runtime)
     }
 
     fn runtime_snapshot(&self) -> UiRuntimeState {
@@ -1569,9 +1556,6 @@ impl eframe::App for BlackshardApp {
                                 Some(crate::readiness::ReadinessState::ValidatingProtocol) => {
                                     "Validating protocol..."
                                 }
-                                Some(crate::readiness::ReadinessState::RunningSelfTest) => {
-                                    "Running self test..."
-                                }
                                 _ => "Starting service...",
                             };
                             ui.label(
@@ -1660,7 +1644,6 @@ fn should_show_loading_screen(runtime: &UiRuntimeState) -> bool {
                 | ReadinessState::StartingDetectionWorkers
                 | ReadinessState::ConnectingDriver
                 | ReadinessState::ValidatingProtocol
-                | ReadinessState::RunningSelfTest
         )
     } else {
         matches!(runtime.protection, ProtectionStatus::Starting)

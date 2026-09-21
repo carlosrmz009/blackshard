@@ -607,8 +607,6 @@ impl DetectionEngine {
         }
     }
 
-    pub fn clear_cache(&self) {}
-
     pub fn external_rules_tripped(&self) -> bool {
         let rules_tripped = self
             .external_rule_circuit_breaker

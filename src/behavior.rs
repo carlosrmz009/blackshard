@@ -35,53 +35,6 @@ pub enum FileAction {
     Other,
 }
 
-#[derive(Debug, Clone)]
-pub enum EtwEvent {
-    ProcessCreate {
-        process_id: u32,
-        parent_id: u32,
-        image_path: String,
-    },
-    RegistryStartupChange {
-        process_id: u32,
-        key_path: String,
-        value_name: String,
-    },
-}
-
-#[derive(Default)]
-pub struct ProcessAncestry {
-    ancestry: HashMap<u32, u32>,
-    image_paths: HashMap<u32, String>,
-}
-
-impl ProcessAncestry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record_process_create(&mut self, pid: u32, ppid: u32, image_path: String) {
-        self.ancestry.insert(pid, ppid);
-        self.image_paths.insert(pid, image_path);
-    }
-
-    pub fn get_chain(&self, mut pid: u32) -> Vec<String> {
-        let mut chain = Vec::new();
-        while let Some(path) = self.image_paths.get(&pid) {
-            chain.push(path.clone());
-            if let Some(&ppid) = self.ancestry.get(&pid) {
-                if ppid == pid || ppid == 0 {
-                    break;
-                }
-                pid = ppid;
-            } else {
-                break;
-            }
-        }
-        chain
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BehaviorDecision {
     pub protected_path: bool,
@@ -101,7 +54,6 @@ struct ProcessActivity {
 pub struct RansomwareMonitor {
     started: Instant,
     processes: HashMap<(u32, u64), ProcessActivity>,
-    ancestry: ProcessAncestry,
 }
 
 struct BehaviorObservation<'a> {
@@ -119,26 +71,11 @@ impl Default for RansomwareMonitor {
         Self {
             started: Instant::now(),
             processes: HashMap::new(),
-            ancestry: ProcessAncestry::new(),
         }
     }
 }
 
 impl RansomwareMonitor {
-    pub fn observe_etw(&mut self, event: EtwEvent) {
-        match event {
-            EtwEvent::ProcessCreate {
-                process_id,
-                parent_id,
-                image_path,
-            } => {
-                self.ancestry
-                    .record_process_create(process_id, parent_id, image_path);
-            }
-            EtwEvent::RegistryStartupChange { .. } => {}
-        }
-    }
-
     pub fn observe(
         &mut self,
         process_id: u32,

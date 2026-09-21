@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const SERVICE_NAME: &str = "blackshard-protection-service";
 pub const SERVICE_HEALTH_SCHEMA_VERSION: u32 = 4;
 pub const SERVICE_HEALTH_FILE_NAME: &str = "service-health.json";
-pub const UPDATE_REQUEST_FILE_NAME: &str = "update-request";
 
 static HEALTH_WRITE_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 const MAX_SERVICE_HEALTH_BYTES: u64 = 64 * 1024;
@@ -148,16 +147,6 @@ pub fn default_service_health_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     service_health_path_from_program_data(&program_data)
-}
-
-pub fn default_update_request_path() -> PathBuf {
-    let program_data = std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    program_data
-        .join("blackshard")
-        .join("Requests")
-        .join(UPDATE_REQUEST_FILE_NAME)
 }
 
 pub fn read_service_health(path: &Path) -> io::Result<ServiceHealthSnapshot> {
@@ -744,7 +733,6 @@ mod windows_service_host {
                     .map(|active| active.generation)
                     .unwrap_or(0),
                 rule_generation: definition_generation.load(std::sync::atomic::Ordering::Acquire),
-                model_generation: 0,
                 driver_connected: snapshot.connection == ServiceConnection::Connected
                     && driver_health.is_some(),
                 driver_protocol_validated: driver_health.is_some(),

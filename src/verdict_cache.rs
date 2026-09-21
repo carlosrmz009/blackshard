@@ -31,9 +31,6 @@ pub struct CachedVerdict {
     pub bytes_scanned: usize,
     pub truncated: bool,
     pub definition_generation: u64,
-    pub freshclam_generation: u64,
-    pub rule_generation: u64,
-    pub model_generation: u64,
     pub scanned_at: DateTime<Utc>,
     pub analysis_completeness: AnalysisCompleteness,
     pub automatic_quarantine_eligible: bool,
@@ -80,11 +77,7 @@ impl VerdictCache {
     ) -> Option<CachedVerdict> {
         if let Some(cached) = self.entries.get(key) {
             let age = Utc::now().signed_duration_since(cached.scanned_at);
-            if age.num_hours() < 24
-                && cached.definition_generation == current_definition_generation
-                && cached.freshclam_generation == current_definition_generation
-                && cached.rule_generation == current_definition_generation
-                && cached.model_generation == current_definition_generation
+            if age.num_hours() < 24 && cached.definition_generation == current_definition_generation
             {
                 if let Some(pos) = self.lru.iter().position(|k| k == key) {
                     let k = self.lru.remove(pos).unwrap();
@@ -154,9 +147,6 @@ mod tests {
             bytes_scanned: 1,
             truncated,
             definition_generation: 1,
-            freshclam_generation: 1,
-            rule_generation: 1,
-            model_generation: 1,
             scanned_at: Utc::now(),
             analysis_completeness: completeness,
             automatic_quarantine_eligible: false,

@@ -100,8 +100,6 @@ pub struct ScanReport {
     pub entropy: f64,
     pub evidence: Vec<Evidence>,
     pub error: Option<String>,
-    pub heuristic_features: Option<crate::model::HeuristicFeatures>,
-    pub heuristic_score: Option<f32>,
 }
 
 impl ScanReport {
@@ -125,8 +123,6 @@ impl ScanReport {
                 description: message.clone(),
             }],
             error: Some(message),
-            heuristic_features: None,
-            heuristic_score: None,
         }
     }
 }
@@ -306,17 +302,12 @@ impl std::error::Error for SignatureError {}
 pub struct ScanEngine {
     config: ScanConfig,
     signatures: SignatureDatabase,
-    model: crate::model::HeuristicManager,
 }
 
 impl ScanEngine {
     pub fn new(config: ScanConfig, signatures: SignatureDatabase) -> Result<Self, ConfigError> {
         config.validate()?;
-        Ok(Self {
-            config,
-            signatures,
-            model: crate::model::HeuristicManager::new(),
-        })
+        Ok(Self { config, signatures })
     }
 
     pub fn config(&self) -> &ScanConfig {
@@ -456,11 +447,6 @@ impl ScanEngine {
         let mut evidence = Vec::new();
         let mut exact_match = false;
 
-        let mut heuristic_features = crate::model::HeuristicFeatures {
-            entropy: entropy as f32,
-            ..Default::default()
-        };
-
         if let Some(digest) = &full_digest {
             if let Some(signature) = self.signatures.lookup(digest) {
                 exact_match = true;
@@ -496,13 +482,7 @@ impl ScanEngine {
 
         match content_type {
             ContentType::Pe32 | ContentType::Pe64 | ContentType::PeUnknown => {
-                heuristic_features.is_pe = 1.0;
-                analyze_pe(
-                    bytes,
-                    &mut content_type,
-                    &mut evidence,
-                    &mut heuristic_features,
-                )
+                analyze_pe(bytes, &mut content_type, &mut evidence)
             }
             ContentType::Script(_) => {
                 analyze_script(bytes, self.config.max_script_sample_bytes, &mut evidence)
@@ -546,13 +526,6 @@ impl ScanEngine {
             &evidence,
         );
 
-        // Reported alongside the verdict for telemetry and future tuning. It deliberately does
-        // not feed `risk_score` or `verdict` above: the static heuristic is not calibrated, and
-        // letting it convict would change detections without any corroborating evidence. It used
-        // to shadow the evidence derived score on this line, which made it look influential when
-        // it was not.
-        let model_score = self.model.active().evaluate(&heuristic_features);
-
         ScanReport {
             verdict,
             content_type,
@@ -566,8 +539,6 @@ impl ScanEngine {
             entropy,
             evidence,
             error: None,
-            heuristic_features: Some(heuristic_features),
-            heuristic_score: Some(model_score),
         }
     }
 }
@@ -799,12 +770,7 @@ fn identify_script_language(lower: &str) -> Option<ScriptLanguage> {
     None
 }
 
-fn analyze_pe(
-    bytes: &[u8],
-    content_type: &mut ContentType,
-    evidence: &mut Vec<Evidence>,
-    features: &mut crate::model::HeuristicFeatures,
-) {
+fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<Evidence>) {
     let pe = match PE::parse(bytes) {
         Ok(pe) => pe,
         Err(error) => {
@@ -824,9 +790,6 @@ fn analyze_pe(
     } else {
         ContentType::Pe32
     };
-
-    features.section_count = pe.sections.len() as f32;
-    features.import_count = pe.imports.len() as f32;
 
     if pe.sections.is_empty() {
         push_evidence(

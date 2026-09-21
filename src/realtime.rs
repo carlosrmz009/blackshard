@@ -618,9 +618,6 @@ pub(crate) fn realtime_worker(
                                     bytes_scanned: scan_result.bytes_scanned,
                                     truncated: scan_result.truncated,
                                     definition_generation: current_gen,
-                                    freshclam_generation: current_gen,
-                                    rule_generation: current_gen,
-                                    model_generation: current_gen,
                                     scanned_at: chrono::Utc::now(),
                                     analysis_completeness: scan_result.analysis_completeness,
                                     automatic_quarantine_eligible: scan_result
