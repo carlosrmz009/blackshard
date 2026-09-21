@@ -508,36 +508,11 @@ pub(crate) fn realtime_worker(
             continue;
         }
 
-        let current_gen = definition_generation.load(Ordering::Acquire);
-        if notification.file_id != 0 {
-            let fast_cached = verdict_cache.write().ok().and_then(|mut cache| {
-                cache.get_by_file_id_and_gen(
-                    notification.file_id,
-                    notification.content_generation,
-                    current_gen,
-                )
-            });
-
-            if let Some(cached) = fast_cached {
-                if cached.verdict == CacheVerdict::Clean {
-                    log::debug!(
-                        "Real-time fast-path cache hit for FileId 0x{:016x}",
-                        notification.file_id
-                    );
-                    let _ = reply(
-                        item.port,
-                        item.message.header.message_id,
-                        DriverVerdict::Allow,
-                        0,
-                    );
-                    if let Ok(mut c) = counters.lock() {
-                        c.scanned += 1;
-                    }
-                    continue;
-                }
-            }
-        }
-
+        // There is no cache lookup before the file is opened. The driver reports a file ID but no
+        // volume, and NTFS file IDs repeat across volumes, so an ID-only hit could allow a file on
+        // a removable drive unscanned on the strength of a clean verdict cached for C:. Opening
+        // the file yields its full identity, and the exact-key lookup below still avoids a rescan.
+        // Restoring a pre-open fast path needs the volume serial added to the driver notification.
         let candidate = open_candidate_file(&openable_path);
         let path = candidate
             .as_ref()

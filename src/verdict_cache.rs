@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,9 +55,13 @@ impl CachedVerdict {
 
 pub struct VerdictCache {
     capacity: usize,
-    entries: HashMap<VerdictCacheKey, CachedVerdict>,
-    by_file_id: HashMap<(u64, u64), VerdictCacheKey>,
-    lru: VecDeque<VerdictCacheKey>,
+    /// Each entry carries the tick of its last use, which is also its key in `recency`.
+    entries: HashMap<VerdictCacheKey, (CachedVerdict, u64)>,
+    /// Keys ordered by last use, oldest first, so every operation is O(log n). This used to be a
+    /// `VecDeque` searched from the front on every hit: at the 100,000 entry capacity the service
+    /// uses, a cache hit cost up to 100,000 key comparisons on the file-open path.
+    recency: BTreeMap<u64, VerdictCacheKey>,
+    tick: u64,
 }
 
 impl VerdictCache {
@@ -65,69 +69,55 @@ impl VerdictCache {
         Arc::new(RwLock::new(Self {
             capacity,
             entries: HashMap::with_capacity(capacity),
-            by_file_id: HashMap::with_capacity(capacity),
-            lru: VecDeque::with_capacity(capacity),
+            recency: BTreeMap::new(),
+            tick: 0,
         }))
     }
 
+    /// Looks up a verdict by the file's full identity.
+    ///
+    /// There is deliberately no lookup by file ID alone. NTFS file IDs are only unique within a
+    /// volume, so an ID-only match could hand a clean verdict cached for one drive to an unrelated
+    /// file on another.
     pub fn get(
         &mut self,
         key: &VerdictCacheKey,
         current_definition_generation: u64,
     ) -> Option<CachedVerdict> {
-        if let Some(cached) = self.entries.get(key) {
-            let age = Utc::now().signed_duration_since(cached.scanned_at);
-            if age.num_hours() < 24 && cached.definition_generation == current_definition_generation
-            {
-                if let Some(pos) = self.lru.iter().position(|k| k == key) {
-                    let k = self.lru.remove(pos).unwrap();
-                    self.lru.push_back(k);
-                }
-                return Some(cached.clone());
-            } else {
-                self.by_file_id
-                    .remove(&(key.file_id, key.content_generation));
-                self.entries.remove(key);
-                if let Some(pos) = self.lru.iter().position(|k| k == key) {
-                    self.lru.remove(pos);
-                }
-            }
+        let (cached, last_used) = self.entries.get(key)?;
+        let fresh = Utc::now()
+            .signed_duration_since(cached.scanned_at)
+            .num_hours()
+            < 24
+            && cached.definition_generation == current_definition_generation;
+        let last_used = *last_used;
+        self.recency.remove(&last_used);
+        if !fresh {
+            self.entries.remove(key);
+            return None;
         }
-        None
-    }
 
-    pub fn get_by_file_id_and_gen(
-        &mut self,
-        file_id: u64,
-        content_generation: u64,
-        current_definition_generation: u64,
-    ) -> Option<CachedVerdict> {
-        let key = self
-            .by_file_id
-            .get(&(file_id, content_generation))
-            .cloned()?;
-        self.get(&key, current_definition_generation)
+        self.tick += 1;
+        self.recency.insert(self.tick, key.clone());
+        let entry = self.entries.get_mut(key).expect("present: looked up above");
+        entry.1 = self.tick;
+        Some(entry.0.clone())
     }
 
     pub fn insert(&mut self, key: VerdictCacheKey, verdict: CachedVerdict) -> bool {
         if !verdict.is_cacheable() {
             return false;
         }
-        if self.entries.contains_key(&key) {
-            if let Some(pos) = self.lru.iter().position(|k| k == &key) {
-                self.lru.remove(pos);
-            }
+        if let Some((_, last_used)) = self.entries.remove(&key) {
+            self.recency.remove(&last_used);
         } else if self.entries.len() >= self.capacity {
-            if let Some(oldest) = self.lru.pop_front() {
-                self.by_file_id
-                    .remove(&(oldest.file_id, oldest.content_generation));
+            if let Some((_, oldest)) = self.recency.pop_first() {
                 self.entries.remove(&oldest);
             }
         }
-        self.lru.push_back(key.clone());
-        self.by_file_id
-            .insert((key.file_id, key.content_generation), key.clone());
-        self.entries.insert(key, verdict);
+        self.tick += 1;
+        self.recency.insert(self.tick, key.clone());
+        self.entries.insert(key, (verdict, self.tick));
         true
     }
 }
@@ -154,15 +144,26 @@ mod tests {
         }
     }
 
+    fn key(volume_serial: u64, file_id: u64) -> VerdictCacheKey {
+        VerdictCacheKey {
+            volume_serial,
+            file_id,
+            file_size: 3,
+            content_generation: 4,
+        }
+    }
+
+    fn assert_consistent(cache: &VerdictCache) {
+        assert_eq!(cache.entries.len(), cache.recency.len());
+        for (key, (_, tick)) in &cache.entries {
+            assert_eq!(cache.recency.get(tick), Some(key));
+        }
+    }
+
     #[test]
     fn rejects_partial_clean_and_scan_errors() {
         let cache = VerdictCache::new(4);
-        let key = VerdictCacheKey {
-            volume_serial: 1,
-            file_id: 2,
-            file_size: 3,
-            content_generation: 4,
-        };
+        let key = key(1, 2);
         let mut cache = cache.write().unwrap();
         assert!(!cache.insert(key.clone(), clean(AnalysisCompleteness::PrefixOnly, true)));
 
@@ -176,30 +177,69 @@ mod tests {
     #[test]
     fn accepts_complete_hashed_clean() {
         let cache = VerdictCache::new(4);
-        let key = VerdictCacheKey {
-            volume_serial: 1,
-            file_id: 2,
-            file_size: 3,
-            content_generation: 4,
-        };
+        let key = key(1, 2);
         let mut cache = cache.write().unwrap();
         assert!(cache.insert(key.clone(), clean(AnalysisCompleteness::Complete, false)));
         assert!(cache.get(&key, 1).is_some());
     }
 
     #[test]
-    fn fast_path_lookup_works() {
+    fn the_same_file_id_on_another_volume_is_not_a_hit() {
         let cache = VerdictCache::new(4);
-        let key = VerdictCacheKey {
-            volume_serial: 10,
-            file_id: 200,
-            file_size: 500,
-            content_generation: 1,
-        };
         let mut cache = cache.write().unwrap();
-        assert!(cache.insert(key, clean(AnalysisCompleteness::Complete, false)));
-        assert!(cache.get_by_file_id_and_gen(200, 1, 1).is_some());
-        assert!(cache.get_by_file_id_and_gen(200, 2, 1).is_none());
-        assert!(cache.get_by_file_id_and_gen(999, 1, 1).is_none());
+        assert!(cache.insert(key(10, 200), clean(AnalysisCompleteness::Complete, false)));
+
+        // A clean verdict for C: must never be handed to an unrelated file on a removable drive
+        // that happens to have the same MFT record number.
+        assert!(cache.get(&key(11, 200), 1).is_none());
+        assert!(cache.get(&key(10, 200), 1).is_some());
+    }
+
+    #[test]
+    fn eviction_drops_the_least_recently_used_entry() {
+        let cache = VerdictCache::new(2);
+        let mut cache = cache.write().unwrap();
+        assert!(cache.insert(key(1, 1), clean(AnalysisCompleteness::Complete, false)));
+        assert!(cache.insert(key(1, 2), clean(AnalysisCompleteness::Complete, false)));
+
+        // Reading the first entry makes the second the oldest, so it is the one evicted.
+        assert!(cache.get(&key(1, 1), 1).is_some());
+        assert!(cache.insert(key(1, 3), clean(AnalysisCompleteness::Complete, false)));
+
+        assert!(cache.get(&key(1, 1), 1).is_some());
+        assert!(cache.get(&key(1, 2), 1).is_none());
+        assert!(cache.get(&key(1, 3), 1).is_some());
+        assert_consistent(&cache);
+    }
+
+    #[test]
+    fn stale_and_replaced_entries_leave_no_residue() {
+        let cache = VerdictCache::new(4);
+        let mut cache = cache.write().unwrap();
+        assert!(cache.insert(key(1, 1), clean(AnalysisCompleteness::Complete, false)));
+        assert!(cache.insert(key(1, 1), clean(AnalysisCompleteness::Complete, false)));
+        assert_consistent(&cache);
+        assert_eq!(cache.entries.len(), 1);
+
+        // A definition update invalidates the entry, and the lookup removes it outright.
+        assert!(cache.get(&key(1, 1), 2).is_none());
+        assert!(cache.entries.is_empty() && cache.recency.is_empty());
+    }
+
+    #[test]
+    fn a_full_cache_stays_at_capacity() {
+        let cache = VerdictCache::new(100);
+        let mut cache = cache.write().unwrap();
+        for file_id in 0..1_000 {
+            assert!(cache.insert(
+                key(1, file_id),
+                clean(AnalysisCompleteness::Complete, false)
+            ));
+            if file_id % 3 == 0 {
+                let _ = cache.get(&key(1, file_id / 2), 1);
+            }
+        }
+        assert_eq!(cache.entries.len(), 100);
+        assert_consistent(&cache);
     }
 }
