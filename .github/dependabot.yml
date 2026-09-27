@@ -1,16 +1,27 @@
 version: 2
 
+# Every dependency change is reviewed by a person before it merges; nothing here is auto-merged.
+# blackshard ships a SYSTEM service and a kernel driver, so a compromised release of any crate,
+# action or package would reach every install.
+#
+# `cooldown` holds version updates back until a release has been public for a week, which is when
+# most malicious or broken releases get noticed and yanked. Security updates ignore the cooldown
+# and arrive as soon as an advisory is published.
+
 updates:
   - package-ecosystem: cargo
     directories:
       - /
       - /fuzz
     schedule:
-      interval: daily
+      interval: weekly
+      day: monday
       time: "05:23"
       timezone: America/Mexico_City
     open-pull-requests-limit: 3
     rebase-strategy: auto
+    cooldown:
+      default-days: 7
     groups:
       rust-security:
         applies-to: security-updates
@@ -26,11 +37,14 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: daily
+      interval: weekly
+      day: monday
       time: "05:43"
       timezone: America/Mexico_City
     open-pull-requests-limit: 1
     rebase-strategy: auto
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
@@ -41,11 +55,14 @@ updates:
       - /installer/package
       - /installer/bundle
     schedule:
-      interval: daily
+      interval: weekly
+      day: monday
       time: "06:03"
       timezone: America/Mexico_City
     open-pull-requests-limit: 1
     rebase-strategy: auto
+    cooldown:
+      default-days: 7
     groups:
       wix:
         patterns:
