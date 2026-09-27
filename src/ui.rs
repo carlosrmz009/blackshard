@@ -137,7 +137,7 @@ impl Default for UiRuntimeState {
             last_realtime_path: None,
             desired_real_time_protection: true,
             update_check_requested: false,
-            engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+            engine_version: crate::product_version(),
             freshclam_version: None,
             freshclam_age_hours: None,
             attention: None,
@@ -241,6 +241,9 @@ pub struct BlackshardApp {
     quarantine_records: Vec<QuarantineRecordView>,
     activity: Vec<SecurityEvent>,
     persistent_error: Option<String>,
+    /// False until the service has supplied the machine's real settings. Until then the page
+    /// shows defaults, and saving is refused so they cannot overwrite what is configured.
+    settings_loaded: bool,
     notice: Option<Notice>,
     confirmation: Option<Confirmation>,
     busy_quarantine: HashSet<Uuid>,
@@ -254,13 +257,25 @@ impl BlackshardApp {
     pub fn new(runtime: SharedUiState, client: IpcClient) -> Self {
         let (settings, load_warning) = match client.get_settings() {
             Ok(settings) => (settings, None),
+            // The dashboard already explains a stopped service; this only has to say what it
+            // means for the settings page.
+            Err(error) if error.is_service_unavailable() => (
+                Settings::default(),
+                Some(
+                    "Settings will load once the protection service is running; until then \
+                     defaults are shown and changes cannot be saved."
+                        .to_owned(),
+                ),
+            ),
             Err(error) => (
                 Settings::default(),
                 Some(format!(
-                    "The protection service could not provide settings; safe display defaults are in use: {error}"
+                    "The protection service could not provide settings, so defaults are shown and \
+                     changes cannot be saved: {error}"
                 )),
             ),
         };
+        let settings_loaded = load_warning.is_none();
         if let Ok(mut shared) = runtime.lock() {
             shared.desired_real_time_protection = settings.real_time_protection;
         }
@@ -280,6 +295,7 @@ impl BlackshardApp {
             quarantine_records: Vec::new(),
             activity: Vec::new(),
             persistent_error: None,
+            settings_loaded,
             notice: load_warning.map(|message| Notice {
                 level: NoticeLevel::Warning,
                 message,
@@ -318,6 +334,22 @@ impl BlackshardApp {
     }
 
     fn refresh_persistent_views(&mut self) {
+        if !self.settings_loaded {
+            if let Ok(settings) = self.client.get_settings() {
+                if let Ok(mut shared) = self.runtime.lock() {
+                    shared.desired_real_time_protection = settings.real_time_protection;
+                }
+                self.settings = settings;
+                self.settings_loaded = true;
+                self.settings_dirty = false;
+                self.settings_save_at = None;
+                self.notice = Some(Notice {
+                    level: NoticeLevel::Success,
+                    message: "Connected to the protection service; settings loaded.".to_owned(),
+                    created: Instant::now(),
+                });
+            }
+        }
         let mut errors = Vec::new();
         match self.client.list_quarantine() {
             Ok(records) => self.quarantine_records = records,
@@ -330,7 +362,7 @@ impl BlackshardApp {
         self.persistent_error = if errors.is_empty() {
             None
         } else {
-            Some(errors.join("  "))
+            Some(errors.join(" "))
         };
         self.refresh_at = Instant::now() + REFRESH_INTERVAL;
     }
@@ -451,6 +483,16 @@ impl BlackshardApp {
 
     fn save_settings(&mut self) {
         self.settings_save_at = None;
+        if !self.settings_loaded {
+            self.notice = Some(Notice {
+                level: NoticeLevel::Warning,
+                message: "Settings cannot be saved until they have loaded from the protection \
+                          service."
+                    .to_owned(),
+                created: Instant::now(),
+            });
+            return;
+        }
         match self.client.save_settings(self.settings.clone()) {
             Ok(_) => {
                 self.settings_dirty = false;
@@ -703,16 +745,13 @@ impl BlackshardApp {
         let mut protection_test_requested = false;
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(&health)
-                            .family(FontFamily::Monospace)
-                            .size(23.0)
-                            .strong()
-                            .color(color),
-                    );
-                    ui.label(RichText::new(detail).color(TEXT));
-                });
+                ui.label(
+                    RichText::new(&health)
+                        .family(FontFamily::Monospace)
+                        .size(23.0)
+                        .strong()
+                        .color(color),
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new("[+]")
@@ -722,7 +761,15 @@ impl BlackshardApp {
                     );
                 });
             });
-            if let Some(attention) = &runtime.attention {
+            // Below the heading row rather than beside the glyph, so a long reason wraps across
+            // the whole card instead of running underneath it.
+            ui.label(RichText::new(&detail).color(TEXT));
+            // The attention line often repeats the reason already in the detail.
+            if let Some(attention) = runtime
+                .attention
+                .as_ref()
+                .filter(|attention| !detail.contains(attention.as_str()))
+            {
                 ui.add_space(8.0);
                 ui.colored_label(AMBER, attention);
             }
@@ -734,16 +781,14 @@ impl BlackshardApp {
                         test_available && !test_busy,
                         egui::Button::new("RUN HARMLESS PROTECTION TEST"),
                     )
-                    .on_hover_text(
-                        "Checks the complete user-mode and kernel blocking path without malware",
-                    )
+                    .on_hover_text("Checks detection and blocking end to end with a harmless file")
                     .clicked()
                 {
                     protection_test_requested = true;
                 }
                 match &runtime.protection_test {
                     ProtectionTestStatus::Idle if !test_available => {
-                        ui.colored_label(MUTED, "Requires an active engine and connected filter");
+                        ui.colored_label(MUTED, "Available once protection is active");
                     }
                     ProtectionTestStatus::Idle => {
                         ui.colored_label(MUTED, "Not run this session");
@@ -1603,8 +1648,27 @@ impl eframe::App for BlackshardApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.render_notice(ui);
-                        if let Some(error) = &self.persistent_error {
-                            ui.colored_label(RED, error);
+                        // With the service down every read fails the same way, and the
+                        // dashboard already says so in plain words.
+                        if let Some(error) = self.persistent_error.as_ref().filter(|_| {
+                            !matches!(runtime.protection, ProtectionStatus::Unavailable(_))
+                        }) {
+                            egui::Frame::none()
+                                .fill(RED.gamma_multiply(0.10))
+                                .stroke(Stroke::new(1.0_f32, RED.gamma_multiply(0.65)))
+                                .rounding(egui::Rounding::same(6.0))
+                                .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new("ERROR")
+                                                .family(FontFamily::Monospace)
+                                                .strong()
+                                                .color(RED),
+                                        );
+                                        ui.label(error);
+                                    });
+                                });
                             ui.add_space(8.0);
                         }
                         match self.page {
@@ -1782,12 +1846,18 @@ fn health_row(ui: &mut egui::Ui, label: &str, value: (String, Color32)) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).color(MUTED));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(value.0)
-                    .family(FontFamily::Monospace)
-                    .size(10.5)
-                    .color(value.1),
-            );
+            // Truncated, with the whole value on hover: a long reason laid out right to left
+            // would otherwise grow leftwards out of its card and over the sidebar.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&value.0)
+                        .family(FontFamily::Monospace)
+                        .size(10.5)
+                        .color(value.1),
+                )
+                .truncate(true),
+            )
+            .on_hover_text(&value.0);
         });
     });
 }
@@ -1917,8 +1987,8 @@ fn compact_health(runtime: &UiRuntimeState) -> (String, Color32) {
             ("PROTECTION ACTIVE".to_owned(), GREEN)
         }
         (ProtectionStatus::Paused, _) => ("PROTECTION PAUSED".to_owned(), AMBER),
-        (ProtectionStatus::Unavailable(_), _)
-        | (_, DriverStatus::Disconnected(_))
+        (ProtectionStatus::Unavailable(_), _) => ("NOT PROTECTED".to_owned(), RED),
+        (_, DriverStatus::Disconnected(_))
         | (_, DriverStatus::NotInstalled)
         | (_, DriverStatus::Error(_)) => ("PROTECTION LIMITED".to_owned(), RED),
         (ProtectionStatus::Starting, _) | (_, DriverStatus::Checking) => {
@@ -1939,7 +2009,7 @@ fn overall_health(runtime: &UiRuntimeState) -> (String, String, Color32) {
         // up, so nobody believes they have file system coverage they do not have.
         (ProtectionStatus::Active, DriverStatus::NotRequired) => (
             "PROTECTION ACTIVE".to_owned(),
-            "Real-time protection covers scripts and macros through AMSI, with on-demand scanning              and quarantine active. Installing the signed driver adds file system coverage."
+            "Real-time protection covers scripts and macros through AMSI, with on-demand scanning and quarantine active. Installing the signed driver adds file system coverage."
                 .to_owned(),
             GREEN,
         ),
@@ -1960,7 +2030,7 @@ fn overall_health(runtime: &UiRuntimeState) -> (String, String, Color32) {
         ),
         (_, DriverStatus::NotInstalled) => (
             "LIMITED PROTECTION".to_owned(),
-            "The kernel minifilter is installed but could not be loaded; file system blocking is              unavailable."
+            "The kernel minifilter is installed but could not be loaded; file system blocking is unavailable."
                 .to_owned(),
             RED,
         ),

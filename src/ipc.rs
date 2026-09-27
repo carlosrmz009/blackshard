@@ -405,6 +405,8 @@ fn requires_elevated_admin(command: &RpcCommand) -> bool {
     )
 }
 
+const SERVICE_UNAVAILABLE: &str = "protection service is unavailable";
+
 #[derive(Debug, Clone)]
 pub struct RpcFailure {
     pub code: RpcErrorCode,
@@ -420,6 +422,12 @@ impl std::fmt::Display for RpcFailure {
 impl std::error::Error for RpcFailure {}
 
 impl RpcFailure {
+    /// Whether the call failed because the service could not be reached at all, as opposed to
+    /// the service answering with an error.
+    pub fn is_service_unavailable(&self) -> bool {
+        self.message.starts_with(SERVICE_UNAVAILABLE)
+    }
+
     fn transport(message: impl Into<String>) -> Self {
         Self {
             code: RpcErrorCode::Internal,
@@ -1850,9 +1858,8 @@ mod windows_transport {
             request_id,
             command,
         };
-        let pipe = connect_client(pipe_name).map_err(|error| {
-            RpcFailure::transport(format!("protection service is unavailable: {error}"))
-        })?;
+        let pipe = connect_client(pipe_name)
+            .map_err(|error| RpcFailure::transport(format!("{SERVICE_UNAVAILABLE}: {error}")))?;
         write_json_frame(pipe.raw(), &request, max_request_bytes).map_err(|error| {
             RpcFailure::transport(format!("could not send service request: {error}"))
         })?;

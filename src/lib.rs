@@ -28,3 +28,12 @@ pub mod vba;
 pub mod verdict_cache;
 
 pub mod clamdb;
+
+/// The product version, with the commit of the CI build that produced it when there is one
+/// (`0.1.0+abc1234`), so a screenshot or bug report identifies the exact build.
+pub fn product_version() -> String {
+    match option_env!("BLACKSHARD_BUILD_ID") {
+        Some(build) if !build.is_empty() => format!("{}+{build}", env!("CARGO_PKG_VERSION")),
+        _ => env!("CARGO_PKG_VERSION").to_owned(),
+    }
+}

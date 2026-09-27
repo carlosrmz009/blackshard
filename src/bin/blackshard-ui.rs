@@ -470,10 +470,11 @@ fn set_health_read_error(runtime: &SharedUiState, error: &io::Error) {
     };
 
     if error.kind() == io::ErrorKind::NotFound {
-        let detail = "the blackshard protection service is not installed or has not started";
+        let detail = "the protection service is not running. If blackshard was just installed, \
+                      give it a few seconds; otherwise restart the computer or reinstall blackshard.";
         state.driver = DriverStatus::NotInstalled;
         state.protection = ProtectionStatus::Unavailable(detail.to_owned());
-        state.attention = Some(detail.to_owned());
+        state.attention = None;
     } else {
         let detail = format!("could not read protection-service health: {error}");
         state.driver = DriverStatus::Error(detail.clone());
@@ -607,7 +608,11 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([920.0, 600.0]),
+            .with_min_inner_size([920.0, 600.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-256.png"))
+                    .unwrap_or_default(),
+            ),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         ..Default::default()

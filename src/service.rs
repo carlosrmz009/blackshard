@@ -114,7 +114,7 @@ impl ServiceHealthSnapshot {
     fn starting(started_at: DateTime<Utc>, real_time_enabled: bool) -> Self {
         Self {
             schema_version: SERVICE_HEALTH_SCHEMA_VERSION,
-            product_version: env!("CARGO_PKG_VERSION").to_owned(),
+            product_version: crate::product_version(),
             process_id: std::process::id(),
             lifecycle: ServiceLifecycle::StartPending,
             connection: ServiceConnection::Connecting,
