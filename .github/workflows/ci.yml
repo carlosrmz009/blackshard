@@ -41,9 +41,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     runs-on: windows-2022
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -53,23 +58,39 @@ jobs:
           targets: i686-pc-windows-msvc
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # build-driver.ps1 downloads a pinned, hash-checked WDK package when the runner has no WDK.
+      - name: Cache the Windows Driver Kit package
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/wdk-nuget
+          key: wdk-${{ hashFiles('build-driver.ps1') }}
+
+      - name: Stamp the build identity
+        shell: pwsh
+        run: |
+          $short = "${{ github.sha }}".Substring(0, 7)
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          "BLACKSHARD_VERSION=$cargo-dev.${{ github.run_number }}+$short" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "BLACKSHARD_BUILD_ID=$short" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       - run: cargo fmt --check
-
-      - run: cargo check --workspace --all-targets
-
-      - run: cargo test --workspace --all-targets
 
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - run: cargo build --workspace --release
+      - run: cargo test --workspace --all-targets
 
-      - name: Build minifilter and development distribution
+      - name: Build binaries and driver
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: .\deploy.ps1
+        run: |
+          .\deploy.ps1
+          Set-Content -LiteralPath .\dist\VERSION.txt -Value $env:BLACKSHARD_VERSION -Encoding ascii
 
-      - name: Build one-click VM development installer
+      - name: Build the installer
         shell: pwsh
         run: |
           .\installer\build-development-vm-installer.ps1 `
@@ -78,9 +99,11 @@ jobs:
             -DriverPath .\dist\blackshard.sys `
             -AmsiX64Path .\dist\blackshard-amsi-x64.dll `
             -AmsiX86Path .\dist\blackshard-amsi-x86.dll `
-            -OutputDirectory .\dist
+            -OutputDirectory .\dist `
+            -Version $env:BLACKSHARD_VERSION `
+            -BuildNumber ([Math]::Min(${{ github.run_number }}, 65535))
 
-      - name: Verify development artifacts
+      - name: Verify release artifacts
         shell: pwsh
         run: |
           $required = @(
@@ -89,16 +112,23 @@ jobs:
             "blackshard.sys",
             "blackshard-amsi-x64.dll",
             "blackshard-amsi-x86.dll",
-            "blackshard-vm-setup.exe"
+            "blackshard-setup.exe",
+            "install.ps1",
+            "uninstall.ps1",
+            "verify.ps1",
+            "VERSION.txt"
           )
-
           foreach ($file in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path ".\dist" $file) -PathType Leaf)) {
               throw "Missing release artifact: $file"
             }
           }
+          $stamped = (Get-Item .\dist\blackshard-setup.exe).VersionInfo.ProductVersion
+          if ($stamped -ne $env:BLACKSHARD_VERSION) {
+            throw "blackshard-setup.exe carries version '$stamped', expected '$env:BLACKSHARD_VERSION'."
+          }
 
-      - name: Scan VM installer with Microsoft Defender
+      - name: Scan the installer with Microsoft Defender
         shell: pwsh
         run: |
           $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
@@ -114,18 +144,10 @@ jobs:
           if (-not $scanner) {
             throw "Microsoft Defender command-line scanner is unavailable."
           }
-          & $scanner -Scan -ScanType 3 -File (Join-Path $PWD "dist\blackshard-vm-setup.exe") -DisableRemediation
+          & $scanner -Scan -ScanType 3 -File (Join-Path $PWD "dist\blackshard-setup.exe") -DisableRemediation
           if ($LASTEXITCODE -ne 0) {
-            throw "Microsoft Defender rejected blackshard-vm-setup.exe with exit code $LASTEXITCODE."
+            throw "Microsoft Defender rejected blackshard-setup.exe with exit code $LASTEXITCODE."
           }
-
-      - name: Upload development test package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: blackshard-development-x64
-          path: dist/
-          if-no-files-found: error
-          retention-days: 14
 
       - name: Parse PowerShell sources
         shell: pwsh
@@ -193,6 +215,75 @@ jobs:
             throw "blackshard rejected the compact MalwareBazaar historical corpus."
           }
 
+      # Runs the installer's own script the way the setup UI does, on this throwaway runner, then
+      # removes everything again. Last in the job, because the AMSI provider it registers is loaded
+      # into every PowerShell started while it is installed.
+      - name: Install, verify and uninstall the driverless build
+        shell: pwsh
+        env:
+          # Refuses at once, so CI never downloads the ClamAV databases from Cisco. The service
+          # keeps running without them, which is all this step needs.
+          BLACKSHARD_CLAMAV_MIRROR: https://127.0.0.1:9
+        run: |
+          $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          $payload = (Resolve-Path .\target\development-installer-build).Path
+          $stage = Join-Path $env:ProgramData "blackshard-development-installer"
+          $service = "blackshard-protection-service"
+          $uninstallKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\blackshard-development"
+          $amsiKey = "HKLM:\Software\Microsoft\AMSI\Providers\{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
+          $shortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\blackshard.lnk"
+          $installed = Join-Path $env:ProgramFiles "blackshard"
+
+          & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $payload "vm-setup.ps1") -UiMode
+          if ($LASTEXITCODE -ne 0) { throw "Setup failed with exit code $LASTEXITCODE." }
+
+          if ((Get-Service $service).Status -ne "Running") { throw "The protection service is not running." }
+          foreach ($path in @($shortcut, $uninstallKey, $amsiKey, (Join-Path $installed "blackshard-ui.exe"))) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "Setup did not create $path." }
+          }
+          $registered = (Get-ItemProperty -LiteralPath $uninstallKey).DisplayVersion
+          if ($registered -ne $env:BLACKSHARD_VERSION) {
+            throw "Apps & features shows '$registered', expected '$env:BLACKSHARD_VERSION'."
+          }
+          $parameters = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$service\Parameters"
+          if ($parameters.AllowUnsignedComponents -ne 1) {
+            throw "The unsigned preview build was installed without letting its UI reach the service."
+          }
+          if (Get-Service blackshard -ErrorAction SilentlyContinue) {
+            throw "The driverless install registered the kernel driver."
+          }
+
+          & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $stage "vm-setup.ps1") -Uninstall -UiMode
+          if ($LASTEXITCODE -ne 0) { throw "Uninstall failed with exit code $LASTEXITCODE." }
+
+          if (Get-Service $service -ErrorAction SilentlyContinue) { throw "Uninstall left the protection service behind." }
+          foreach ($path in @($shortcut, $uninstallKey, $amsiKey, (Join-Path $installed "blackshard-service.exe"))) {
+            if (Test-Path -LiteralPath $path) { throw "Uninstall left $path behind." }
+          }
+
+      - name: Show installer diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach ($log in @(
+            (Join-Path $env:ProgramData "blackshard-development-installer\setup.log"),
+            (Join-Path $env:TEMP "blackshard-setup.log"),
+            (Join-Path $env:ProgramData "blackshard\service-health.json")
+          )) {
+            if (Test-Path -LiteralPath $log) {
+              Write-Host "===== $log ====="
+              Get-Content -LiteralPath $log -Tail 200
+            }
+          }
+
+      - name: Upload the build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: blackshard-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
   publish-testing-candidate:
     name: Publish testing candidate
     needs: rust
@@ -200,50 +291,89 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     concurrency:
       group: testing-candidate-release
       cancel-in-progress: true
 
     steps:
-      - name: Download development test package
+      - name: Download the build
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: blackshard-development-x64
-          path: release-assets
+          name: blackshard-windows-x64
+          path: build
 
-      - name: Replace testing candidate installer
+      - name: Package the release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release | Out-Null
+          Move-Item build/blackshard-setup.exe release/
+          Compress-Archive -Path build/* -DestinationPath release/blackshard-portable-x64.zip
+          Get-ChildItem release -File | Sort-Object Name | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content release/SHA256SUMS.txt
+          Get-Content release/SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/blackshard-setup.exe
+            release/blackshard-portable-x64.zip
+
+      - name: Replace the testing candidate
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: veryveryunstable
         run: |
-          $asset = Join-Path $PWD "release-assets/blackshard-vm-setup.exe"
-          if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
-            throw "Missing release asset: $asset"
-          }
-
           $mainHead = gh api "repos/$env:GITHUB_REPOSITORY/commits/main" --jq .sha
           if ($mainHead -ne $env:GITHUB_SHA) {
             Write-Host "Skipping release upload because a newer main commit exists: $mainHead"
             exit 0
           }
 
-          $publishedName = Split-Path -Leaf $asset
-          $legacyAssets = @(gh release view $env:RELEASE_TAG `
-            --repo $env:GITHUB_REPOSITORY `
-            --json assets `
-            --jq ".assets[].name" | Where-Object {
-              $_ -ne $publishedName -and $_ -match "(?i)^blackshard(?:vmsetup|-vm-setup)\.exe$"
-            })
-          foreach ($legacyAsset in $legacyAssets) {
-            gh release delete-asset $env:RELEASE_TAG $legacyAsset `
-              --repo $env:GITHUB_REPOSITORY `
-              --yes 2>$null
+          # A rolling prerelease: move its tag so the source archives match these binaries.
+          gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/$env:RELEASE_TAG" `
+            -f sha=$env:GITHUB_SHA -F force=true | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not move the $env:RELEASE_TAG tag; the release keeps its previous source archive."
           }
 
-          gh release upload $env:RELEASE_TAG $asset `
-            --repo $env:GITHUB_REPOSITORY `
-            --clobber
+          $version = (Get-Content build/VERSION.txt -Raw).Trim()
+          $subject = (gh api "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA" --jq .commit.message) |
+            Select-Object -First 1
+          $sums = Get-Content release/SHA256SUMS.txt -Raw
+          $notes = @"
+          Rolling preview build of ``main``. Expect breakage.
+
+          **Version:** $version
+          **Commit:** $env:GITHUB_SHA ($subject)
+          **Built:** $((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm")) UTC
+
+          - ``blackshard-setup.exe``: the installer. By default it installs without the kernel driver, so it runs on any 64-bit Windows 10 or 11 machine with no restart. The driver is an opt-in for disposable VMs.
+          - ``blackshard-portable-x64.zip``: the same binaries with ``install.ps1`` for manual installs.
+
+          These builds are not code-signed yet. Check a download against the SHA-256 list below, or verify where it was built with ``gh attestation verify <file> --repo $env:GITHUB_REPOSITORY``.
+
+          ``````
+          $sums
+          ``````
+          "@
+          Set-Content -Path notes.md -Value $notes
+
+          $published = @(Get-ChildItem release -File | ForEach-Object Name)
+          $stale = @(gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json assets --jq ".assets[].name" |
+            Where-Object { $_ -notin $published })
+          foreach ($asset in $stale) {
+            gh release delete-asset $env:RELEASE_TAG $asset --repo $env:GITHUB_REPOSITORY --yes
+          }
+
+          gh release upload $env:RELEASE_TAG (Get-ChildItem release -File).FullName `
+            --repo $env:GITHUB_REPOSITORY --clobber
+          gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            --prerelease --title "testing candidate ($version)" --notes-file notes.md
 
   dependency-audit:
     runs-on: ubuntu-latest
