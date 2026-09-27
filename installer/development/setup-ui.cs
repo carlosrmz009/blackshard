@@ -28,6 +28,7 @@ namespace blackshardDevelopmentSetup
         private readonly TextBox logBox;
         private readonly ProgressBar progress;
         private RingProgress ringProgress;
+        private CheckBox driverCheckBox;
         private Process setupProcess;
         private bool rebootPending;
         private bool installComplete;
@@ -35,7 +36,7 @@ namespace blackshardDevelopmentSetup
 
         internal SetupForm()
         {
-            Text = "blackshard VM setup";
+            Text = "blackshard setup";
             ClientSize = new Size(760, 520);
             MinimumSize = new Size(776, 559);
             MaximumSize = new Size(776, 559);
@@ -228,9 +229,11 @@ namespace blackshardDevelopmentSetup
                 RowCount = 3,
                 Padding = new Padding(25, 40, 30, 28)
             };
+            right.RowCount = 4;
             right.RowStyles.Add(new RowStyle(SizeType.Percent, 23F));
-            right.RowStyles.Add(new RowStyle(SizeType.Percent, 67F));
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 60F));
             right.RowStyles.Add(new RowStyle(SizeType.Percent, 10F));
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 7F));
             layout.Controls.Add(right, 1, 0);
 
             var actions = new TableLayoutPanel
@@ -296,13 +299,31 @@ namespace blackshardDevelopmentSetup
             statusLabel.TextAlign = ContentAlignment.BottomLeft;
             statusLabel.Font = FontResolver.CreateMono(12F, FontStyle.Bold);
             statusArea.Controls.Add(statusLabel, 0, 0);
-            detailLabel.Text = "Installs full protection in this disposable development VM.";
+            detailLabel.Text = DriverlessDescription;
             detailLabel.Dock = DockStyle.Fill;
             detailLabel.AutoSize = false;
             detailLabel.TextAlign = ContentAlignment.TopLeft;
             detailLabel.Font = FontResolver.CreateDisplay(10F, FontStyle.Regular);
             statusArea.Controls.Add(detailLabel, 0, 1);
             right.Controls.Add(statusArea, 0, 2);
+
+            // The driver is test-signed, so installing it means turning on Windows test-signing
+            // and restarting. That is only acceptable on a disposable VM, and setup refuses
+            // anywhere else.
+            driverCheckBox = new CheckBox
+            {
+                Text = "also install the kernel driver (disposable VMs only: enables test-signing and restarts Windows)",
+                Dock = DockStyle.Fill,
+                ForeColor = Muted,
+                BackColor = Color.Black,
+                Font = FontResolver.CreateDisplay(10F, FontStyle.Regular),
+                Cursor = Cursors.Hand
+            };
+            driverCheckBox.CheckedChanged += delegate
+            {
+                detailLabel.Text = driverCheckBox.Checked ? DriverDescription : DriverlessDescription;
+            };
+            right.Controls.Add(driverCheckBox, 0, 3);
 
             KeyDown += delegate(object sender, KeyEventArgs eventArgs)
             {
@@ -313,6 +334,11 @@ namespace blackshardDevelopmentSetup
             };
             UpdateInstallButtonAvailability();
         }
+
+        private const string DriverlessDescription =
+            "Installs the protection service, script scanning (AMSI), quarantine, and on-demand scans. No restart needed.";
+        private const string DriverDescription =
+            "Also installs the test-signed kernel minifilter. Windows restarts once and setup resumes automatically.";
 
         private static Control BuildInstallerBrand()
         {
@@ -434,6 +460,7 @@ namespace blackshardDevelopmentSetup
         {
             var enabled = setupProcess == null && !rebootPending;
             installButton.Enabled = enabled;
+            if (driverCheckBox != null) driverCheckBox.Enabled = enabled;
             installButton.BackColor = enabled ? Accent : Color.FromArgb(48, 48, 48);
             installButton.ForeColor = enabled ? Background : Muted;
             installButton.FlatAppearance.BorderColor = enabled ? Accent : Color.FromArgb(48, 48, 48);
@@ -453,7 +480,8 @@ namespace blackshardDevelopmentSetup
             progress.Style = ProgressBarStyle.Marquee;
             ringProgress.ProgressValue = 5;
             ringProgress.RingColor = Accent;
-            SetStatus("initializing", "Validating the VM and preparing the protected installer payload.", Accent);
+            if (driverCheckBox != null) driverCheckBox.Enabled = false;
+            SetStatus("initializing", "Preparing the protected installer payload.", Accent);
             AppendLog("Starting elevated blackshard setup engine...");
 
             var script = Path.Combine(EmbeddedPayload.Root, "vm-setup.ps1");
@@ -467,7 +495,7 @@ namespace blackshardDevelopmentSetup
             var start = new ProcessStartInfo
             {
                 FileName = powerShell,
-                Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\" -UiMode",
+                Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\" -UiMode" + (driverCheckBox != null && driverCheckBox.Checked ? " -WithDriver" : ""),
                 WorkingDirectory = EmbeddedPayload.Root,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -585,7 +613,7 @@ namespace blackshardDevelopmentSetup
                         ? "The setup engine reported an error. Review and copy the activity log below."
                         : "Setup exited with code " + exitCode + ". Review and copy the activity log below.";
                 SetStatus("installation failed", detail, Failure);
-                AppendLog("Setup failed. Persistent logs: %TEMP%\\blackshard-vm-setup.log and C:\\ProgramData\\blackshard-development-installer\\setup.log");
+                AppendLog("Setup failed. Persistent logs: %TEMP%\\blackshard-setup.log and C:\\ProgramData\\blackshard-development-installer\\setup.log");
                 installButton.Text = "retry";
             }
             UpdateInstallButtonAvailability();
@@ -672,7 +700,7 @@ namespace blackshardDevelopmentSetup
             const string ui = @"C:\Program Files\blackshard\blackshard-ui.exe";
             if (!File.Exists(ui))
             {
-                MessageBox.Show("The installed blackshard executable was not found.", "blackshard VM setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("The installed blackshard executable was not found.", "blackshard setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
             Process.Start(new ProcessStartInfo("explorer.exe", "\"" + ui + "\"") { UseShellExecute = true });
@@ -683,7 +711,7 @@ namespace blackshardDevelopmentSetup
             if (setupProcess == null) return;
             var result = MessageBox.Show(
                 "Setup is still running. Closing this window could leave installation incomplete. Close anyway?",
-                "blackshard VM setup",
+                "blackshard setup",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning);
             if (result != DialogResult.Yes) eventArgs.Cancel = true;
@@ -1369,7 +1397,7 @@ namespace blackshardDevelopmentSetup
             }
             var result = MessageBox.Show(
                 "blackshard is still installing in the background. Close the progress window?",
-                "blackshard VM setup",
+                "blackshard setup",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning
             );
@@ -1390,7 +1418,7 @@ namespace blackshardDevelopmentSetup
             "blackshard.sys",
             "blackshard-amsi-x64.dll",
             "blackshard-amsi-x86.dll",
-            "clamav-runtime.zip",
+            "version.txt",
             "install.ps1",
             "uninstall.ps1",
             "verify.ps1",

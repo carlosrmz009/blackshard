@@ -1134,7 +1134,7 @@ mod windows_transport {
             }
             _ => TrustedClientComponent::Unknown,
         };
-        if component == TrustedClientComponent::Unknown || development_ipc_policy_enabled() {
+        if component == TrustedClientComponent::Unknown || unsigned_components_allowed() {
             return Ok(component);
         }
 
@@ -1149,15 +1149,41 @@ mod windows_transport {
         Ok(component)
     }
 
-    fn development_ipc_policy_enabled() -> bool {
-        let Some(program_data) = std::env::var_os("PROGRAMDATA").map(PathBuf::from) else {
-            return false;
+    /// Whether the installer allowed unsigned components to use the control pipe.
+    ///
+    /// Preview builds ship unsigned, so the installer records that in the service's own registry
+    /// key, which only administrators can write. The same-directory check above still applies,
+    /// and the installation directory is writable by administrators alone.
+    fn unsigned_components_allowed() -> bool {
+        use windows_sys::Win32::System::Registry::{
+            RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD,
         };
-        let marker = program_data
-            .join("blackshard-development-installer")
-            .join("development-ipc-policy");
-        fs::symlink_metadata(marker)
-            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+
+        let subkey: Vec<u16> = format!(
+            r"SYSTEM\CurrentControlSet\Services\{}\Parameters",
+            crate::service::SERVICE_NAME
+        )
+        .encode_utf16()
+        .chain([0])
+        .collect();
+        let name: Vec<u16> = "AllowUnsignedComponents"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut value = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        status == 0 && value == 1
     }
 
     fn process_one_request(

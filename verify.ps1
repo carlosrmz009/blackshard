@@ -2,6 +2,9 @@
 [CmdletBinding()]
 param(
     [switch]$DevelopmentVm,
+    # Verify a driverless install: the service runs in the userland tier and no minifilter is
+    # expected. Definitions may still be downloading, so readiness is reported but not required.
+    [switch]$Userland,
     [switch]$NoExit,
     [ValidateRange(0, 600)]
     [int]$WaitSeconds = 0
@@ -126,7 +129,16 @@ do {
             $candidate = Get-Content -LiteralPath $healthPath -Raw | ConvertFrom-Json
             $updatedAt = [DateTimeOffset]::Parse([string]$candidate.updated_at)
             $ageSeconds = ([DateTimeOffset]::UtcNow - $updatedAt.ToUniversalTime()).TotalSeconds
-            $healthHealthy = (
+            $current = (
+                [int]$candidate.schema_version -eq $healthSchemaVersion -and
+                [string]$candidate.lifecycle -eq "running" -and
+                $ageSeconds -ge -5 -and
+                $ageSeconds -le 15
+            )
+            $healthHealthy = if ($Userland) {
+                $current -and [string]$candidate.tier -eq "Userland"
+            }
+            else {
                 [int]$candidate.schema_version -eq $healthSchemaVersion -and
                 [string]$candidate.lifecycle -eq "running" -and
                 [string]$candidate.connection -eq "connected" -and
@@ -135,7 +147,7 @@ do {
                 -not [bool]$candidate.external_rules_suppressed -and
                 $ageSeconds -ge -5 -and
                 $ageSeconds -le 15
-            )
+            }
             $health = $candidate
         }
         catch {
@@ -184,6 +196,15 @@ $productionHealthy = (
     $applicationAclHealthy -and
     $applicationsSigned
 )
+$userlandHealthy = (
+    -not $driverService.Exists -and
+    -not $loaded -and
+    $protectionService.Running -and
+    $healthHealthy -and
+    $applicationsPresent -and
+    $applicationAclHealthy -and
+    ($DevelopmentVm -or $applicationsSigned)
+)
 $developmentHealthy = (
     $driverService.Running -and
     $loaded -and
@@ -194,8 +215,22 @@ $developmentHealthy = (
     $applicationAclHealthy
 )
 
-if (($DevelopmentVm -and $developmentHealthy) -or (-not $DevelopmentVm -and $productionHealthy)) {
-    if ($DevelopmentVm) {
+$passed = if ($Userland) {
+    $userlandHealthy
+}
+elseif ($DevelopmentVm) {
+    $developmentHealthy
+}
+else {
+    $productionHealthy
+}
+if ($passed) {
+    if ($Userland) {
+        Write-Host "`n[PASS] The protection service is running without the kernel minifilter." -ForegroundColor Green
+        if ($null -ne $health -and [string]$health.readiness -ne "Ready") {
+            Write-Host "Readiness is '$($health.readiness)'; definitions may still be downloading." -ForegroundColor Yellow
+        }
+    } elseif ($DevelopmentVm) {
         Write-Host "`n[PASS] The development-VM minifilter and protection service are healthy." -ForegroundColor Green
         Write-Host "Launch .\blackshard-ui.exe and run the harmless protection test. This result is not production qualification."
     } else {

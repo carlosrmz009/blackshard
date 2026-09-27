@@ -432,14 +432,11 @@ mod windows_service_host {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         let blackshard_data = program_data.join("blackshard");
+        // Start on the definitions already on disk. Fetching first would hold the service in
+        // START_PENDING for as long as a 300 MB download takes; the scheduler fetches in the
+        // background instead and hands over the new generation when it lands.
         let mut active_freshclam =
-            match crate::clamdb::downloader::download_databases(&blackshard_data) {
-                Ok(active) => Some(active),
-                Err(error) => {
-                    log::warn!("Initial FreshClam activation failed: {error}");
-                    crate::clamdb::downloader::active_database(&blackshard_data).ok()
-                }
-            };
+            crate::clamdb::downloader::active_database(&blackshard_data).ok();
         let freshclam_receiver = crate::clamdb::scheduler::start_scheduler(blackshard_data.clone());
 
         readiness.update_state(crate::readiness::ReadinessState::LoadingDefinitions);

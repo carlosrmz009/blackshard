@@ -10,7 +10,12 @@ param(
     [string]$AmsiX64Path,
     [Parameter(Mandatory)]
     [string]$AmsiX86Path,
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\target\development-installer")
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\target\development-installer"),
+    # Shown in Apps & features and stamped into the executable. Defaults to the Cargo version.
+    [string]$Version,
+    # CI run number, used as the fourth part of the file version.
+    [ValidateRange(0, 65535)]
+    [int]$BuildNumber = 0
 )
 
 Set-StrictMode -Version Latest
@@ -34,6 +39,13 @@ $AmsiX64Path = Resolve-RequiredFile $AmsiX64Path "blackshard x64 AMSI provider"
 $AmsiX86Path = Resolve-RequiredFile $AmsiX86Path "blackshard x86 AMSI provider"
 $oobeSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "..\oobe.png") "blackshard OOBE image"
 $logoSource = Resolve-RequiredFile (Join-Path $PSScriptRoot "..\logo.png") "blackshard logo"
+$cargoVersion = (Select-String -LiteralPath (Join-Path $PSScriptRoot "..\Cargo.toml") `
+    -Pattern '^version\s*=\s*"(\d+)\.(\d+)\.(\d+)' | Select-Object -First 1).Matches[0]
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = "{0}.{1}.{2}" -f $cargoVersion.Groups[1].Value, $cargoVersion.Groups[2].Value, $cargoVersion.Groups[3].Value
+}
+$fileVersion = "{0}.{1}.{2}.{3}" -f $cargoVersion.Groups[1].Value, $cargoVersion.Groups[2].Value, `
+    $cargoVersion.Groups[3].Value, $BuildNumber
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
@@ -98,12 +110,13 @@ $outerManifestContent = $manifest.Replace(
 [IO.File]::WriteAllText($outerManifest, $outerManifestContent, [Text.Encoding]::UTF8)
 $assemblyMetadata = @"
 using System.Reflection;
-[assembly: AssemblyTitle("blackshard VM setup")]
-[assembly: AssemblyDescription("blackshard disposable VM development installer")]
+[assembly: AssemblyTitle("blackshard setup")]
+[assembly: AssemblyDescription("blackshard preview installer")]
 [assembly: AssemblyCompany("blackshard")]
 [assembly: AssemblyProduct("blackshard")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("$fileVersion")]
+[assembly: AssemblyFileVersion("$fileVersion")]
+[assembly: AssemblyInformationalVersion("$Version")]
 "@
 [IO.File]::WriteAllText($assemblyInfo, $assemblyMetadata, [Text.Encoding]::UTF8)
 $compiler = Start-Process -FilePath $csc -ArgumentList @(
@@ -191,6 +204,9 @@ if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
     throw "The blackshard shortcut icon could not be created from $logoSource."
 }
 
+$versionFile = Join-Path $buildRoot "version.txt"
+[IO.File]::WriteAllText($versionFile, $Version, [Text.UTF8Encoding]::new($false))
+
 $payload = [ordered]@{
     "blackshard-setup-ui.exe" = $uiExecutable
     "blackshard-service.exe" = $ServicePath
@@ -204,9 +220,24 @@ $payload = [ordered]@{
     "enable-test-signing.ps1" = (Join-Path $PSScriptRoot "..\enable-test-signing.ps1")
     "disable-test-signing.ps1" = (Join-Path $PSScriptRoot "..\disable-test-signing.ps1")
     "vm-setup.ps1" = (Join-Path $PSScriptRoot "development\vm-setup.ps1")
+    "version.txt" = $versionFile
     "oobe.png" = $oobeSource
     "logo.png" = $logoSource
     "blackshard.ico" = $iconPath
+}
+
+# The setup UI refuses to start unless every file it lists is embedded, so the two lists must
+# match exactly. A stale entry there once shipped an installer that failed on launch.
+$uiSourceText = Get-Content -LiteralPath $uiSource -Raw
+$listMatch = [regex]::Match($uiSourceText, '(?s)string\[\]\s+FileNames\s*=\s*\{(.*?)\};')
+if (-not $listMatch.Success) {
+    throw "Could not find the EmbeddedPayload.FileNames list in $uiSource."
+}
+$uiPayloadNames = @([regex]::Matches($listMatch.Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+$missingFromPayload = @($uiPayloadNames | Where-Object { $_ -notin $payload.Keys })
+$missingFromUi = @($payload.Keys | Where-Object { $_ -notin $uiPayloadNames })
+if ($missingFromPayload.Count -or $missingFromUi.Count) {
+    throw "setup-ui.cs and this script disagree on the payload. Listed by the UI but not embedded: $($missingFromPayload -join ', '). Embedded but not listed by the UI: $($missingFromUi -join ', ')."
 }
 
 foreach ($entry in $payload.GetEnumerator()) {
@@ -219,8 +250,8 @@ foreach ($entry in $payload.GetEnumerator()) {
 
 $packageOutputDirectory = Join-Path $buildRoot "package-output"
 New-Item -ItemType Directory -Path $packageOutputDirectory | Out-Null
-$packageOutputPath = Join-Path $packageOutputDirectory "blackshard-vm-setup.exe"
-$outputPath = Join-Path $OutputDirectory "blackshard-vm-setup.exe"
+$packageOutputPath = Join-Path $packageOutputDirectory "blackshard-setup.exe"
+$outputPath = Join-Path $OutputDirectory "blackshard-setup.exe"
 if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
     Remove-Item -LiteralPath $outputPath -Force
 }
@@ -275,5 +306,5 @@ foreach ($resourceName in $expectedPayloads) {
 }
 
 $hash = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash
-Write-Host "[+] VM development installer created: $outputPath" -ForegroundColor Green
+Write-Host "[+] Installer $Version created: $outputPath" -ForegroundColor Green
 Write-Host "[+] SHA-256: $hash" -ForegroundColor Green

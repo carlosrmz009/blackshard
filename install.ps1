@@ -5,7 +5,10 @@ param(
     [switch]$AllowUnsigned,
     # Install without the kernel minifilter. Real-time coverage then comes from AMSI, which needs
     # no kernel code and therefore no EV certificate or test-signing.
-    [switch]$SkipDriver
+    [switch]$SkipDriver,
+    # Where the service downloads ClamAV definitions from, for a private mirror. Also settable
+    # through the BLACKSHARD_CLAMAV_MIRROR environment variable of the installing process.
+    [string]$DefinitionMirror = $env:BLACKSHARD_CLAMAV_MIRROR
 )
 
 Set-StrictMode -Version Latest
@@ -197,10 +200,14 @@ enable-test-signing.ps1, reboot, and re-run install.ps1 with -AllowUnsigned.
     }
 }
 
+# The service only answers its own UI when both are Authenticode-signed, unless the installer
+# records otherwise in the service's registry key (writable by administrators alone).
+$unsignedComponents = $false
 foreach ($sourceExecutable in @($sourceService, $sourceUi)) {
     $executableSignature = Get-AuthenticodeSignature -LiteralPath $sourceExecutable
     if ($executableSignature.Status -ne "Valid") {
-        Write-Warning "$([IO.Path]::GetFileName($sourceExecutable)) is not Authenticode-signed. Use it only in this disposable VM."
+        $unsignedComponents = $true
+        Write-Warning "$([IO.Path]::GetFileName($sourceExecutable)) is not Authenticode-signed; this is a preview build."
     }
 }
 
@@ -213,11 +220,6 @@ Copy-Item -LiteralPath $sourceUi -Destination $destinationUi -Force
 Copy-Item -LiteralPath $sourceAmsiX64 -Destination $destinationAmsiX64 -Force
 Copy-Item -LiteralPath $sourceAmsiX86 -Destination $destinationAmsiX86 -Force
 
-
-
-
-
-
 & icacls.exe $agentDirectory "/inheritance:e" `
     "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `
     "/grant:r" "*S-1-5-32-544:(OI)(CI)(F)" `
@@ -228,7 +230,18 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not apply the protected Program Files ACL."
 }
 
+# ProgramData is writable by standard users, so the directory may already exist with an owner and
+# access entries someone else chose. Take ownership, strip every explicit entry below it, then set
+# the protected ACL that everything inside inherits.
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
+& icacls.exe $dataDirectory "/setowner" "*S-1-5-32-544" "/T" "/C" "/Q" | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not take ownership of $dataDirectory."
+}
+& icacls.exe $dataDirectory "/reset" "/T" "/C" "/Q" | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not reset the access entries under $dataDirectory."
+}
 & icacls.exe $dataDirectory "/inheritance:r" `
     "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `
     "/grant:r" "*S-1-5-32-544:(OI)(CI)(F)" `
@@ -266,24 +279,15 @@ if ($installDriver) {
     & sc.exe stop $driverName 2>$null | Out-Host
     & sc.exe delete $driverName 2>$null | Out-Host
 
-
-
-
-
-
     $waitLimit = 20
     for ($i = 0; $i -lt $waitLimit; $i++) {
         $query = & sc.exe query $driverName 2>&1
         if ($LASTEXITCODE -ne 0) {
-
             break
         }
         Start-Sleep -Milliseconds 500
     }
     if (Test-Path -LiteralPath $serviceRegistryPath) {
-
-
-
         Remove-Item -LiteralPath $serviceRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 500
     }
@@ -302,11 +306,6 @@ if ($installDriver) {
         New-Item -Path $serviceRegistryPath -Force | Out-Null
     }
 
-
-
-
-
-
     $instanceLayouts = @(
         (Join-Path $serviceRegistryPath "Instances"),
         (Join-Path $serviceRegistryPath "Parameters\Instances")
@@ -317,12 +316,9 @@ if ($installDriver) {
         New-ItemProperty -Path $instancesPath -Name "DefaultInstance" -Value "blackshard Instance" -PropertyType String -Force | Out-Null
         New-Item -Path $instancePath -Force | Out-Null
 
-
-
         New-ItemProperty -Path $instancePath -Name "Altitude" -Value "320000.4242" -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $instancePath -Name "Flags" -Value 0 -PropertyType DWord -Force | Out-Null
     }
-
 
     $parametersPath = Join-Path $serviceRegistryPath "Parameters"
     New-Item -Path $parametersPath -Force | Out-Null
@@ -330,8 +326,6 @@ if ($installDriver) {
     New-ItemProperty -Path $parametersPath -Name "SupportedFeatures" -Value 3 -PropertyType DWord -Force | Out-Null
 
     Write-Host "[*] Loading blackshard minifilter..." -ForegroundColor Cyan
-
-
 
     $registryDump = & reg.exe query "HKLM\System\CurrentControlSet\Services\$driverName" /s 2>&1
     $registryDump | Out-Host
@@ -355,7 +349,6 @@ $regDump
     if (-not (Test-blackshardFilterLoaded)) {
         throw "fltmc reported success, but blackshard is absent from the loaded filter list."
     }
-
 }
 else {
     Write-Host "[*] Skipping the kernel minifilter; blackshard will run with AMSI coverage." -ForegroundColor Yellow
@@ -368,7 +361,24 @@ $null = New-Service `
     -Description "blackshard real-time protection and quarantine service"
 
 $serviceCommand = "`"$destinationService`" --service"
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$protectionServiceName" -Name ImagePath -Value $serviceCommand -Type ExpandString
+$serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$protectionServiceName"
+Set-ItemProperty -Path $serviceKey -Name ImagePath -Value $serviceCommand -Type ExpandString
+$serviceParameters = Join-Path $serviceKey "Parameters"
+New-Item -Path $serviceParameters -Force | Out-Null
+if ($unsignedComponents) {
+    New-ItemProperty -Path $serviceParameters -Name AllowUnsignedComponents -Value 1 -PropertyType DWord -Force | Out-Null
+}
+else {
+    Remove-ItemProperty -Path $serviceParameters -Name AllowUnsignedComponents -ErrorAction SilentlyContinue
+}
+
+if ([string]::IsNullOrWhiteSpace($DefinitionMirror)) {
+    Remove-ItemProperty -Path $serviceKey -Name Environment -ErrorAction SilentlyContinue
+}
+else {
+    New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString `
+        -Value @("BLACKSHARD_CLAMAV_MIRROR=$DefinitionMirror") -Force | Out-Null
+}
 
 & sc.exe failure $protectionServiceName "reset= 86400" "actions= restart/30000/restart/30000/none/0" | Out-Host
 Start-Service -Name $protectionServiceName
