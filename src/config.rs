@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 
@@ -24,6 +25,9 @@ pub struct Settings {
     pub worker_count: usize,
     pub definition_update_interval_hours: u64,
     pub exclusions: Vec<PathBuf>,
+    /// `exclusions` resolved to comparison keys, computed on first use. See `is_excluded`.
+    #[serde(skip)]
+    exclusion_keys: OnceLock<Vec<String>>,
 }
 
 impl Default for Settings {
@@ -45,6 +49,7 @@ impl Default for Settings {
             worker_count: logical_cpus.saturating_sub(1).clamp(1, 4),
             definition_update_interval_hours: 4,
             exclusions: Vec::new(),
+            exclusion_keys: OnceLock::new(),
         }
     }
 }
@@ -74,22 +79,42 @@ impl Settings {
         base.join("blackshard").join("settings.json")
     }
 
+    /// Whether `path` is an exclusion or lies inside one.
+    ///
+    /// This runs for every real-time event, so it touches no file system: the exclusions are
+    /// resolved once, and the candidate is compared as text. Callers therefore pass a path that is
+    /// already final: the path of an opened handle, a kernel device path, or a path found under a
+    /// canonicalised scan root.
     pub fn is_excluded(&self, path: &Path) -> bool {
-        let candidate = normalize_for_comparison(path);
-        self.exclusions.iter().any(|exclusion| {
-            let exclusion = normalize_for_comparison(exclusion);
-            candidate == exclusion || candidate.starts_with(&exclusion)
+        let candidate = comparison_key(path);
+        self.exclusion_keys().iter().any(|exclusion| {
+            candidate
+                .strip_prefix(exclusion.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+        })
+    }
+
+    /// Each exclusion canonicalised, in both its drive-letter and kernel device form, since
+    /// real-time events arrive as `\Device\HarddiskVolumeN\...` paths.
+    fn exclusion_keys(&self) -> &[String] {
+        self.exclusion_keys.get_or_init(|| {
+            let mut keys = Vec::new();
+            for exclusion in &self.exclusions {
+                let key = resolved_key(exclusion);
+                if let Some(device) = device_form(&key) {
+                    keys.push(device);
+                }
+                keys.push(key);
+            }
+            keys
         })
     }
 
     pub fn add_exclusion(&mut self, path: PathBuf) {
-        let normalized = normalize_for_comparison(&path);
-        if !self
-            .exclusions
-            .iter()
-            .any(|item| normalize_for_comparison(item) == normalized)
-        {
+        let key = resolved_key(&path);
+        if !self.exclusions.iter().any(|item| resolved_key(item) == key) {
             self.exclusions.push(path);
+            self.exclusion_keys = OnceLock::new();
         }
     }
 
@@ -98,24 +123,62 @@ impl Settings {
         self.max_file_size_mb = self.max_file_size_mb.clamp(1, 4_096);
         self.worker_count = self.worker_count.clamp(1, 16);
         self.definition_update_interval_hours = self.definition_update_interval_hours.clamp(1, 24);
+        self.exclusions.sort_by_key(|path| resolved_key(path));
         self.exclusions
-            .sort_by_key(|path| normalize_for_comparison(path));
-        self.exclusions.dedup_by(|left, right| {
-            normalize_for_comparison(left) == normalize_for_comparison(right)
-        });
+            .dedup_by(|left, right| resolved_key(left) == resolved_key(right));
+        self.exclusion_keys = OnceLock::new();
     }
 }
 
-fn normalize_for_comparison(path: &Path) -> PathBuf {
-    let absolute = canonicalize_with_missing_tail(path);
-    #[cfg(windows)]
+/// Canonicalises a path, then reduces it to its comparison key.
+fn resolved_key(path: &Path) -> String {
+    comparison_key(&canonicalize_with_missing_tail(path))
+}
+
+/// Case-folded path text without Win32 namespace prefixes or trailing separators, so
+/// `\\?\C:\Temp\`, `C:/temp` and `\\?\GLOBALROOT\Device\X\temp` compare as their plain forms.
+fn comparison_key(path: &Path) -> String {
+    let lower = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let key = if let Some(rest) = lower.strip_prefix(r"\\?\globalroot") {
+        rest.to_owned()
+    } else if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = lower
+        .strip_prefix(r"\\?\")
+        .or_else(|| lower.strip_prefix(r"\??\"))
     {
-        PathBuf::from(absolute.to_string_lossy().to_lowercase())
+        rest.to_owned()
+    } else {
+        lower
+    };
+    key.trim_end_matches('\\').to_owned()
+}
+
+/// Rewrites a `c:\...` key into the `\device\harddiskvolumen\...` form the minifilter reports.
+#[cfg(windows)]
+fn device_form(key: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+
+    let bytes = key.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
     }
-    #[cfg(not(windows))]
-    {
-        absolute
+    let drive: Vec<u16> = key[..2].encode_utf16().chain([0]).collect();
+    let mut target = vec![0u16; 1024];
+    let written =
+        unsafe { QueryDosDeviceW(drive.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+    if written == 0 {
+        return None;
     }
+    // The result is a list of NUL-terminated names; the first is the current mapping.
+    let device = target.split(|unit| *unit == 0).next()?;
+    let device = String::from_utf16(device).ok()?.to_lowercase();
+    Some(format!("{device}{}", &key[2..]))
+}
+
+#[cfg(not(windows))]
+fn device_form(_key: &str) -> Option<String> {
+    None
 }
 
 fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
@@ -190,7 +253,42 @@ mod tests {
         let mut settings = Settings::default();
         settings.add_exclusion(excluded.clone());
 
+        // Callers pass final paths, so the test does too.
+        let excluded = fs::canonicalize(&excluded).unwrap();
+        let sibling = fs::canonicalize(&sibling).unwrap();
         assert!(settings.is_excluded(&excluded.join("file.bin")));
+        assert!(settings.is_excluded(&excluded));
         assert!(!settings.is_excluded(&sibling.join("file.bin")));
+    }
+
+    #[test]
+    fn exclusions_match_the_forms_real_time_events_arrive_in() {
+        let temporary = tempfile::tempdir().unwrap();
+        let excluded = fs::canonicalize(temporary.path())
+            .unwrap()
+            .join("Build Cache");
+        fs::create_dir_all(&excluded).unwrap();
+        let mut settings = Settings::default();
+        settings.add_exclusion(excluded.clone());
+
+        let key = comparison_key(&excluded);
+        let device = device_form(&key).expect("the temp drive has a device name");
+        assert!(settings.is_excluded(Path::new(&format!(r"{device}\OUT.obj"))));
+        assert!(settings.is_excluded(Path::new(&format!(r"\\?\GLOBALROOT{device}\out.obj"))));
+        assert!(settings.is_excluded(&excluded.join("x.obj")));
+        assert!(!settings.is_excluded(Path::new(&format!(r"{device}-old\x.obj"))));
+    }
+
+    #[test]
+    fn changing_exclusions_invalidates_the_resolved_keys() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temporary.path()).unwrap();
+        let mut settings = Settings::default();
+        assert!(!settings.is_excluded(&root.join("a")));
+        settings.add_exclusion(root.clone());
+        assert!(settings.is_excluded(&root.join("a")));
+        settings.exclusions.clear();
+        settings.validate();
+        assert!(!settings.is_excluded(&root.join("a")));
     }
 }

@@ -508,13 +508,25 @@ fn scan_roots(kind: &ScanKind, settings: &Settings) -> Result<Vec<PathBuf>, Stri
         ScanKind::Full => full_scan_roots(settings.scan_network_drives),
         ScanKind::Custom(paths) => paths.clone(),
     };
+    // Canonical roots give every path found under them its final form, which is what
+    // `Settings::is_excluded` compares against.
     let mut roots = roots
         .into_iter()
-        .filter(|path| path.exists())
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .map(strip_verbatim_prefix)
         .collect::<Vec<_>>();
     roots.sort();
     roots.dedup();
     Ok(roots)
+}
+
+/// `\\?\C:\x` back to `C:\x`, so canonical roots still compare equal to ordinary paths such as
+/// the quarantine root. UNC and device paths keep their prefix.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_string_lossy().strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 fn is_archive_container(path: &Path) -> bool {
