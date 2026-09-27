@@ -338,7 +338,9 @@ function Install-AllComponents {
     Write-Output "blackshard_ui:INSTALL_COMPLETE"
 
     Write-Host "[+] blackshard is installed and verified." -ForegroundColor Green
-    Write-Host "[+] blackshard completion will appear when an interactive user signs in." -ForegroundColor Green
+    if (Test-Path -LiteralPath $driverModePath -PathType Leaf) {
+        Write-Host "[+] blackshard completion will appear when an interactive user signs in." -ForegroundColor Green
+    }
 }
 
 function Start-ImmediateSystemInstall {

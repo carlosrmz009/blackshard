@@ -80,6 +80,36 @@ function Stop-blackshardServiceForReplacement([string]$Name) {
     throw "The $Name service registration could not be removed before replacement."
 }
 
+# Every PowerShell, Office and script host loads the AMSI provider at startup, including the
+# PowerShell running this script, and Windows will not delete or overwrite a loaded DLL. It
+# will rename one, so a file in use is moved aside and deleted at the next restart.
+if (-not ("blackshard.NativeFile" -as [type])) {
+Add-Type -Namespace blackshard -Name NativeFile -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern bool MoveFileEx(string existing, string replacement, int flags);
+"@
+}
+
+function Remove-FileNowOrAtRestart([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return
+    }
+    catch [UnauthorizedAccessException], [IO.IOException] {
+    }
+    $aside = "$Path.$([Guid]::NewGuid().ToString('N')).old"
+    [IO.File]::Move($Path, $aside)
+    $delayUntilReboot = 4
+    if (-not [blackshard.NativeFile]::MoveFileEx($aside, $null, $delayUntilReboot)) {
+        Write-Warning "$aside is in use and could not be scheduled for deletion; remove it after a restart."
+        return
+    }
+    Write-Host "[*] $([IO.Path]::GetFileName($Path)) is in use; it will be deleted at the next restart." -ForegroundColor Yellow
+}
+
 function Get-DriverLoadDiagnostics {
     $lines = New-Object Collections.Generic.List[string]
     try {
@@ -133,23 +163,18 @@ function Remove-blackshardInstallation {
     & sc.exe delete $driverName 2>$null | Out-Host
     Start-Sleep -Seconds 1
 
-    if (Test-Path -LiteralPath $destinationDriver) {
-        Remove-Item -LiteralPath $destinationDriver -Force
-    }
-    foreach ($installedFile in @(
-        $destinationService,
-        $destinationUi,
-        $destinationAmsiX64,
-        $destinationAmsiX86
-    )) {
-        if (Test-Path -LiteralPath $installedFile -PathType Leaf) {
-            Remove-Item -LiteralPath $installedFile -Force
-        }
-    }
+    Remove-FileNowOrAtRestart $destinationDriver
+    # Only blackshard writes here (the directory is administrator-only), so everything in it goes.
     if (Test-Path -LiteralPath $agentDirectory -PathType Container) {
-        $remaining = @(Get-ChildItem -LiteralPath $agentDirectory -Force)
-        if ($remaining.Count -eq 0) {
+        foreach ($installedFile in @(Get-ChildItem -LiteralPath $agentDirectory -File -Force)) {
+            Remove-FileNowOrAtRestart $installedFile.FullName
+        }
+        if (@(Get-ChildItem -LiteralPath $agentDirectory -Force).Count -eq 0) {
             Remove-Item -LiteralPath $agentDirectory -Force
+        }
+        else {
+            # Only files moved aside remain. Windows deletes them at restart, then the directory.
+            [void][blackshard.NativeFile]::MoveFileEx($agentDirectory, $null, 4)
         }
     }
 
@@ -215,10 +240,16 @@ foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)
     Stop-blackshardServiceForReplacement -Name $serviceName
 }
 New-Item -ItemType Directory -Path $agentDirectory -Force | Out-Null
-Copy-Item -LiteralPath $sourceService -Destination $destinationService -Force
-Copy-Item -LiteralPath $sourceUi -Destination $destinationUi -Force
-Copy-Item -LiteralPath $sourceAmsiX64 -Destination $destinationAmsiX64 -Force
-Copy-Item -LiteralPath $sourceAmsiX86 -Destination $destinationAmsiX86 -Force
+foreach ($component in @(
+    @{ Source = $sourceService; Destination = $destinationService },
+    @{ Source = $sourceUi; Destination = $destinationUi },
+    @{ Source = $sourceAmsiX64; Destination = $destinationAmsiX64 },
+    @{ Source = $sourceAmsiX86; Destination = $destinationAmsiX86 }
+)) {
+    # An upgrade finds the old AMSI provider loaded in running processes, and the UI may be open.
+    Remove-FileNowOrAtRestart $component.Destination
+    Copy-Item -LiteralPath $component.Source -Destination $component.Destination -Force
+}
 
 & icacls.exe $agentDirectory "/inheritance:e" `
     "/grant:r" "*S-1-5-18:(OI)(CI)(F)" `

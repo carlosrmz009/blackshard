@@ -227,8 +227,12 @@ else {
 if ($passed) {
     if ($Userland) {
         Write-Host "`n[PASS] The protection service is running without the kernel minifilter." -ForegroundColor Green
-        if ($null -ne $health -and [string]$health.readiness -ne "Ready") {
-            Write-Host "Readiness is '$($health.readiness)'; definitions may still be downloading." -ForegroundColor Yellow
+        # Readiness is a plain string when ready and an object named after the state otherwise.
+        $readiness = if ($null -eq $health) { "unknown" }
+            elseif ($health.readiness -is [string]) { $health.readiness }
+            else { @($health.readiness.PSObject.Properties.Name) -join ", " }
+        if ($readiness -ne "Ready") {
+            Write-Host "Readiness is '$readiness'; definitions may still be downloading." -ForegroundColor Yellow
         }
     } elseif ($DevelopmentVm) {
         Write-Host "`n[PASS] The development-VM minifilter and protection service are healthy." -ForegroundColor Green

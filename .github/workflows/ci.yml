@@ -253,6 +253,11 @@ jobs:
             throw "The driverless install registered the kernel driver."
           }
 
+          # Again over the top, as an upgrade would: the AMSI provider is loaded by then.
+          & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $payload "vm-setup.ps1") -UiMode
+          if ($LASTEXITCODE -ne 0) { throw "Reinstalling over an existing install failed with exit code $LASTEXITCODE." }
+          if ((Get-Service $service).Status -ne "Running") { throw "The protection service is not running after the upgrade." }
+
           & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $stage "vm-setup.ps1") -Uninstall -UiMode
           if ($LASTEXITCODE -ne 0) { throw "Uninstall failed with exit code $LASTEXITCODE." }
 
