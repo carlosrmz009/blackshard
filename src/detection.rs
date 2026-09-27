@@ -3,14 +3,12 @@ use crate::archive::{inspect_gzip, inspect_ole, inspect_zip, ContainerInspection
 use crate::clamdb::native_index::{pe_section_digests, IndexMatch, MatchOrigin, NativeIndex};
 use crate::definitions::{DefinitionMatchRateCircuitBreaker, DefinitionMatchRateState};
 use crate::engine::{ContentType, ScanEngine, ScanReport, Verdict as StaticVerdict};
-use crate::parser_worker::{protocol::ParseResult, ParserWorker};
 use crate::rules::{RuleDisposition, RuleEnforcementAuthority, RuleEngine, RuleMatch};
 use crate::similarity::{SimilarityEngine, SimilarityMatch};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -134,7 +132,6 @@ pub struct DetectionEngine {
     external_rule_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
     external_similarity_circuit_breaker: Mutex<DefinitionMatchRateCircuitBreaker>,
     native_index: Arc<RwLock<NativeIndex>>,
-    parser_worker: Mutex<Option<ParserWorker>>,
 }
 
 impl DetectionEngine {
@@ -154,7 +151,6 @@ impl DetectionEngine {
                 DefinitionMatchRateCircuitBreaker::default(),
             ),
             native_index: shared_native_index(),
-            parser_worker: Mutex::new(ParserWorker::new().ok()),
         }
     }
 
@@ -213,14 +209,6 @@ impl DetectionEngine {
         })
     }
 
-    pub fn parser_worker_healthy(&self) -> bool {
-        self.parser_worker
-            .lock()
-            .ok()
-            .and_then(|mut worker| worker.as_mut().map(ParserWorker::health_check))
-            .is_some_and(|result| result.is_ok())
-    }
-
     pub fn builtin() -> Result<Self, String> {
         Ok(Self::new(ScanEngine::default(), RuleEngine::builtin()?))
     }
@@ -256,6 +244,10 @@ impl DetectionEngine {
     }
 
     pub fn scan_open_file(&self, file: &File) -> DetectionReport {
+        contain_panics(Instant::now(), || self.analyze_open_file(file))
+    }
+
+    fn analyze_open_file(&self, file: &File) -> DetectionReport {
         let started = Instant::now();
         let before = match file.metadata() {
             Ok(metadata) if metadata.is_file() => metadata,
@@ -323,35 +315,6 @@ impl DetectionEngine {
             self.static_engine
                 .scan_sample_with_digest(&sample, declared_size, digests.sha256);
         let static_duration = static_start.elapsed();
-
-        if requires_isolated_parser(static_report.content_type) {
-            let parser_result = self.parser_worker.lock().ok().and_then(|mut worker| {
-                worker
-                    .as_mut()
-                    .map(|worker| worker.scan_handle(file.as_raw_handle() as u64))
-            });
-            match parser_result {
-                Some(Ok(ParseResult::Error(error))) => {
-                    return DetectionReport::error(
-                        format!("isolated parser rejected the candidate: {error}"),
-                        started.elapsed(),
-                    )
-                }
-                Some(Err(error)) => {
-                    return DetectionReport::error(
-                        format!("isolated parser worker is unavailable: {error}"),
-                        started.elapsed(),
-                    )
-                }
-                None => {
-                    return DetectionReport::error(
-                        "isolated parser worker is unavailable",
-                        started.elapsed(),
-                    )
-                }
-                _ => {}
-            }
-        }
 
         let native_index_start = Instant::now();
         let native_index_match =
@@ -431,8 +394,10 @@ impl DetectionEngine {
 
     fn scan_bytes_with(&self, bytes: &[u8], system_amsi: SystemAmsi) -> DetectionReport {
         let started = Instant::now();
-        let report = self.scan_leaf_bytes_with(bytes, system_amsi);
-        self.with_container_inspection(bytes, report, started, system_amsi)
+        contain_panics(started, || {
+            let report = self.scan_leaf_bytes_with(bytes, system_amsi);
+            self.with_container_inspection(bytes, report, started, system_amsi)
+        })
     }
 
     #[cfg(test)]
@@ -727,19 +692,19 @@ fn read_and_hash(
     ))
 }
 
-fn requires_isolated_parser(content_type: ContentType) -> bool {
-    matches!(
-        content_type,
-        ContentType::Pe32
-            | ContentType::Pe64
-            | ContentType::PeUnknown
-            | ContentType::Pdf
-            | ContentType::Zip
-            | ContentType::Gzip
-            | ContentType::SevenZip
-            | ContentType::Rar
-            | ContentType::OleCompound
-    )
+/// Runs one analysis, turning a panic anywhere in it into an error verdict.
+///
+/// Every parser here is memory-safe Rust working on a bounded sample, so what malformed input can
+/// realistically cause is a panic, not memory corruption. Containing it keeps one bad file from
+/// killing the scanning thread, and with it real-time protection.
+///
+/// ponytail: no hang protection. A parser stuck in a loop holds its thread until the service
+/// restarts; an out-of-process worker pool with per-request timeouts is the upgrade, and becomes
+/// necessary if a parser written in an unsafe language (libclamav, say) is ever linked in.
+fn contain_panics(started: Instant, analysis: impl FnOnce() -> DetectionReport) -> DetectionReport {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(analysis)).unwrap_or_else(|_| {
+        DetectionReport::error("the analysis panicked on this input", started.elapsed())
+    })
 }
 
 #[cfg(windows)]
@@ -1041,6 +1006,12 @@ fn shared_system_amsi() -> Result<Arc<AmsiScanner>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_panicking_analysis_becomes_an_error_verdict() {
+        let report = contain_panics(Instant::now(), || panic!("malformed input"));
+        assert_eq!(report.verdict, DetectionVerdict::Error);
+        assert!(!report.should_block() && !report.should_quarantine());
+    }
     #[test]
     fn whole_file_digests_cover_bytes_past_the_analysis_limit() {
         let mut file = vec![7u8; 5000];

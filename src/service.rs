@@ -563,8 +563,7 @@ mod windows_service_host {
         let mut consecutive_health_failures = 0u32;
         let mut self_test_passed = false;
         let mut last_self_test_attempt = None::<Instant>;
-        let mut last_worker_health_check = None::<Instant>;
-        let mut parser_worker_healthy = false;
+        let mut last_version_refresh = None::<Instant>;
         while !stop_requested.load(Ordering::Acquire) {
             let mut changed = false;
             match event_receiver.recv_timeout(Duration::from_millis(500)) {
@@ -687,20 +686,16 @@ mod windows_service_host {
                 .unwrap_or(true);
 
             let driver_health = protection.driver_health().ok();
-            if last_worker_health_check
+            if last_version_refresh
                 .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(30))
             {
-                if let Ok(active) = engine.read() {
-                    parser_worker_healthy = active.parser_worker_healthy();
-                }
                 snapshot.definition_database_version = active_freshclam
                     .as_ref()
                     .map(|active| active.version.clone());
-                last_worker_health_check = Some(Instant::now());
+                last_version_refresh = Some(Instant::now());
             }
-            let worker_preflight = active_freshclam.is_some() && parser_worker_healthy;
             let self_test_ready =
-                worker_preflight && (!tier.requires_driver() || driver_health.is_some());
+                active_freshclam.is_some() && (!tier.requires_driver() || driver_health.is_some());
             if !self_test_passed
                 && self_test_ready
                 && last_self_test_attempt
@@ -739,7 +734,6 @@ mod windows_service_host {
                 driver_ready_generation: driver_health.as_ref().and_then(|health| {
                     (health.ready_generation != 0).then_some(health.ready_generation)
                 }),
-                parser_worker_healthy,
                 quarantine_available: quarantine.list().is_ok(),
                 history_available: history.recent(1).is_ok(),
                 ipc_available: true,

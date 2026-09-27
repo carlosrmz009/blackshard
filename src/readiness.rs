@@ -90,7 +90,6 @@ pub struct ProtectionComponents {
     pub driver_connected: bool,
     pub driver_protocol_validated: bool,
     pub driver_ready_generation: Option<u64>,
-    pub parser_worker_healthy: bool,
     pub quarantine_available: bool,
     pub history_available: bool,
     pub ipc_available: bool,
@@ -111,7 +110,6 @@ impl ProtectionComponents {
                 "active FreshClam database",
             ),
             (self.rule_generation != 0, "rule generation"),
-            (self.parser_worker_healthy, "isolated parser worker"),
             (self.quarantine_available, "quarantine store"),
             (self.history_available, "event history"),
             (self.ipc_available, "local control server"),
@@ -280,7 +278,6 @@ mod tests {
             driver_connected: true,
             driver_protocol_validated: true,
             driver_ready_generation: Some(9),
-            parser_worker_healthy: true,
             quarantine_available: true,
             history_available: true,
             ipc_available: true,
@@ -310,11 +307,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_driver_self_test_or_worker_never_reports_ready() {
+    fn missing_driver_or_self_test_never_reports_ready() {
         for mutate in [
             |components: &mut ProtectionComponents| components.driver_connected = false,
             |components: &mut ProtectionComponents| components.self_test_passed = false,
-            |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
             |components: &mut ProtectionComponents| components.quarantine_available = false,
         ] {
             let mut components = healthy_components();
@@ -358,7 +354,6 @@ mod tests {
     fn the_userland_tier_still_requires_everything_that_does_not_need_a_driver() {
         for mutate in [
             |components: &mut ProtectionComponents| components.self_test_passed = false,
-            |components: &mut ProtectionComponents| components.parser_worker_healthy = false,
             |components: &mut ProtectionComponents| components.native_definitions_loaded = false,
             |components: &mut ProtectionComponents| components.quarantine_available = false,
         ] {

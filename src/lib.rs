@@ -28,4 +28,3 @@ pub mod vba;
 pub mod verdict_cache;
 
 pub mod clamdb;
-pub mod parser_worker;

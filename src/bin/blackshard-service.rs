@@ -14,7 +14,6 @@ const SELF_TEST_ARGUMENT: &str = "--blackshard-self-test-open";
 const INSTALL_DRIVER_ARGUMENT: &str = "--install-driver";
 const UNINSTALL_DRIVER_ARGUMENT: &str = "--uninstall-driver";
 const NOTIFICATION_AGENT_ARGUMENT: &str = "--notification-agent";
-const PARSER_WORKER_ARGUMENT: &str = "--parser-worker";
 const UPDATE_DEFINITIONS_ARGUMENT: &str = "--update-definitions";
 const VALIDATE_RELEASE_CONFIGURATION_ARGUMENT: &str = "--validate-release-configuration";
 const VALIDATE_DEFINITION_PAYLOAD_ARGUMENT: &str = "--validate-definition-payload";
@@ -418,7 +417,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(INSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(true)),
         Some(UNINSTALL_DRIVER_ARGUMENT) => std::process::exit(driver_change_exit_code(false)),
         Some(NOTIFICATION_AGENT_ARGUMENT) => notification_agent::run().map_err(Into::into),
-        Some(PARSER_WORKER_ARGUMENT) => parser_worker::run_worker_process().map_err(Into::into),
         Some(UPDATE_DEFINITIONS_ARGUMENT) => {
             let destination = std::env::args_os()
                 .nth(2)
