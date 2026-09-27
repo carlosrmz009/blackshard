@@ -629,9 +629,10 @@ pub(crate) fn realtime_worker(
             report.risk_score as u32,
         );
 
-        if driver_verdict == DriverVerdict::Block && notification.process_id != 0 {
-            terminate_malicious_process(notification.process_id);
-        }
+        // No process is terminated here. For an open, the requester only read the file and may
+        // well be innocent: Explorer drawing an icon, the indexer, a browser checking a download.
+        // For an execution, denying the image section already stops the program, and the process
+        // that requested the section is the one launching it, not the program itself.
 
         let mut quarantine_record = None;
         let mut action_error = None;
@@ -768,6 +769,7 @@ fn handle_protected_modification(
     monitor: &Arc<Mutex<RansomwareMonitor>>,
     trust_cache: &Arc<Mutex<HashMap<(u32, u64), ProcessTrust>>>,
 ) {
+    let observed_at = std::time::SystemTime::now();
     let (enabled, block_mode) = settings
         .read()
         .map(|settings| {
@@ -838,7 +840,7 @@ fn handle_protected_modification(
             counters.blocked_replies += 1;
         }
         if notification.process_id != 0 {
-            terminate_malicious_process(notification.process_id);
+            terminate_ransomware_process(notification.process_id, observed_at);
         }
     }
     if !decision.alert {
@@ -1063,28 +1065,260 @@ pub fn launch_hidden_probe(executable: &Path, argument: &str, path: &Path) -> st
     Ok(status.code().unwrap_or(-1))
 }
 
-fn terminate_malicious_process(process_id: u32) {
+/// Windows binaries that are never terminated, even when they trip the ransomware heuristic.
+///
+/// Killing the shell, the search indexer or a service host takes down far more than the one
+/// operation that was suspicious, and blocking the write has already stopped the damage. Matched
+/// only for images inside `%SystemRoot%`, so a program that merely borrows one of these names is
+/// not protected by it.
+const NEVER_TERMINATE: &[&str] = &[
+    "explorer.exe",
+    "searchindexer.exe",
+    "searchprotocolhost.exe",
+    "searchfilterhost.exe",
+    "svchost.exe",
+    "dllhost.exe",
+];
+
+/// Why a termination was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpareReason {
+    ReservedProcessId,
+    Critical,
+    ProtectedSystemBinary,
+    /// Created after the event, so it is a different process that reused the ID.
+    CreatedAfterEvent,
+}
+
+/// Decides whether a process that tripped the ransomware heuristic may be terminated.
+///
+/// Kept separate from the Windows calls so the policy can be tested directly.
+fn termination_policy(
+    process_id: u32,
+    image: &Path,
+    critical: bool,
+    created_at: std::time::SystemTime,
+    observed_at: std::time::SystemTime,
+    system_root: &Path,
+) -> Result<(), SpareReason> {
     if process_id == 0 || process_id == 4 || process_id == std::process::id() {
-        return;
+        return Err(SpareReason::ReservedProcessId);
     }
+    if critical {
+        // Terminating a critical process bugchecks the machine.
+        return Err(SpareReason::Critical);
+    }
+    // Compared component by component, so `C:\WindowsApps` does not count as `C:\Windows`.
+    let in_system_root = PathBuf::from(image.to_string_lossy().to_ascii_lowercase())
+        .starts_with(system_root.to_string_lossy().to_ascii_lowercase());
+    let reserved_name = image
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| NEVER_TERMINATE.contains(&name.to_ascii_lowercase().as_str()));
+    if in_system_root && reserved_name {
+        return Err(SpareReason::ProtectedSystemBinary);
+    }
+    // ponytail: bounded by when the event was dequeued, not when it happened. A process ID reused
+    // inside that queueing delay would still pass; having the driver send the requester's creation
+    // time would close it exactly.
+    if created_at > observed_at {
+        return Err(SpareReason::CreatedAfterEvent);
+    }
+    Ok(())
+}
+
+/// Terminates the process the ransomware heuristic blocked, unless the policy spares it.
+///
+/// Only this path terminates anything. The write that tripped the heuristic is already denied;
+/// terminating the writer stops it moving on to the next file.
+fn terminate_ransomware_process(process_id: u32, observed_at: std::time::SystemTime) {
     #[cfg(windows)]
     unsafe {
-        use windows_sys::Win32::Foundation::CloseHandle;
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+            GetProcessTimes, IsProcessCritical, OpenProcess, QueryFullProcessImageNameW,
+            TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
         };
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, process_id);
-        if handle != 0 {
-            let _ = TerminateProcess(handle, 1);
+
+        let handle = OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            process_id,
+        );
+        if handle == 0 {
+            return;
+        }
+        let close = |reason: &str| {
+            log::warn!("Not terminating PID {process_id}: {reason}");
             CloseHandle(handle);
-            log::warn!("Terminated malicious process PID {}", process_id);
+        };
+
+        let mut image = vec![0u16; 32_768];
+        let mut length = image.len() as u32;
+        if QueryFullProcessImageNameW(handle, 0, image.as_mut_ptr(), &mut length) == 0 {
+            return close("its image path could not be read");
+        }
+        image.truncate(length as usize);
+        let image = PathBuf::from(std::ffi::OsString::from_wide(&image));
+
+        let mut critical = 0;
+        if IsProcessCritical(handle, &mut critical) == 0 {
+            return close("its critical status could not be read");
+        }
+
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+            return close("its creation time could not be read");
+        }
+        let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        // FILETIME counts 100 ns intervals from 1601-01-01.
+        let created_at = std::time::UNIX_EPOCH
+            + Duration::from_nanos(ticks.saturating_sub(116_444_736_000_000_000) * 100);
+
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        match termination_policy(
+            process_id,
+            &image,
+            critical != 0,
+            created_at,
+            observed_at,
+            &system_root,
+        ) {
+            Ok(()) => {
+                let _ = TerminateProcess(handle, 1);
+                CloseHandle(handle);
+                log::warn!("Terminated ransomware-suspect PID {process_id} ({image:?})");
+            }
+            Err(reason) => close(&format!("{reason:?} ({image:?})")),
         }
     }
+    #[cfg(not(windows))]
+    let _ = (process_id, observed_at);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy(image: &str, critical: bool, created_offset_ms: i64) -> Result<(), SpareReason> {
+        let observed = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let created = if created_offset_ms >= 0 {
+            observed + Duration::from_millis(created_offset_ms as u64)
+        } else {
+            observed - Duration::from_millis(created_offset_ms.unsigned_abs())
+        };
+        termination_policy(
+            4242,
+            Path::new(image),
+            critical,
+            created,
+            observed,
+            Path::new(r"C:\Windows"),
+        )
+    }
+
+    #[test]
+    fn an_ordinary_encrypting_process_may_be_terminated() {
+        assert_eq!(
+            policy(r"C:\Users\x\Downloads\invoice.exe", false, -5_000),
+            Ok(())
+        );
+        // Living-off-the-land tools are not spared just for living in System32.
+        assert_eq!(
+            policy(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                false,
+                -5_000
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn critical_processes_and_the_shell_are_never_terminated() {
+        assert_eq!(
+            policy(r"C:\Windows\System32\csrss.exe", true, -5_000),
+            Err(SpareReason::Critical)
+        );
+        assert_eq!(
+            policy(r"C:\Windows\explorer.exe", false, -5_000),
+            Err(SpareReason::ProtectedSystemBinary)
+        );
+        assert_eq!(
+            policy(r"c:\windows\system32\SearchIndexer.EXE", false, -5_000),
+            Err(SpareReason::ProtectedSystemBinary)
+        );
+    }
+
+    #[test]
+    fn a_borrowed_system_name_outside_system_root_is_not_protected() {
+        assert_eq!(
+            policy(r"C:\Users\x\AppData\Local\Temp\explorer.exe", false, -5_000),
+            Ok(())
+        );
+        assert_eq!(
+            policy(r"C:\WindowsApps\explorer.exe", false, -5_000),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_process_created_after_the_event_is_a_reused_id() {
+        assert_eq!(
+            policy(r"C:\Users\x\Downloads\invoice.exe", false, 250),
+            Err(SpareReason::CreatedAfterEvent)
+        );
+    }
+
+    #[test]
+    fn reserved_process_ids_are_never_terminated() {
+        let now = std::time::SystemTime::now();
+        for process_id in [0, 4, std::process::id()] {
+            assert_eq!(
+                termination_policy(
+                    process_id,
+                    Path::new("x.exe"),
+                    false,
+                    now,
+                    now,
+                    Path::new(r"C:\Windows")
+                ),
+                Err(SpareReason::ReservedProcessId)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_live_process_is_spared_or_terminated_by_the_real_checks() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // An event observed before this process existed cannot have been caused by it.
+        terminate_ransomware_process(child.id(), std::time::UNIX_EPOCH);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a reused ID was terminated"
+        );
+
+        terminate_ransomware_process(
+            child.id(),
+            std::time::SystemTime::now() + Duration::from_secs(1),
+        );
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
 
     #[test]
     fn device_paths_use_globalroot() {
