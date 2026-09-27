@@ -4,16 +4,17 @@
 //! the same header but stores the archive uncompressed. Reading both natively removes the need to
 //! ship `freshclam.exe` and `sigtool.exe` alongside the agent purely to unpack definitions.
 //!
-//! The container is *parsed* here, not trusted. Authenticity is established by the Ed25519
-//! signature blackshard applies to its own definition bundles once the feed builder has converted
-//! the extracted databases, so this module deliberately does not attempt to validate ClamAV's own
-//! RSA container signature.
+//! Every container carries ClamAV's RSA signature over the MD5 of its archive, and
+//! [`verify_signature`] checks it against ClamAV's published public key. Together with the body MD5
+//! check in the downloader, that authenticates the container end to end, so a compromised mirror or
+//! intercepted connection cannot substitute its own definitions.
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Component, Path};
 
 use flate2::read::GzDecoder;
+use num_bigint::BigUint;
 
 /// Length of the fixed size ASCII header that introduces every container.
 pub const HEADER_LEN: usize = 512;
@@ -26,6 +27,16 @@ const MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Upper bound on the number of entries accepted from one container.
 const MAX_ENTRIES: usize = 4096;
+
+/// ClamAV's container signing key: modulus and public exponent, in decimal. These are the values
+/// every ClamAV install verifies `.cvd` files against (`CLI_NSTR` / `CLI_ESTR` in libclamav).
+const CLAMAV_MODULUS: &str = "118640995551645342603070001658453189751527774412027743746599405743243142607464144767361060640655844749760788890022283424922762488917565551002467771109669598189410434699034532232228621591089508178591428456220796841621637175567590476666928698770143328137383952820383197532047771780196576957695822641224262693037";
+const CLAMAV_EXPONENT: u32 = 100_001_027;
+
+/// The digit alphabet of ClamAV's signature encoding: base 64, but in this order, and with the
+/// *first* character as the least significant digit.
+const SIGNATURE_ALPHABET: &[u8; 64] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
 
 #[derive(Debug)]
 pub enum CvdError {
@@ -62,6 +73,8 @@ pub struct CvdHeader {
     pub signature_count: u64,
     pub functionality_level: u32,
     pub md5: String,
+    /// ClamAV's RSA signature over `md5`, in its own base 64 encoding.
+    pub signature: String,
     pub builder: String,
 }
 
@@ -114,8 +127,55 @@ impl CvdHeader {
             signature_count,
             functionality_level,
             md5,
+            signature: fields[5].trim().to_owned(),
             builder: fields[6].trim().to_owned(),
         })
+    }
+}
+
+/// Checks that ClamAV signed this header's archive digest.
+///
+/// The signature decodes to an integer which, raised to ClamAV's public exponent modulo its public
+/// key, must equal the 16 byte MD5 recorded in the header. The downloader separately confirms that
+/// the archive body hashes to that MD5, so the two checks together authenticate the whole file.
+///
+/// This is ClamAV's legacy scheme: unpadded RSA over MD5. It is what `.cvd` files carry, and it is
+/// adequate against substitution by a network attacker, who would need a second preimage of a
+/// genuinely signed digest. Routing definitions through blackshard's own Ed25519 feed would retire
+/// it.
+pub fn verify_signature(header: &CvdHeader) -> Result<(), CvdError> {
+    let modulus = BigUint::parse_bytes(CLAMAV_MODULUS.as_bytes(), 10)
+        .expect("the ClamAV modulus constant is valid decimal");
+
+    let mut signature = BigUint::default();
+    for (position, symbol) in header.signature.bytes().enumerate() {
+        let digit = SIGNATURE_ALPHABET
+            .iter()
+            .position(|candidate| *candidate == symbol)
+            .ok_or_else(|| malformed("the container signature contains an invalid character"))?;
+        signature += BigUint::from(digit) << (6 * position);
+    }
+    if signature == BigUint::default() || signature >= modulus {
+        return Err(malformed("the container signature is out of range"));
+    }
+
+    let digest = signature
+        .modpow(&BigUint::from(CLAMAV_EXPONENT), &modulus)
+        .to_bytes_be();
+    if digest.len() > 16 {
+        return Err(malformed(
+            "the container signature does not match its digest",
+        ));
+    }
+    let mut padded = [0u8; 16];
+    padded[16 - digest.len()..].copy_from_slice(&digest);
+
+    if hex::encode(padded).eq_ignore_ascii_case(&header.md5) {
+        Ok(())
+    } else {
+        Err(malformed(
+            "the container signature does not match its digest",
+        ))
     }
 }
 
@@ -338,6 +398,48 @@ mod tests {
         let mut out = header_block(&"0".repeat(32));
         out.extend_from_slice(&body);
         out
+    }
+
+    /// Headers exactly as `database.clamav.net` served them, captured for these tests.
+    const REAL_MAIN_HEADER: &str = "ClamAV-VDB:16 Dec 2025 23-18 +0000:63:3287027:90:9c353a6b32555186a45a61c6441f38c0:gI9w3cezaElJbedEoiykyQeX1f6j9Xbs3a+cf9U/kH5QScGMe2mRz1K2JlYOrqfBuOUMbiKmvkVvAquOsMeDp/ejLVDx5WulC6klZVhLOfBHda29OjaLZwEGR9GPIHDr0mXriv7pivuMH60/loxpASIJHLOszyj95pxVK+EaTCh:tomjudge:1765927102";
+    const REAL_DAILY_HEADER: &str = "ClamAV-VDB:26 Sep 2026 06-24 +0000:28135:355678:90:f028011319ac371fc1d722bc77ce109d:dmZwAflr3ZUqHZNTqxgww2flmNvgqjHZFB2gI20Unm5Uvz6hM0SeuN4NCTPr+Jdwa7k6P3LJDH7vHrxzFq6hhN+EXuqpswsXEk/6bawtiAj2/m5rKm9jTRozA4SiZZTXaslHTJqKmpwunwss42/e7n02TPYjMQlHBC7x5JuYtaf:svc.clamav-publisher:1790403853";
+
+    fn real(header: &str) -> CvdHeader {
+        let mut block = header.as_bytes().to_vec();
+        block.resize(HEADER_LEN, b' ');
+        CvdHeader::parse(&block).unwrap()
+    }
+
+    #[test]
+    fn genuine_clamav_signatures_verify() {
+        for header in [REAL_MAIN_HEADER, REAL_DAILY_HEADER] {
+            verify_signature(&real(header)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_signature_is_bound_to_its_own_digest() {
+        // Swapping the digests between two genuinely signed headers must fail both ways.
+        let mut main = real(REAL_MAIN_HEADER);
+        let daily = real(REAL_DAILY_HEADER);
+        main.md5 = daily.md5.clone();
+        assert!(verify_signature(&main).is_err());
+
+        let mut altered = real(REAL_DAILY_HEADER);
+        altered.md5.replace_range(0..1, "0");
+        assert!(verify_signature(&altered).is_err());
+    }
+
+    #[test]
+    fn malformed_signatures_are_rejected() {
+        for signature in ["", "not base64 at all!", "aaaa"] {
+            let mut header = real(REAL_MAIN_HEADER);
+            header.signature = signature.to_owned();
+            assert!(verify_signature(&header).is_err(), "{signature:?}");
+        }
+        let mut tampered = real(REAL_MAIN_HEADER);
+        tampered.signature.replace_range(10..11, "Z");
+        assert!(verify_signature(&tampered).is_err());
     }
 
     #[test]
