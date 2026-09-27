@@ -134,6 +134,11 @@ pub struct NativeIndex {
     section_md5: HashTable<16>,
     allow_sha256: HashSet<[u8; 32]>,
     allow_md5: HashSet<[u8; 16]>,
+    /// File sizes named by whole-file MD5 signatures and MD5 allowlist entries, so a caller can
+    /// skip hashing a large file with MD5 when no MD5 entry could possibly match it.
+    md5_sizes: HashSet<u64>,
+    /// Set when some MD5 entry uses the `*` size wildcard, which could match a file of any size.
+    md5_any_size: bool,
 }
 
 /// Which database families a load should consider.
@@ -297,6 +302,7 @@ impl NativeIndex {
             (Family::FileHash, 16) => {
                 let hash: [u8; 16] = bytes.try_into().expect("length checked above");
                 self.file_md5.push(hash, size, name.to_owned());
+                self.note_md5_size(size);
                 true
             }
             (Family::SectionHash, 32) => {
@@ -317,12 +323,30 @@ impl NativeIndex {
             (Family::Allowlist, 16) => {
                 self.allow_md5
                     .insert(bytes.try_into().expect("length checked above"));
+                self.note_md5_size(size);
                 true
             }
             // SHA-1 signatures also appear in `.hsb`; blackshard does not compute SHA-1, so they
             // are skipped rather than stored where they could never match.
             _ => false,
         }
+    }
+
+    fn note_md5_size(&mut self, size: Option<u64>) {
+        match size {
+            Some(size) => {
+                self.md5_sizes.insert(size);
+            }
+            None => self.md5_any_size = true,
+        }
+    }
+
+    /// Whether a whole-file MD5 of a file this size could match anything in the index.
+    ///
+    /// MD5 is the slower of the two digests, and for a multi-gigabyte file it dominates the scan,
+    /// so callers only compute it when this says it can matter.
+    pub fn wants_file_md5(&self, file_size: u64) -> bool {
+        self.md5_any_size || self.md5_sizes.contains(&file_size)
     }
 
     fn sort(&mut self) {
@@ -358,11 +382,11 @@ impl NativeIndex {
     pub fn evaluate(
         &self,
         sha256: &[u8; 32],
-        md5: &[u8; 16],
+        md5: Option<&[u8; 16]>,
         file_size: Option<u64>,
         sections: &[SectionDigest],
     ) -> Option<IndexMatch> {
-        if self.is_allowlisted(sha256, Some(md5)) {
+        if self.is_allowlisted(sha256, md5) {
             return None;
         }
 
@@ -372,7 +396,7 @@ impl NativeIndex {
                 origin: MatchOrigin::WholeFile,
             });
         }
-        if let Some(name) = self.file_md5.lookup(md5, file_size) {
+        if let Some(name) = md5.and_then(|md5| self.file_md5.lookup(md5, file_size)) {
             return Some(IndexMatch {
                 threat_name: name.to_owned(),
                 origin: MatchOrigin::WholeFile,
@@ -470,13 +494,13 @@ mod tests {
         assert_eq!(stats.file_hashes, 2);
 
         let matched = index
-            .evaluate(&sha("11"), &md5("ff"), Some(4), &[])
+            .evaluate(&sha("11"), Some(&md5("ff")), Some(4), &[])
             .unwrap();
         assert_eq!(matched.threat_name, "Test.Sha");
         assert_eq!(matched.origin, MatchOrigin::WholeFile);
 
         let matched = index
-            .evaluate(&sha("ff"), &md5("22"), Some(4), &[])
+            .evaluate(&sha("ff"), Some(&md5("22")), Some(4), &[])
             .unwrap();
         assert_eq!(matched.threat_name, "Test.Md5");
     }
@@ -507,7 +531,7 @@ mod tests {
             sha256: sha("33"),
         }];
         let matched = index
-            .evaluate(&sha("ee"), &md5("ee"), Some(9_999), &sections)
+            .evaluate(&sha("ee"), Some(&md5("ee")), Some(9_999), &sections)
             .unwrap();
         assert_eq!(matched.threat_name, "Test.Section");
         assert_eq!(matched.origin, MatchOrigin::PeSection);
@@ -519,7 +543,7 @@ mod tests {
         }];
         assert_eq!(
             index
-                .evaluate(&sha("ee"), &md5("ee"), Some(9_999), &sections)
+                .evaluate(&sha("ee"), Some(&md5("ee")), Some(9_999), &sections)
                 .unwrap()
                 .threat_name,
             "Test.SectionMd5"
@@ -546,7 +570,7 @@ mod tests {
             sha256: sha("33"),
         }];
         assert!(index
-            .evaluate(&sha("ee"), &md5("ee"), Some(9_999), &sections)
+            .evaluate(&sha("ee"), Some(&md5("ee")), Some(9_999), &sections)
             .is_none());
     }
 
@@ -572,7 +596,7 @@ mod tests {
         assert_eq!(index.allowlist_len(), 1);
 
         assert!(index
-            .evaluate(&sha("11"), &md5("ff"), Some(4), &[])
+            .evaluate(&sha("11"), Some(&md5("ff")), Some(4), &[])
             .is_none());
         assert!(index.evaluate_sha256(&sha("11"), Some(4)).is_none());
     }
@@ -597,10 +621,10 @@ mod tests {
             .unwrap();
 
         assert!(index
-            .evaluate(&sha("11"), &md5("22"), Some(4), &[])
+            .evaluate(&sha("11"), Some(&md5("22")), Some(4), &[])
             .is_none());
         assert!(index
-            .evaluate(&sha("11"), &md5("ff"), Some(4), &[])
+            .evaluate(&sha("11"), Some(&md5("ff")), Some(4), &[])
             .is_some());
     }
 
@@ -619,9 +643,11 @@ mod tests {
             .unwrap();
 
         assert!(index
-            .evaluate(&sha("11"), &md5("ff"), Some(1), &[])
+            .evaluate(&sha("11"), Some(&md5("ff")), Some(1), &[])
             .is_some());
-        assert!(index.evaluate(&sha("11"), &md5("ff"), None, &[]).is_some());
+        assert!(index
+            .evaluate(&sha("11"), Some(&md5("ff")), None, &[])
+            .is_some());
     }
 
     #[test]
@@ -666,7 +692,7 @@ mod tests {
         assert_eq!(stats.file_hashes, 1);
         assert_eq!(
             index
-                .evaluate(&sha("11"), &md5("ff"), Some(4), &[])
+                .evaluate(&sha("11"), Some(&md5("ff")), Some(4), &[])
                 .unwrap()
                 .threat_name,
             "Good.One"
@@ -688,7 +714,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             index
-                .evaluate(&sha("11"), &md5("ff"), Some(4), &[])
+                .evaluate(&sha("11"), Some(&md5("ff")), Some(4), &[])
                 .unwrap()
                 .threat_name,
             "Win.Trojan:Agent-1"
@@ -712,14 +738,14 @@ mod tests {
         for (size, expected) in [(10, "Test.Ten"), (20, "Test.Twenty"), (30, "Test.Thirty")] {
             assert_eq!(
                 index
-                    .evaluate(&sha("11"), &md5("ff"), Some(size), &[])
+                    .evaluate(&sha("11"), Some(&md5("ff")), Some(size), &[])
                     .unwrap()
                     .threat_name,
                 expected
             );
         }
         assert!(index
-            .evaluate(&sha("11"), &md5("ff"), Some(40), &[])
+            .evaluate(&sha("11"), Some(&md5("ff")), Some(40), &[])
             .is_none());
     }
 
@@ -804,13 +830,68 @@ mod tests {
         let matched = index
             .evaluate(
                 &Sha256::digest(&repacked).into(),
-                &Md5::digest(&repacked).into(),
+                Some(&Md5::digest(&repacked).into()),
                 Some(repacked.len() as u64),
                 &pe_section_digests(&repacked),
             )
             .unwrap();
         assert_eq!(matched.threat_name, "Test.Repacked");
         assert_eq!(matched.origin, MatchOrigin::PeSection);
+    }
+
+    #[test]
+    fn md5_is_only_wanted_for_sizes_an_md5_entry_names() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            "main.hdb",
+            &format!("{}:4096:Test.Md5", "22".repeat(16)),
+        );
+        write(
+            directory.path(),
+            "daily.hsb",
+            &format!("{}:*:Test.Sha", "11".repeat(32)),
+        );
+
+        let mut index = NativeIndex::new();
+        index
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert!(index.wants_file_md5(4096));
+        // A SHA-256 wildcard does not make MD5 worth computing.
+        assert!(!index.wants_file_md5(5 * 1024 * 1024 * 1024));
+
+        write(
+            directory.path(),
+            "daily.fp",
+            &format!("{}:*:Vendor.Clean", "33".repeat(16)),
+        );
+        let mut index = NativeIndex::new();
+        index
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert!(index.wants_file_md5(5 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_missing_md5_still_allows_sha256_and_section_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            "daily.hsb",
+            &format!("{}:4:Test.Sha", "11".repeat(32)),
+        );
+        let mut index = NativeIndex::new();
+        index
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert_eq!(
+            index
+                .evaluate(&sha("11"), None, Some(4), &[])
+                .unwrap()
+                .threat_name,
+            "Test.Sha"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@ use crate::engine::{ContentType, ScanEngine, ScanReport, Verdict as StaticVerdic
 use crate::parser_worker::{protocol::ParseResult, ParserWorker};
 use crate::rules::{RuleDisposition, RuleEnforcementAuthority, RuleEngine, RuleMatch};
 use crate::similarity::{SimilarityEngine, SimilarityMatch};
+use md5::Md5;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::windows::io::AsRawHandle;
@@ -183,13 +185,13 @@ impl DetectionEngine {
         sample: &[u8],
         static_report: &ScanReport,
         declared_size: u64,
+        whole_file_md5: Option<[u8; 16]>,
     ) -> Option<IndexMatch> {
         let sha256: [u8; 32] = static_report
             .sha256
             .as_deref()
             .and_then(|value| hex::decode(value).ok())
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())?;
-        let md5: [u8; 16] = <md5::Md5 as md5::Digest>::digest(sample).into();
 
         // Section digests only mean anything for a PE, and parsing is skipped otherwise.
         let sections = if matches!(
@@ -201,10 +203,14 @@ impl DetectionEngine {
             Vec::new()
         };
 
-        self.native_index
-            .read()
-            .ok()
-            .and_then(|index| index.evaluate(&sha256, &md5, Some(declared_size), &sections))
+        self.native_index.read().ok().and_then(|index| {
+            index.evaluate(
+                &sha256,
+                whole_file_md5.as_ref(),
+                Some(declared_size),
+                &sections,
+            )
+        })
     }
 
     pub fn parser_worker_healthy(&self) -> bool {
@@ -282,7 +288,11 @@ impl DetectionEngine {
             );
         }
         let sample_limit = self.static_engine.config().max_read_bytes;
-        let (sample, observed_extra) = match read_bounded(&mut reader, sample_limit) {
+        let with_md5 = self
+            .native_index
+            .read()
+            .is_ok_and(|index| index.wants_file_md5(before.len()));
+        let (sample, digests) = match read_and_hash(&mut reader, sample_limit, with_md5) {
             Ok(result) => result,
             Err(error) => {
                 return DetectionReport::error(
@@ -307,11 +317,11 @@ impl DetectionEngine {
             );
         }
 
-        let declared_size = before
-            .len()
-            .max(sample.len() as u64 + u64::from(observed_extra));
+        let declared_size = before.len().max(digests.length);
         let static_start = Instant::now();
-        let static_report = self.static_engine.scan_sample(&sample, declared_size);
+        let static_report =
+            self.static_engine
+                .scan_sample_with_digest(&sample, declared_size, digests.sha256);
         let static_duration = static_start.elapsed();
 
         if requires_isolated_parser(static_report.content_type) {
@@ -344,7 +354,8 @@ impl DetectionEngine {
         }
 
         let native_index_start = Instant::now();
-        let native_index_match = self.evaluate_native_index(&sample, &static_report, declared_size);
+        let native_index_match =
+            self.evaluate_native_index(&sample, &static_report, declared_size, digests.md5);
         let native_index_duration = native_index_start.elapsed();
 
         let yara_start = Instant::now();
@@ -436,8 +447,12 @@ impl DetectionEngine {
         let static_duration = static_start.elapsed();
 
         let native_index_start = Instant::now();
-        let native_index_match =
-            self.evaluate_native_index(bytes, &static_report, bytes.len() as u64);
+        let native_index_match = self.evaluate_native_index(
+            bytes,
+            &static_report,
+            bytes.len() as u64,
+            Some(Md5::digest(bytes).into()),
+        );
         let native_index_duration = native_index_start.elapsed();
 
         let yara_start = Instant::now();
@@ -663,15 +678,53 @@ impl DetectionEngine {
     }
 }
 
-fn read_bounded(reader: &mut File, limit: usize) -> io::Result<(Vec<u8>, bool)> {
-    let mut reader = reader.take(limit.saturating_add(1) as u64);
-    let mut bytes = Vec::with_capacity(limit.min(1024 * 1024));
-    reader.read_to_end(&mut bytes)?;
-    let observed_extra = bytes.len() > limit;
-    if observed_extra {
-        bytes.truncate(limit);
+/// Digests of an entire file, however large.
+struct WholeFileDigests {
+    sha256: [u8; 32],
+    /// Only computed when the native index could use it; see `NativeIndex::wants_file_md5`.
+    md5: Option<[u8; 16]>,
+    length: u64,
+}
+
+/// Reads the whole file once: the first `limit` bytes are kept for analysis, and every byte goes
+/// through the hashers.
+///
+/// Analysis is what is expensive, and it stays bounded. Hashing is cheap, so it covers the whole
+/// file, and a known sample padded past the analysis limit is still recognised by its digest.
+fn read_and_hash(
+    reader: &mut impl Read,
+    limit: usize,
+    with_md5: bool,
+) -> io::Result<(Vec<u8>, WholeFileDigests)> {
+    let mut sample = Vec::with_capacity(limit.min(1024 * 1024));
+    let mut sha256 = Sha256::new();
+    let mut md5 = with_md5.then(Md5::new);
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut length = 0u64;
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let chunk = &buffer[..read];
+        sha256.update(chunk);
+        if let Some(md5) = md5.as_mut() {
+            md5.update(chunk);
+        }
+        let room = limit.saturating_sub(sample.len());
+        sample.extend_from_slice(&chunk[..read.min(room)]);
+        length += read as u64;
     }
-    Ok((bytes, observed_extra))
+    Ok((
+        sample,
+        WholeFileDigests {
+            sha256: sha256.finalize().into(),
+            md5: md5.map(|md5| md5.finalize().into()),
+            length,
+        },
+    ))
 }
 
 fn requires_isolated_parser(content_type: ContentType) -> bool {
@@ -792,16 +845,23 @@ pub struct EvidenceCascade {
 
 impl EvidenceCascade {
     pub fn resolve(self, elapsed: Duration) -> DetectionReport {
-        let automatic_quarantine_eligible = self.static_report.verdict == StaticVerdict::Malicious
-            && !self.static_report.truncated
-            && self.static_report.sha256.is_some()
-            && self
-                .static_report
-                .evidence
-                .iter()
-                .any(|evidence| evidence.code == "signature.exact_sha256");
+        // `sha256` is only ever the digest of the entire file, so an exact match convicts the file
+        // itself even when the rest of the analysis was bounded to a prefix. A whole-file hit in
+        // the ClamAV index is the same strength of evidence as the built-in exact list, so it is
+        // quarantined the same way; a section hit only proves one section and is not.
+        let whole_file_index_match = self
+            .native_index_match
+            .as_ref()
+            .is_some_and(|matched| matched.origin == MatchOrigin::WholeFile);
+        let automatic_quarantine_eligible = self.static_report.sha256.is_some()
+            && ((self.static_report.verdict == StaticVerdict::Malicious
+                && self
+                    .static_report
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.code == "signature.exact_sha256"))
+                || whole_file_index_match);
         let reputation_block_eligible = self.static_report.verdict == StaticVerdict::Malicious
-            && !self.static_report.truncated
             && self.static_report.sha256.is_some()
             && self
                 .static_report
@@ -980,6 +1040,50 @@ fn shared_system_amsi() -> Result<Arc<AmsiScanner>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_file_digests_cover_bytes_past_the_analysis_limit() {
+        let mut file = vec![7u8; 5000];
+        file[4999] = 9;
+        let (sample, digests) = read_and_hash(&mut file.as_slice(), 1000, true).unwrap();
+
+        assert_eq!(sample.len(), 1000);
+        assert_eq!(digests.length, 5000);
+        assert_eq!(digests.sha256, <[u8; 32]>::from(Sha256::digest(&file)));
+        assert_eq!(digests.md5, Some(<[u8; 16]>::from(Md5::digest(&file))));
+
+        let (_, without_md5) = read_and_hash(&mut file.as_slice(), 1000, false).unwrap();
+        assert!(without_md5.md5.is_none());
+    }
+
+    #[test]
+    fn a_padded_file_reports_the_digest_of_every_byte() {
+        let engine = DetectionEngine::new(
+            ScanEngine::new(
+                crate::engine::ScanConfig {
+                    max_read_bytes: 16,
+                    ..Default::default()
+                },
+                crate::engine::SignatureDatabase::default(),
+            )
+            .unwrap(),
+            RuleEngine::builtin().unwrap(),
+        );
+        let mut padded = crate::self_test::PAYLOAD.to_vec();
+        padded.resize(4096, 0);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("padded.bin");
+        fs::write(&path, &padded).unwrap();
+        let report = engine.scan_path(&path);
+
+        // The analysed prefix is 16 bytes, but the digest is of all 4096.
+        assert!(report.truncated);
+        assert_eq!(
+            report.sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(&padded)).as_str())
+        );
+    }
 
     #[test]
     fn harmless_self_test_is_malicious_and_quarantinable() {

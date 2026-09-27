@@ -432,6 +432,34 @@ impl ScanEngine {
         )
     }
 
+    /// Analyses `sample`, the start of a file of `file_size` bytes, whose whole-file SHA-256 the
+    /// caller has already computed by streaming the entire file.
+    ///
+    /// The expensive analysis stays bounded by the sample, but signature lookups use the real
+    /// digest, so padding a known sample past the read limit no longer hides it.
+    pub fn scan_sample_with_digest(
+        &self,
+        sample: &[u8],
+        file_size: u64,
+        whole_file_sha256: [u8; 32],
+    ) -> ScanReport {
+        let sample = &sample[..sample.len().min(self.config.max_read_bytes)];
+        let file_size = file_size.max(sample.len() as u64);
+        let truncated = file_size > sample.len() as u64;
+        self.analyze_internal(
+            sample,
+            file_size,
+            sample.len(),
+            truncated,
+            Some(whole_file_sha256),
+            if truncated {
+                AnalysisCompleteness::PrefixAndTargetedRegions
+            } else {
+                AnalysisCompleteness::Complete
+            },
+        )
+    }
+
     fn analyze_internal(
         &self,
         bytes: &[u8],
