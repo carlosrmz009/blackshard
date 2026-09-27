@@ -30,7 +30,7 @@ open-source adaptive antivirus agent
 
 ## Demo
 
-blackshard is currently in really early stages of development, so no download is currently offered. If you're really brave, though, you can try compiling your own binaries, or use the generated Github Artifacts from Actions (NOT RECCOMENDED, NOT SIGNED AND UNSTABLE!).
+blackshard is currently in really early stages of development, so no stable download is offered. If you're really brave, though, you can try compiling your own binaries, or grab `blackshard-setup.exe` from the [testing candidate](https://github.com/carlosrmz009/blackshard/releases/tag/veryveryunstable) release, rebuilt from every commit to main (NOT RECOMMENDED, NOT SIGNED AND UNSTABLE! try it in a VM).
 
 
 ## FAQ
