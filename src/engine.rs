@@ -854,8 +854,8 @@ fn analyze_pe(
             .to_ascii_lowercase();
         let executable = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
         let writable = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
-        let virtual_start = section.virtual_address as usize;
-        let virtual_span = (section.virtual_size as usize).max(section.size_of_raw_data as usize);
+        let virtual_start = section.virtual_address;
+        let virtual_span = section.virtual_size.max(section.size_of_raw_data);
         if pe.entry >= virtual_start && pe.entry < virtual_start.saturating_add(virtual_span) {
             entry_section_found = true;
             if writable {
