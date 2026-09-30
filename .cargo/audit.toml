@@ -21,11 +21,6 @@ ignore = [
     # component model, which this build does not compile (wasmtime features in use: cranelift,
     # runtime, std). Fixed in 48.0.3+ / 49.0.1+; yara-x 1.21.0 still pins ^45.
     "RUSTSEC-2026-0316",
-
-    # webbrowser (via eframe/egui-winit): argument injection through the Unix BROWSER variable.
-    # blackshard only builds for Windows, where that code path does not exist. Fixed in 1.2.2+,
-    # which needs a newer eframe.
-    "RUSTSEC-2026-0257",
 ]
 
 [target]

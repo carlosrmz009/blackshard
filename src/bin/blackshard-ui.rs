@@ -484,22 +484,24 @@ fn set_health_read_error(runtime: &SharedUiState, error: &io::Error) {
 }
 
 fn start_service_health_monitor(runtime: SharedUiState) {
-    thread::spawn(move || {
-        let path = default_service_health_path();
-        loop {
-            match read_service_health(&path) {
-                Ok(health) => apply_service_health(&runtime, health),
-                Err(error) => set_health_read_error(&runtime, &error),
-            }
-            if take_protection_test_request(&runtime) {
-                let test_runtime = Arc::clone(&runtime);
-                thread::spawn(move || {
-                    complete_protection_test(&test_runtime, run_harmless_protection_test());
-                });
-            }
-            process_update_request(&runtime);
-            thread::sleep(HEALTH_POLL_INTERVAL);
+    let path = default_service_health_path();
+    let read_health = move |runtime: &SharedUiState| match read_service_health(&path) {
+        Ok(health) => apply_service_health(runtime, health),
+        Err(error) => set_health_read_error(runtime, &error),
+    };
+    // Once before the window exists, so the app knows whether the service is up before it
+    // tries to talk to it.
+    read_health(&runtime);
+    thread::spawn(move || loop {
+        thread::sleep(HEALTH_POLL_INTERVAL);
+        read_health(&runtime);
+        if take_protection_test_request(&runtime) {
+            let test_runtime = Arc::clone(&runtime);
+            thread::spawn(move || {
+                complete_protection_test(&test_runtime, run_harmless_protection_test());
+            });
         }
+        process_update_request(&runtime);
     });
 }
 
@@ -599,9 +601,11 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
     initialize_runtime(&runtime);
     start_service_health_monitor(Arc::clone(&runtime));
 
+    let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    wgpu_setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    wgpu_setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
     let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
-        supported_backends: eframe::wgpu::Backends::DX12,
-        power_preference: eframe::wgpu::PowerPreference::LowPower,
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
         ..Default::default()
     };
 
@@ -621,7 +625,10 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "blackshard",
         options,
-        Box::new(move |_creation_context| Box::new(BlackshardApp::with_machine_defaults(runtime))),
+        Box::new(move |creation_context| {
+            BlackshardApp::apply_theme(&creation_context.egui_ctx);
+            Ok(Box::new(BlackshardApp::with_machine_defaults(runtime)))
+        }),
     )?;
     Ok(())
 }

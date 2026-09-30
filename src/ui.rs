@@ -250,16 +250,23 @@ pub struct BlackshardApp {
     operation_sender: mpsc::Sender<QuarantineOutcome>,
     operation_receiver: mpsc::Receiver<QuarantineOutcome>,
     refresh_at: Instant,
-    theme_applied: bool,
 }
 
 impl BlackshardApp {
     pub fn new(runtime: SharedUiState, client: IpcClient) -> Self {
-        let (settings, load_warning) = match client.get_settings() {
-            Ok(settings) => (settings, None),
+        let service_down = runtime
+            .lock()
+            .is_ok_and(|state| matches!(state.protection, ProtectionStatus::Unavailable(_)));
+        let loaded = if service_down {
+            None
+        } else {
+            Some(client.get_settings())
+        };
+        let (settings, load_warning) = match loaded {
+            Some(Ok(settings)) => (settings, None),
             // The dashboard already explains a stopped service; this only has to say what it
             // means for the settings page.
-            Err(error) if error.is_service_unavailable() => (
+            None => (
                 Settings::default(),
                 Some(
                     "Settings will load once the protection service is running; until then \
@@ -267,7 +274,15 @@ impl BlackshardApp {
                         .to_owned(),
                 ),
             ),
-            Err(error) => (
+            Some(Err(error)) if error.is_service_unavailable() => (
+                Settings::default(),
+                Some(
+                    "Settings will load once the protection service is running; until then \
+                     defaults are shown and changes cannot be saved."
+                        .to_owned(),
+                ),
+            ),
+            Some(Err(error)) => (
                 Settings::default(),
                 Some(format!(
                     "The protection service could not provide settings, so defaults are shown and \
@@ -306,7 +321,6 @@ impl BlackshardApp {
             operation_sender,
             operation_receiver,
             refresh_at: Instant::now(),
-            theme_applied: false,
         };
         app.refresh_persistent_views();
         app
@@ -334,6 +348,17 @@ impl BlackshardApp {
     }
 
     fn refresh_persistent_views(&mut self) {
+        // Every call to a service that is not there waits out the pipe timeout, and this runs on
+        // the UI thread, so while health says the service is down the window would freeze for
+        // seconds at a time. Check back soon instead; health is re-read every second.
+        if matches!(
+            self.runtime_snapshot().protection,
+            ProtectionStatus::Unavailable(_)
+        ) {
+            self.persistent_error = None;
+            self.refresh_at = Instant::now() + Duration::from_secs(2);
+            return;
+        }
         if !self.settings_loaded {
             if let Ok(settings) = self.client.get_settings() {
                 if let Ok(mut shared) = self.runtime.lock() {
@@ -571,7 +596,9 @@ impl BlackshardApp {
         });
     }
 
-    fn apply_theme(ctx: &egui::Context) {
+    /// Installs blackshard's look. Called once, before the first frame: the root `Ui` of a frame
+    /// is styled before the app runs, so a style set during a frame never reaches it.
+    pub fn apply_theme(ctx: &egui::Context) {
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(TEXT);
         visuals.panel_fill = BG;
@@ -594,20 +621,21 @@ impl BlackshardApp {
         visuals.widgets.open.bg_fill = SURFACE_HOVER;
         visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, GREEN);
 
-        let mut style = (*ctx.style()).clone();
-        style.visuals = visuals;
-        style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-        style.spacing.button_padding = egui::vec2(14.0, 8.0);
-        style.spacing.interact_size.y = 34.0;
-        style.text_styles.insert(
-            egui::TextStyle::Heading,
-            FontId::new(26.0, FontFamily::Monospace),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Button,
-            FontId::new(14.0, FontFamily::Monospace),
-        );
-        ctx.set_style(style);
+        // Both the dark and light style slots, so the theme holds whichever one egui selects.
+        ctx.all_styles_mut(|style| {
+            style.visuals = visuals.clone();
+            style.spacing.item_spacing = egui::vec2(10.0, 9.0);
+            style.spacing.button_padding = egui::vec2(14.0, 8.0);
+            style.spacing.interact_size.y = 34.0;
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                FontId::new(26.0, FontFamily::Monospace),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                FontId::new(14.0, FontFamily::Monospace),
+            );
+        });
     }
 
     fn render_top_bar(&mut self, ui: &mut egui::Ui, runtime: &UiRuntimeState) {
@@ -704,11 +732,11 @@ impl BlackshardApp {
             NoticeLevel::Warning => ("ATTENTION", AMBER),
             NoticeLevel::Error => ("ERROR", RED),
         };
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(color.gamma_multiply(0.10))
             .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
-            .rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 9))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
@@ -779,7 +807,7 @@ impl BlackshardApp {
                 if ui
                     .add_enabled(
                         test_available && !test_busy,
-                        egui::Button::new("RUN HARMLESS PROTECTION TEST"),
+                        egui::Button::new(button_text("RUN HARMLESS PROTECTION TEST")),
                     )
                     .on_hover_text("Checks detection and blocking end to end with a harmless file")
                     .clicked()
@@ -1002,7 +1030,7 @@ impl BlackshardApp {
                         .hint_text(r"C:\Users\you\Downloads or C:\path\sample.exe"),
                 );
                 if ui
-                    .add_enabled(!running, egui::Button::new("SCAN TARGET"))
+                    .add_enabled(!running, egui::Button::new(button_text("SCAN TARGET")))
                     .clicked()
                 {
                     requested = Some(ScanRequestKind::Custom { roots: Vec::new() });
@@ -1115,7 +1143,7 @@ impl BlackshardApp {
             "Neutralized files are encrypted and cannot execute from the vault.",
         );
         ui.horizontal(|ui| {
-            if ui.button("REFRESH").clicked() {
+            if ui.button(button_text("REFRESH")).clicked() {
                 self.refresh_persistent_views();
             }
             ui.label(
@@ -1219,7 +1247,7 @@ impl BlackshardApp {
             "Local, append-only security events. Newest entries appear first.",
         );
         ui.horizontal(|ui| {
-            if ui.button("REFRESH").clicked() {
+            if ui.button(button_text("REFRESH")).clicked() {
                 self.refresh_persistent_views();
             }
             if ui
@@ -1320,7 +1348,7 @@ impl BlackshardApp {
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.settings.worker_count)
-                            .clamp_range(1..=16)
+                            .range(1..=16)
                             .speed(1),
                     )
                     .changed();
@@ -1330,7 +1358,7 @@ impl BlackshardApp {
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.settings.max_file_size_mb)
-                            .clamp_range(1..=4_096)
+                            .range(1..=4_096)
                             .suffix(" MiB"),
                     )
                     .changed();
@@ -1349,11 +1377,11 @@ impl BlackshardApp {
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.settings.definition_update_interval_hours)
-                            .clamp_range(1..=24)
+                            .range(1..=24)
                             .suffix(" hours"),
                     )
                     .changed();
-                if ui.button("CHECK NOW").clicked() {
+                if ui.button(button_text("CHECK NOW")).clicked() {
                     update_requested = true;
                 }
             });
@@ -1381,7 +1409,7 @@ impl BlackshardApp {
                     egui::TextEdit::singleline(&mut self.exclusion_input)
                         .hint_text(r"C:\trusted\path"),
                 );
-                if ui.button("ADD").clicked() {
+                if ui.button(button_text("ADD")).clicked() {
                     let value = self.exclusion_input.trim().trim_matches('"');
                     if !value.is_empty() {
                         self.settings.add_exclusion(PathBuf::from(value));
@@ -1499,7 +1527,7 @@ impl BlackshardApp {
                     {
                         accepted = true;
                     }
-                    if ui.button("CANCEL").clicked() {
+                    if ui.button(button_text("CANCEL")).clicked() {
                         cancelled = true;
                     }
                 });
@@ -1561,22 +1589,19 @@ impl Drop for BlackshardApp {
 }
 
 impl eframe::App for BlackshardApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.theme_applied {
-            Self::apply_theme(ctx);
-            self.theme_applied = true;
-        }
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.poll_background_work();
         let runtime = self.runtime_snapshot();
 
         if should_show_loading_screen(&runtime) {
             egui::CentralPanel::default()
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(BG)
-                        .inner_margin(egui::Margin::same(22.0)),
+                        .inner_margin(egui::Margin::same(22)),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
                             ui.spinner();
@@ -1616,34 +1641,34 @@ impl eframe::App for BlackshardApp {
             return;
         }
 
-        egui::TopBottomPanel::top("blackshard_top")
-            .exact_height(61.0)
+        egui::Panel::top("blackshard_top")
+            .exact_size(61.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(PANEL)
                     .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(egui::Margin::symmetric(18.0, 0.0)),
+                    .inner_margin(egui::Margin::symmetric(18, 0)),
             )
-            .show(ctx, |ui| self.render_top_bar(ui, &runtime));
+            .show(ui, |ui| self.render_top_bar(ui, &runtime));
 
-        egui::SidePanel::left("blackshard_navigation")
-            .exact_width(190.0)
+        egui::Panel::left("blackshard_navigation")
+            .exact_size(190.0)
             .resizable(false)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(PANEL)
                     .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(egui::Margin::symmetric(12.0, 0.0)),
+                    .inner_margin(egui::Margin::symmetric(12, 0)),
             )
-            .show(ctx, |ui| self.render_sidebar(ui));
+            .show(ui, |ui| self.render_sidebar(ui));
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(BG)
-                    .inner_margin(egui::Margin::same(22.0)),
+                    .inner_margin(egui::Margin::same(22)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -1653,11 +1678,11 @@ impl eframe::App for BlackshardApp {
                         if let Some(error) = self.persistent_error.as_ref().filter(|_| {
                             !matches!(runtime.protection, ProtectionStatus::Unavailable(_))
                         }) {
-                            egui::Frame::none()
+                            egui::Frame::NONE
                                 .fill(RED.gamma_multiply(0.10))
                                 .stroke(Stroke::new(1.0_f32, RED.gamma_multiply(0.65)))
-                                .rounding(egui::Rounding::same(6.0))
-                                .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(12, 9))
                                 .show(ui, |ui| {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label(
@@ -1714,6 +1739,12 @@ fn should_show_loading_screen(runtime: &UiRuntimeState) -> bool {
     }
 }
 
+/// Plain button text in the button style. egui 0.36 sets plain strings in the body font,
+/// ignoring the style's button font, so the terminal look has to be asked for.
+fn button_text(text: impl Into<String>) -> RichText {
+    RichText::new(text).text_style(egui::TextStyle::Button)
+}
+
 fn page_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.label(
         RichText::new(title.to_uppercase())
@@ -1744,21 +1775,21 @@ fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 }
 
 fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(SURFACE)
         .stroke(Stroke::new(1.0_f32, BORDER))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(15.0))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(15))
         .show(ui, add_contents)
         .inner
 }
 
 fn status_pill(ui: &mut egui::Ui, label: &str, color: Color32) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(color.gamma_multiply(0.12))
         .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.72)))
-        .rounding(egui::Rounding::same(10.0))
-        .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(9, 4))
         .show(ui, |ui| {
             ui.label(
                 RichText::new(format!("* {label}"))
@@ -1825,7 +1856,10 @@ fn scan_option(
         ui.label(RichText::new(timing).size(10.5).color(MUTED));
         if !matches!(kind, ScanRequestKind::Custom { .. })
             && ui
-                .add_enabled(enabled, egui::Button::new(format!("START {title}")))
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(button_text(format!("START {title}"))),
+                )
                 .clicked()
         {
             *request = Some(kind);
@@ -1855,7 +1889,7 @@ fn health_row(ui: &mut egui::Ui, label: &str, value: (String, Color32)) {
                         .size(10.5)
                         .color(value.1),
                 )
-                .truncate(true),
+                .truncate(),
             )
             .on_hover_text(&value.0);
         });
