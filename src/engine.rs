@@ -852,7 +852,8 @@ fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<E
         let writable = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
         let virtual_start = section.virtual_address as usize;
         let virtual_span = (section.virtual_size as usize).max(section.size_of_raw_data as usize);
-        if pe.entry >= virtual_start && pe.entry < virtual_start.saturating_add(virtual_span) {
+        let entry = pe.entry as usize;
+        if entry >= virtual_start && entry < virtual_start.saturating_add(virtual_span) {
             entry_section_found = true;
             if writable {
                 push_evidence(

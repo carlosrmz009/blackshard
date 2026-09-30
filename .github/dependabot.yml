@@ -9,10 +9,10 @@ version: 2
 # and arrive as soon as an advisory is published.
 
 updates:
+  # Only the root. The fuzz crate depends on nothing but blackshard itself, so watching /fuzz as
+  # well opened every root update a second time.
   - package-ecosystem: cargo
-    directories:
-      - /
-      - /fuzz
+    directory: /
     schedule:
       interval: weekly
       day: monday

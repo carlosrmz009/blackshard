@@ -1,5 +1,5 @@
 use log::{error, info};
-use rand::Rng;
+use rand::RngExt;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -58,7 +58,7 @@ fn next_check_delay(has_definitions: bool) -> Duration {
         15 * 60
     };
     let spread = base / 16;
-    let offset = rand::thread_rng().gen_range(0..=2 * spread);
+    let offset = rand::rng().random_range(0..=2 * spread);
     Duration::from_secs(base - spread + offset)
 }
 

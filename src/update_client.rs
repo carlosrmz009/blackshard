@@ -7,7 +7,7 @@ use crate::updater::{
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
-use rand::{rngs::OsRng, RngCore};
+use rand::Rng;
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
@@ -566,7 +566,7 @@ fn update_worker(
         if stopping.load(Ordering::Acquire) {
             break;
         }
-        let delay = config.scheduler.delay_for_sample(OsRng.next_u64());
+        let delay = config.scheduler.delay_for_sample(rand::rng().next_u64());
         let next_check = SystemTime::now()
             .checked_add(delay)
             .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX));
@@ -1349,7 +1349,7 @@ mod tests {
             expires_at: now + chrono::Duration::hours(8),
             payload_url: "https://updates.blackshard.dev/definitions.json".to_owned(),
             payload_size: payload.len() as u64,
-            payload_sha256: format!("{:x}", Sha256::digest(payload)),
+            payload_sha256: hex::encode(Sha256::digest(payload)),
         };
         let signature = key.sign(&manifest.signing_bytes().unwrap());
         let mut envelope = SignedUpdateEnvelope {
