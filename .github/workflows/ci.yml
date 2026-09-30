@@ -388,18 +388,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-audit
 
-      # RUSTSEC-2023-0071 is the Marvin timing attack in `rsa`, which yara-x's `pe` module pulls in
-      # to verify Authenticode signatures. Marvin recovers a *private* key by timing decryption or
-      # signing; blackshard only ever performs public-key verification and holds no RSA private
-      # key, so it is not exposed. No fixed release exists. Revisit if that changes.
-      #
-      # This step is enforcing: a new advisory fails the job rather than being reported green.
+      # Ignored advisories, each with the reason it does not apply, live in .cargo/audit.toml.
+      # Enforcing: a new advisory fails the job rather than being reported green.
       - name: Run cargo audit
-        run: cargo audit --ignore RUSTSEC-2026-0269 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0222 --ignore RUSTSEC-2026-0257 --ignore RUSTSEC-2023-0071
+        run: cargo audit
 
   definitions-smoke:
     name: Native ClamAV definition pipeline
@@ -447,7 +443,7 @@ jobs:
           toolchain: nightly
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-fuzz
 

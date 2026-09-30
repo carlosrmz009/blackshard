@@ -1,11 +1,32 @@
-
-
-
-
-
-
+# Every ignored advisory is listed with the reason blackshard is not exposed. Re-check each one
+# when the dependency that pulls it in is upgraded, and drop it as soon as a fixed version lands.
 [advisories]
-ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195", "RUSTSEC-2026-0222", "RUSTSEC-2026-0257", "RUSTSEC-2026-0269"]
+ignore = [
+    # rsa: Marvin timing attack (key recovery). Pulled in by yara-x's `pe` module to verify
+    # Authenticode signatures. The attack recovers a *private* key by timing decryption or signing;
+    # blackshard only verifies with public keys and holds no RSA private key. No fixed release.
+    "RUSTSEC-2023-0071",
+
+    # wasmtime 45 (via yara-x, which pins ^45): stores can mix up type indices between engines.
+    # Needs two wasmtime Engines in one process; yara-x keeps a single global Engine
+    # (yara-x src/wasm/mod.rs, `static ENGINE`). Fixed in 46.0.2+ / 47.0.3+.
+    "RUSTSEC-2026-0222",
+
+    # wasmtime 45: filesystem sandbox escape through trailing slashes. Lives in WASI's filesystem
+    # support; wasmtime-wasi is not in the dependency tree and yara-x grants modules no files.
+    # Fixed in 46.0.3+ / 47.0.4+.
+    "RUSTSEC-2026-0269",
+
+    # wasmtime 45: dynamic record lifting can allocate beyond the hostcall fuel limit. Lives in the
+    # component model, which this build does not compile (wasmtime features in use: cranelift,
+    # runtime, std). Fixed in 48.0.3+ / 49.0.1+; yara-x 1.21.0 still pins ^45.
+    "RUSTSEC-2026-0316",
+
+    # webbrowser (via eframe/egui-winit): argument injection through the Unix BROWSER variable.
+    # blackshard only builds for Windows, where that code path does not exist. Fixed in 1.2.2+,
+    # which needs a newer eframe.
+    "RUSTSEC-2026-0257",
+]
 
 [target]
 arch = ["x86_64"]
