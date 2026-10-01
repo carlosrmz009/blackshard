@@ -7,7 +7,6 @@ use crate::updater::{
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
-use rand::{rngs::OsRng, RngCore};
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
@@ -566,7 +565,7 @@ fn update_worker(
         if stopping.load(Ordering::Acquire) {
             break;
         }
-        let delay = config.scheduler.delay_for_sample(OsRng.next_u64());
+        let delay = config.scheduler.delay_for_sample(rand::random());
         let next_check = SystemTime::now()
             .checked_add(delay)
             .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX));

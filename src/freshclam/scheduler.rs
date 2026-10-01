@@ -1,5 +1,4 @@
 use log::{error, info};
-use rand::Rng;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -21,9 +20,7 @@ pub fn start_scheduler(program_data: PathBuf) -> Receiver<super::downloader::Act
         }
 
         let base_duration = Duration::from_secs(4 * 60 * 60);
-        let mut rng = rand::thread_rng();
-
-        let jitter: i64 = rng.gen_range(-900..=900);
+        let jitter: i64 = i64::from(rand::random::<u16>() % 1_801) - 900;
 
         let sleep_duration = if jitter < 0 {
             base_duration - Duration::from_secs((-jitter) as u64)

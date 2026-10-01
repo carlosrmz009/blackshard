@@ -8,8 +8,6 @@ use chacha20poly1305::{
 };
 use chrono::{DateTime, Utc};
 use hkdf::Hkdf;
-use rand::rngs::OsRng;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -156,15 +154,13 @@ impl QuarantineStore {
         let id = Uuid::new_v4();
         let payload_path = self.payload_path(id);
         let temporary_payload = self.root.join(format!(".{id}.payload.tmp"));
-        let mut kdf_secret = [0u8; 32];
-        OsRng.fill_bytes(&mut kdf_secret);
+        let kdf_secret: [u8; 32] = rand::random();
 
         let hk = Hkdf::<sha2::Sha256>::new(Some(expected_sha256.as_bytes()), &kdf_secret);
         let mut okm = [0u8; 32];
         hk.expand(id.as_bytes(), &mut okm).unwrap();
 
-        let mut stream_nonce = [0u8; 19];
-        OsRng.fill_bytes(&mut stream_nonce);
+        let stream_nonce: [u8; 19] = rand::random();
 
         let aad = format!(
             "BSQ|V2|{}|{}|{}|{}",
